@@ -37,7 +37,7 @@ uv run kama --version
 
 ## Architecture
 
-This is a **dual-process** local AI agent system. `kama-core` is a persistent daemon; `kama` and `kama-tui` are clients that connect to it over a Unix domain socket.
+This is a **dual-process** local AI agent system. `kama-core` is a persistent daemon; `kama` and `kama-tui` are clients that connect to it over TCP loopback using JSON-RPC 2.0 NDJSON.
 
 ```
 kama-core (daemon)
@@ -53,10 +53,10 @@ kama (CLI)   kama-tui (TUI, S2+)
 All IPC messages are typed pydantic v2 models with a **discriminated union on the `type` field**. This is the contract boundary — adding a new command or event means adding a new model class to `commands.py` or `events.py` and extending the `Command`/`Event` union.
 
 - `envelope.py` — `JsonRpcRequest`, `JsonRpcSuccess`, `JsonRpcError`, error code constants, `make_error()`
-- `commands.py` — `Command` union; currently only `PingCommand` + `PongResult`
-- `events.py` — `Event` union; currently only `CoreStartedEvent`
+- `commands.py` — `Command` union and command/result models; current protocol surface is defined by this file
+- `events.py` — `Event` union and event models; current event surface is defined by this file
 
-`WIRE_PROTOCOL.md` is **generated** from these models by `scripts/gen_protocol_doc.py`. Always regenerate and commit it after changing bus models.
+`WIRE_PROTOCOL.md` is **generated** from these models by `scripts/gen_protocol_doc.py`. The current command/event protocol is authoritative in `commands.py`, `events.py`, and the generated `WIRE_PROTOCOL.md`. Always regenerate and commit `WIRE_PROTOCOL.md` after changing bus models.
 
 ### Transport layer (`src/kama_claude/core/transport/`)
 
@@ -64,15 +64,15 @@ All IPC messages are typed pydantic v2 models with a **discriminated union on th
 
 ### Config (`src/kama_claude/core/config.py`)
 
-Four-tier priority: **built-in defaults → `~/.kama/config.toml` → `.env` → env vars**.
+Priority: **built-in defaults → `~/.kama/config.toml` → `.kama/config.toml` → `.env` → env vars**.
 
-S0 keys: `host` (default `127.0.0.1`), `port` (default `7437`), `log_level`, `log_file`. Config file is silently skipped if absent; unknown keys cause a hard exit.
+Current config groups include `core` (`host`, `port`), `logging`, `agent`, `llm`, `trace`, `permission`, `compaction`, and `mcp`. Config files are silently skipped if absent; unknown keys cause a hard exit.
 
-Relevant env vars: `KAMA_CONFIG`, `KAMA_HOST`, `KAMA_PORT`, `KAMA_LOG_LEVEL`, `KAMA_LOG_FILE`, `KAMA_LOG_FORMAT`.
+Relevant env vars include `KAMA_CONFIG`, `KAMA_HOST`, `KAMA_PORT`, `KAMA_LOG_LEVEL`, `KAMA_LOG_FILE`, `KAMA_LOG_FORMAT`, `KAMA_MAX_STEPS`, `KAMA_LLM_DEFAULT_MODEL`, `KAMA_TRACE_ENABLED`, `KAMA_TRACE_FILE`, `KAMA_TRACE_INCLUDE_LLM_PAYLOAD`, `KAMA_PERMISSION_TIMEOUT_S`, `KAMA_COMPACT_THRESHOLD`, `KAMA_COMPACT_TOOL_LIMIT`, and `KAMA_COMPACT_TOOL_KEEP`.
 
 ### Daemon entry (`src/kama_claude/core/app.py`)
 
-`CoreApp.run()` is the single async entry point: loads config → sets up logging → creates `SocketServer` → registers handlers → waits for `SIGINT`/`SIGTERM` → calls `server.stop()`. Adding new handlers: instantiate a handler method on `CoreApp` and call `server.register()`.
+`CoreApp.run()` is the single async entry point: loads config, sets up logging, initializes `EventBus`, optional `TraceWriter`, `IpcEventBroadcaster`, `SessionManager`, `PermissionManager`, optional MCP servers, and `AgentRunner` wiring, then creates `SocketServer`, registers handlers, waits for `SIGINT`/`SIGTERM`, and calls `server.stop()`. Adding new handlers: instantiate a handler method on `CoreApp` and call `server.register()`.
 
 ### Testing
 
