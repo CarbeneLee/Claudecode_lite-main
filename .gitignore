@@ -19,3 +19,5 @@ workspace/
 docs
 requirements.txt
 kamaclaude key prompt.md.codegraph/
+.codex
+gpt-5.5-base-instructions.md
