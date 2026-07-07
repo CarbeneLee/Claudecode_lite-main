@@ -11,6 +11,7 @@ from kama_claude.cli.commands.trace import cmd_trace
 from kama_claude.cli.commands.version import cmd_version
 from kama_claude.core.config import get_config
 from kama_claude.core.logging_setup import setup_logging
+from kama_claude.cli.commands.echo import cmd_echo
 
 
 # CLI 主入口：解析命令行参数并分发到对应子命令
@@ -21,6 +22,8 @@ def main() -> None:
 
     subparsers.add_parser("ping", help="Ping the core daemon")
     subparsers.add_parser("chat", help="Start a multi-turn chat session")
+    echo_parser = subparsers.add_parser("echo", help="Echo a message to the core daemon")
+    echo_parser.add_argument("--message", required=True, help="Message to echo")
 
     run_parser = subparsers.add_parser("run", help="Run an agent task")
     run_parser.add_argument("--goal", required=True, help="Goal for the agent to accomplish")
@@ -53,6 +56,8 @@ def main() -> None:
         cmd_chat(config)
     elif args.command == "run":
         cmd_run(args.goal, config)
+    elif args.command == "echo":
+        cmd_echo(config, args.message)
     elif args.command == "core":
         if args.core_command == "start":
             cmd_core_start(config)

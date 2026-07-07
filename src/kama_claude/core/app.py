@@ -22,6 +22,7 @@ from kama_claude.core.bus.commands import (
     PermissionRespondCommand,
     PermissionRespondResult,
     PongResult,
+    EchoResult,
     SessionCloseCommand,
     SessionCloseResult,
     SessionCompactCommand,
@@ -77,6 +78,15 @@ class CoreApp:
             uptime_ms=int((time.monotonic() - self._start_time) * 1000),
             received_at=datetime.datetime.now(datetime.UTC).isoformat(),
         )
+    
+    async def _echo_handler(self, params: dict[str, Any]) -> EchoResult:
+        message = params.get("message", "")
+        logger.debug("echo message=%s", message)
+        return EchoResult(
+            server_version=kama_claude.__version__,
+            received_at=datetime.datetime.now(datetime.UTC).isoformat(),
+            message=message,
+    )
 
     # 将 EventBus 事件写入 trace（作为 EventBus 订阅者）
     async def _trace_event_handler(self, event: BaseModel) -> None:
@@ -260,6 +270,7 @@ class CoreApp:
             trace=self._trace,
         )
         server.register("core.ping", self._ping_handler)
+        server.register("core.echo", self._echo_handler)
         server.register("agent.run", self._agent_run_handler)
         server.register("event.subscribe", self._subscribe_handler)
         server.register("session.create", self._session_create_handler)

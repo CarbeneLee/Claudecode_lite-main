@@ -6,7 +6,7 @@ import sys
 import time
 
 import kama_claude
-from kama_claude.core.bus.commands import PongResult
+from kama_claude.core.bus.commands import EchoResult
 from kama_claude.core.bus.envelope import JsonRpcError, JsonRpcSuccess
 from kama_claude.core.config import KamaConfig
 
@@ -43,8 +43,8 @@ async def _echo(config: KamaConfig, message: str) -> None:
         sys.exit(1)
 
     resp = JsonRpcSuccess.model_validate(raw)
-    result = PongResult.model_validate(resp.result)
-    print(f"echo response={result.server_version} latency={latency_ms}ms")
+    result = EchoResult.model_validate(resp.result)
+    print(f"echo server={result.server_version} message={result.message} latency={latency_ms}ms")
 
 
         
