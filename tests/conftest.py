@@ -11,6 +11,7 @@ from collections.abc import AsyncGenerator
 import pytest
 
 
+# 分配一个当前空闲的 TCP 端口供 daemon fixture 绑定
 @pytest.fixture
 def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -19,12 +20,14 @@ def free_port() -> int:
     return port  # socket released; daemon can bind to this port
 
 
+# 启动真实 kama-core 子进程并等待 TCP 端口可连接
 @pytest.fixture
 async def running_daemon(free_port: int) -> AsyncGenerator[subprocess.Popen[bytes], None]:
     env = os.environ.copy()
     env["KAMA_PORT"] = str(free_port)
     env["KAMA_LOG_FILE"] = ""
     env["KAMA_LOG_LEVEL"] = "WARNING"
+    env.setdefault("ANTHROPIC_API_KEY", "test-key")
 
     proc = subprocess.Popen([sys.executable, "-m", "kama_claude.core"], env=env)
 

@@ -23,7 +23,8 @@ def main() -> None:
     subparsers.add_parser("ping", help="Ping the core daemon")
     subparsers.add_parser("chat", help="Start a multi-turn chat session")
     echo_parser = subparsers.add_parser("echo", help="Echo a message to the core daemon")
-    echo_parser.add_argument("--message", required=True, help="Message to echo")
+    echo_parser.add_argument("message", nargs="?", help="Message to echo")
+    echo_parser.add_argument("--message", dest="message_option", help="Message to echo")
 
     run_parser = subparsers.add_parser("run", help="Run an agent task")
     run_parser.add_argument("--goal", required=True, help="Goal for the agent to accomplish")
@@ -57,7 +58,10 @@ def main() -> None:
     elif args.command == "run":
         cmd_run(args.goal, config)
     elif args.command == "echo":
-        cmd_echo(config, args.message)
+        message = args.message_option if args.message_option is not None else args.message
+        if message is None:
+            echo_parser.error("message is required")
+        cmd_echo(config, message)
     elif args.command == "core":
         if args.core_command == "start":
             cmd_core_start(config)
