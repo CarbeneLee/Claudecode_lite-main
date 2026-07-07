@@ -17,6 +17,15 @@ class PongResult(BaseModel):
     uptime_ms: int
     received_at: str  # ISO 8601
 
+class EchoCommand(BaseModel):
+    type: Literal["core.echo"] = "core.echo"
+    message: str
+
+class EchoResult(BaseModel):
+    server_version: str
+    received_at: str  # ISO 8601
+    message: str
+
 
 class AgentRunCommand(BaseModel):
     type: Literal["agent.run"] = "agent.run"
