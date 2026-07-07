@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
-from kama_claude.core.bus.commands import PingCommand, PongResult
+from kama_claude.core.bus.commands import Command, EchoCommand, PingCommand, PongResult
 from kama_claude.core.bus.events import CoreStartedEvent
 
 
@@ -14,6 +14,25 @@ def test_ping_command_roundtrip() -> None:
     cmd2 = PingCommand.model_validate_json(cmd.model_dump_json())
     assert cmd2.client == "cli/0.0.1"
     assert cmd2.type == "core.ping"
+
+
+# 功能：验证 EchoCommand 序列化为 JSON 后再反序列化，message 和 type 字段完整保留
+# 设计：直接使用 EchoCommand 做 JSON 往返，覆盖命令模型自身的字段约束和默认 type 判别键
+def test_echo_command_roundtrip() -> None:
+    cmd = EchoCommand(message="hello echo")
+    cmd2 = EchoCommand.model_validate_json(cmd.model_dump_json())
+    assert cmd2.message == "hello echo"
+    assert cmd2.type == "core.echo"
+
+
+# 功能：验证 EchoCommand 的 JSON 可以通过 Command 判别联合反序列化回 EchoCommand
+# 设计：用 TypeAdapter(Command) 模拟协议层按 type 分发，防止新增命令模型后忘记接入 Command union
+def test_echo_command_roundtrip_through_command_union() -> None:
+    cmd = EchoCommand(message="你好，echo")
+    cmd2 = TypeAdapter(Command).validate_json(cmd.model_dump_json())
+    assert isinstance(cmd2, EchoCommand)
+    assert cmd2.message == "你好，echo"
+    assert cmd2.type == "core.echo"
 
 
 # 功能：验证 PingCommand 的 type 字段默认值为 "core.ping"

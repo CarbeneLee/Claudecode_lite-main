@@ -5,11 +5,12 @@ import json
 import sys
 import time
 
-import kama_claude
 from kama_claude.core.bus.commands import EchoResult
 from kama_claude.core.bus.envelope import JsonRpcError, JsonRpcSuccess
 from kama_claude.core.config import KamaConfig
 
+
+# 执行 kama echo 命令，连接 daemon 并打印回显结果
 def cmd_echo(config: KamaConfig, message: str) -> None:
     try:
         asyncio.run(_echo(config, message))
@@ -17,6 +18,8 @@ def cmd_echo(config: KamaConfig, message: str) -> None:
         print(f"error: core not running ({config.host}:{config.port})", file=sys.stderr)
         sys.exit(1)
 
+
+# 异步发送 core.echo 请求并解析 JSON-RPC 响应
 async def _echo(config: KamaConfig, message: str) -> None:
     t0 = time.monotonic()
     reader, writer = await asyncio.open_connection(config.host, config.port)
@@ -45,6 +48,3 @@ async def _echo(config: KamaConfig, message: str) -> None:
     resp = JsonRpcSuccess.model_validate(raw)
     result = EchoResult.model_validate(resp.result)
     print(f"echo server={result.server_version} message={result.message} latency={latency_ms}ms")
-
-
-        

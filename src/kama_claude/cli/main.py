@@ -5,13 +5,13 @@ import sys
 
 from kama_claude.cli.commands.chat import cmd_chat
 from kama_claude.cli.commands.core import cmd_core_start, cmd_core_status, cmd_core_stop
+from kama_claude.cli.commands.echo import cmd_echo
 from kama_claude.cli.commands.ping import cmd_ping
 from kama_claude.cli.commands.run import cmd_run
 from kama_claude.cli.commands.trace import cmd_trace
 from kama_claude.cli.commands.version import cmd_version
 from kama_claude.core.config import get_config
 from kama_claude.core.logging_setup import setup_logging
-from kama_claude.cli.commands.echo import cmd_echo
 
 
 # CLI 主入口：解析命令行参数并分发到对应子命令

@@ -17,9 +17,11 @@ class PongResult(BaseModel):
     uptime_ms: int
     received_at: str  # ISO 8601
 
+
 class EchoCommand(BaseModel):
     type: Literal["core.echo"] = "core.echo"
     message: str
+
 
 class EchoResult(BaseModel):
     server_version: str
@@ -112,6 +114,7 @@ class SessionCompactResult(BaseModel):
 # 根据 type 字段决定命令类型的判别联合
 Command = Annotated[
     PingCommand
+    | EchoCommand
     | AgentRunCommand
     | EventSubscribeCommand
     | SessionCreateCommand

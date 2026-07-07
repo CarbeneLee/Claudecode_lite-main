@@ -17,12 +17,13 @@ import kama_claude
 from kama_claude.core.bus.commands import (
     AgentRunCommand,
     AgentRunResult,
+    EchoCommand,
+    EchoResult,
     EventSubscribeCommand,
     EventSubscribeResult,
     PermissionRespondCommand,
     PermissionRespondResult,
     PongResult,
-    EchoResult,
     SessionCloseCommand,
     SessionCloseResult,
     SessionCompactCommand,
@@ -78,15 +79,16 @@ class CoreApp:
             uptime_ms=int((time.monotonic() - self._start_time) * 1000),
             received_at=datetime.datetime.now(datetime.UTC).isoformat(),
         )
-    
+
+    # 处理 core.echo 请求，校验消息参数并返回原始 message
     async def _echo_handler(self, params: dict[str, Any]) -> EchoResult:
-        message = params.get("message", "")
-        logger.debug("echo message=%s", message)
+        cmd = EchoCommand.model_validate(params)
+        logger.debug("echo message=%s", cmd.message)
         return EchoResult(
             server_version=kama_claude.__version__,
             received_at=datetime.datetime.now(datetime.UTC).isoformat(),
-            message=message,
-    )
+            message=cmd.message,
+        )
 
     # 将 EventBus 事件写入 trace（作为 EventBus 订阅者）
     async def _trace_event_handler(self, event: BaseModel) -> None:
