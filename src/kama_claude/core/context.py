@@ -57,7 +57,7 @@ class ExecutionContext:
             "content": content,
         }
         if is_error:
-            block["is_error"] = True
+            block["is_error"] = True #ToolResult.content 作为 tool_result user block 写回 ExecutionContext；错误会带 is_error=True
 
         last = self.messages[-1] if self.messages else None
         if (

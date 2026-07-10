@@ -45,7 +45,8 @@ class AgentLoop:
         self._session_id = session_id
 
     # 驱动 plan→act→observe 循环直到上下文终止；CancelledError 向上传播
-    async def run(self, context: ExecutionContext) -> None:
+    # AgentLoop.run() 每步发布 step.started，调用 LLM：传入 context.messages、registry.tool_schemas()、system prompt
+    async def run(self, context: ExecutionContext) -> None: 
         while not context.is_done(): #一旦 status 变为 "success" 或 "failed"，循环退出。这是一个由状态机驱动的循环，不是简单的计数循环。
             context.step += 1
             await self._bus.publish(
