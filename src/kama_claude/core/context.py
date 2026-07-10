@@ -4,51 +4,51 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-@dataclass
+@dataclass # 唯一的、贯穿整个 run 生命周期的有状态对象（状态机、消息容器和系统提示词构建器）
 class ExecutionContext:
-    run_id: str
-    goal: str
-    max_steps: int
-    prefill_messages: list[dict[str, Any]] = field(default_factory=list)
-    session_notes: str = ""
-    global_context: str = ""
-    project_context: str = ""
-    messages: list[dict[str, Any]] = field(default_factory=list)
-    step: int = 0
-    status: str = "running"  # "running" | "success" | "failed"
-    reason: str | None = None
-    result: str = ""
+    run_id: str # 本次运行的唯一标识
+    goal: str # 用户的初始目标文本
+    max_steps: int # 最大执行步数
+    prefill_messages: list[dict[str, Any]] = field(default_factory=list) # session 回放的完整历史
+    session_notes: str = "" # 持久化笔记
+    global_context: str = "" # ~/.kama/context.md 内容
+    project_context: str = "" # .kama/context.md 内容
+    messages: list[dict[str, Any]] = field(default_factory=list) # ← 核心：完整的对话历史
+    step: int = 0 # 当前步数计数器
+    status: str = "running"  # "running" | "success" | "failed" 
+    reason: str | None = None # 失败原因（成功时为 None）
+    result: str = "" # 最终文本输出
     # skill 或 subagent 角色可覆盖默认 system prompt
-    system_prompt_override: str | None = None
-
+    system_prompt_override: str | None = None #system_prompt_override 存在时，base prompt 被完全跳过
+    # 每个上下文层都通过 .strip() 检查是否为空。空文件不会产生空的 ## Global Context\n 标题，保持最终 prompt 的整洁
     # 初始化消息历史，优先使用 session 完整回放内容
     def __post_init__(self) -> None:
-        if self.prefill_messages:
-            self.messages = [dict(m) for m in self.prefill_messages]
-        elif not self.messages:
+        if self.prefill_messages: # prefill_message非空
+            self.messages = [dict(m) for m in self.prefill_messages] #防御性拷贝，直接饮用prefill_messages可能导致外部修改影响上下文(跨run数据污染)
+        elif not self.messages: #如果prefill_messages为空且messages不为空，则将goal作为用户消息追加到messages中
             self.messages.append({"role": "user", "content": self.goal})
 
     # 返回当前 run 的 system prompt；有 override 时跳过 base，直接注入记忆层
-    def system_prompt(self, base: str) -> str:
-        parts = [self.system_prompt_override if self.system_prompt_override else base]
-        if self.global_context.strip():
+    def system_prompt(self, base: str) -> str: #最终 System Prompt = [base 或 override] + [Global Context] + [Project Context] + [Session Notes]
+        parts = [self.system_prompt_override if self.system_prompt_override else base] #base硬编码在AgentLoop.run() 中
+        if self.global_context.strip(): #~/.kama/context.md,跨项目记录用户偏好和全局规则
             parts.append("\n\n## Global Context\n" + self.global_context.strip())
-        if self.project_context.strip():
+        if self.project_context.strip():# .kama/context.md,作用于当前项目的项目级别的上下文信息，通常包含项目目标、约束和已知事实
             parts.append("\n\n## Project Context\n" + self.project_context.strip())
-        if self.session_notes.strip():
+        if self.session_notes.strip(): #SessionStore 持久化，跨多轮对话持续记忆的事实
             parts.append(
                 "\n\n## Session Notes\n"
                 + self.session_notes.strip()
-                + "\n\nRemember important durable facts by calling note_save."
+                + "\n\nRemember important durable facts by calling note_save."#这行提示是运行时注入的元指令，让 LLM 知道它有一个持久化记忆工具可用。
             )
-        return "".join(parts)
+        return "".join(parts)#因为每个部分都以 \n\n 开头，用空字符串 join 比 "\n\n".join() 更精确
 
     # 将 LLM 响应的 content blocks 追加为 assistant 消息
     def add_assistant_message(self, content: list[Any]) -> None:
         self.messages.append({"role": "assistant", "content": content})
 
     # 将工具调用结果追加为 user 消息；同一步的多个结果共享同一条消息
-    def add_tool_result(
+    def add_tool_result(# 同一步的多个工具调用结果共享同一条 user 消息，避免消息膨胀
         self, tool_use_id: str, content: str, is_error: bool = False
     ) -> None:
         block: dict[str, Any] = {
@@ -61,12 +61,12 @@ class ExecutionContext:
 
         last = self.messages[-1] if self.messages else None
         if (
-            last is not None
-            and last["role"] == "user"
-            and isinstance(last["content"], list)
-            and last["content"]
-            and all(b.get("type") == "tool_result" for b in last["content"])
-        ):
+            last is not None #	messages 列表为空
+            and last["role"] == "user" #上一条是 assistant（需要在新的 user 消息中追加）
+            and isinstance(last["content"], list) #user content 是纯文本字符串（如初始 "请帮我..."）
+            and last["content"] #content 列表为空（防御性检查）
+            and all(b.get("type") == "tool_result" for b in last["content"]) # content 中有 text 类型的 block（混合内容）
+        ): # 只有五个条件全部满足时，才将新的 tool_result 追加到上一条 user 消息中。否则创建一条全新的 user 消息。
             last["content"].append(block)
         else:
             self.messages.append({"role": "user", "content": [block]})
@@ -83,3 +83,55 @@ class ExecutionContext:
     def mark_failed(self, reason: str) -> None:
         self.status = "failed"
         self.reason = reason
+'''
+Anthropic API 要求同一步的多个 tool_result 必须放在同一条 role: user 消息的 content 数组中：
+
+
+# ✅ 正确格式
+{"role": "user", "content": [
+    {"type": "tool_result", "tool_use_id": "tool_001", "content": "..."},
+    {"type": "tool_result", "tool_use_id": "tool_002", "content": "..."},
+]}
+
+# ❌ 错误格式（会导致 API 拒绝）
+{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tool_001", ...}]}
+{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tool_002", ...}]}
+'''
+
+'''
+当前 messages 末尾                     调用 add_tool_result 后
+────────────────────────────────────    ──────────────────────────
+[..., {role:assistant, content:[...tool_use...]}]
+                                     → [..., {role:assistant, ...},
+                                          {role:user, content:[tool_result_A]}]  ← 新建 user 消息
+
+[..., {role:user, content:[tool_result_A]}]
+                                     → [..., {role:user, content:[tool_result_A,
+                                                                   tool_result_B]}]  ← 追加到同一条
+
+[..., {role:user, content:"纯文本消息"}]
+                                     → [..., {role:user, content:"纯文本"},
+                                          {role:user, content:[tool_result_A]}]  ← 新建 user 消息
+'''
+
+'''
+AgentRunner.run_and_capture()
+  │  创建 ExecutionContext  ──────────────────────┐
+  │  读取 context.status / context.result          │
+  │                                                │
+AgentLoop.run(context)                             │
+  │  轮询 context.is_done()         ◄──────────────┤
+  │  调用 context.system_prompt()                  │
+  │  调用 context.add_assistant_message()          │
+  │  调用 context.add_tool_result()                │
+  │  设置 context.step += 1                        │
+  │  设置 context.result / mark_success / mark_failed
+  │                                                │
+Compactor.compact(context, provider)               │
+  │  读取 context.messages                         │
+  │  就地替换 context.messages = [...]  ◄──────────┤
+  │                                                │
+EventWriter                                        │
+  │  读取 context.run_id（事件关联）                │
+  └────────────────────────────────────────────────┘
+'''

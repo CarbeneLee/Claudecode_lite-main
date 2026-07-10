@@ -40,23 +40,23 @@ from kama_claude.core.trace.provider import TracingProvider
 from kama_claude.core.trace.writer import TraceWriter
 
 
-def _now() -> str:
+def _now() -> str: # 生成当前 UTC 时间的 ISO 格式字符串，用于事件时间戳。
     return datetime.now(UTC).isoformat()
-
+# 返回str而非datetime对象，方便JSONL序列化和日志记录。
 
 @dataclass
 class RunOutcome:
-    status: str
-    result: str
-    reason: str | None
-
+    status: str # 运行状态，例如 "success" 或 "failure"
+    result: str  # 运行结果的文本输出，可能为 None
+    reason: str | None # 运行失败的原因，如果有的话
+# 一次运行后的不可变快照结果
 
 class AgentRunner:
     # 组装所有运行时依赖，准备执行一次完整的 agent run
     def __init__(
         self,
-        config: KamaConfig,
-        *,
+        config: KamaConfig, #唯一必须参数
+        *, # 通过*传递的可选参数
         bus: EventBus | None = None,
         provider: LLMProvider | None = None,
         extra_handlers: list[EventHandler] | None = None,
@@ -77,8 +77,8 @@ class AgentRunner:
         self._task_registry = BackgroundTaskRegistry()
 
     # 构建工具注册表，注入 TaskManager（任务工具共享同一实例）；可选注入 SpawnAgentTool
-    def _build_registry(
-        self,
+    def _build_registry( #条件化工具注入
+        self, 
         task_manager: TaskManager,
         *,
         session: Session | None = None,
@@ -124,7 +124,7 @@ class AgentRunner:
                         task_registry=self._task_registry,
                         runs_dir=runs_dir,
                         session_id=session_id,
-                        depth=0,
+                        depth=0, # 防止agent无限递归调用自身，depth=0表示这是顶层agent
                     )
                 )
             if _ok("agent_result"):
@@ -140,13 +140,13 @@ class AgentRunner:
         await self.run_and_capture(goal, run_id=run_id)
 
     # 执行 agent run 并返回 RunOutcome（含最终文字结果）
-    async def run_and_capture(
+    async def run_and_capture( #构造执行上下文，创建 AgentLoop，驱动循环，处理异常，返回最终结果
         self,
         goal: str,
         *,
         run_id: str | None = None,
-        session: Session | None = None,
-        store: SessionStore | None = None,
+        session: Session | None = None, #无 session 时：创建最小历史 [{"role": "user", "content": goal}]，作为一次性执行。
+        store: SessionStore | None = None,#有session时，运行结果会被存储到sessionstore中,实现上下文延续
         system_prompt_override: str | None = None,
         tool_whitelist: list[str] | None = None,
     ) -> RunOutcome:
@@ -164,25 +164,25 @@ class AgentRunner:
         global_ctx = load_context_file(Path("~/.kama/context.md").expanduser())
         project_ctx = load_context_file(Path(".kama/context.md"))
 
-        task_manager = TaskManager(run_path / ".tasks")
+        task_manager = TaskManager(run_path / ".tasks") #TaskManager 的存储路径是 run_path / ".tasks"，每个 run 有独立的任务文件，互不干扰
 
         bus = self._bus if self._bus is not None else EventBus()
         for h in self._extra_handlers:
             bus.subscribe(h)
 
-        context = ExecutionContext(
+        context = ExecutionContext( #这里创建了一个执行上下文对象，包含了运行的基本信息和状态信息等。|]|
             run_id=run_id,
             goal=goal,
-            max_steps=self._config.agent.max_steps,
-            prefill_messages=history,
+            max_steps=self._config.agent.max_steps, # max_steps: int = _DEFAULT_MAX_STEPS,对于本程序是20
+            prefill_messages=history, #messages：完整的对话历史（prefill_messages → 持续的 assistant/user 交替）
             session_notes=notes,
             global_context=global_ctx,
             project_context=project_ctx,
             system_prompt_override=system_prompt_override,
         )
-        prefill_len = len(history)
+        prefill_len = len(history) #避免重复存储历史消息
 
-        async with EventWriter(run_path / "events.jsonl") as writer:
+        async with EventWriter(run_path / "events.jsonl") as writer: #EventWriter 是一个异步上下文管理器，自动处理文件打开/关闭。
             writer.subscribe(bus)
             await bus.publish(RunStartedEvent(run_id=run_id, goal=goal, ts=_now()))
 
@@ -224,12 +224,12 @@ class AgentRunner:
                     provider, registry, bus,
                     permission_manager=self._permission_manager,
                     compactor=compactor,
-                    compact_threshold=self._config.compaction.auto_threshold,
+                    compact_threshold=self._config.compaction.auto_threshold, #触发压缩上下文的阈值
                     session_id=session_id_str,
                 )
                 await loop.run(context)
-            except asyncio.CancelledError:
-                cancelled = True
+            except asyncio.CancelledError: #CancelledError 单独处理：这是 Python 异步取消的标准模式。cancelled = True 标志位使得方法在退出前知道是被取消的。
+                cancelled = True #确保取消不丢失数据
                 if not context.is_done():
                     context.mark_failed("cancelled")
             except Exception:
