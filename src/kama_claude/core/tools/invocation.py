@@ -1,5 +1,7 @@
 from __future__ import annotations
-# invocation.py 是 KamaClaude 的工具调用管线 (Tool Invocation Pipeline),它是 AgentLoop [Act] 阶段的核心实现——接收 LLM 产生的 ToolCallBlock
+
+# invocation.py 是 KamaClaude 的工具调用管线 (Tool Invocation Pipeline)
+# 它是 AgentLoop [Act] 阶段的核心实现，接收 LLM 产生的 ToolCallBlock
 import asyncio
 import time
 from datetime import UTC, datetime
@@ -24,8 +26,10 @@ from kama_claude.core.tools.registry import ToolRegistry
 if TYPE_CHECKING:
     from kama_claude.core.permissions.manager import PermissionManager
 
-_DEFAULT_TIMEOUT: float = 120.0 #单个工具调用最长 2 分钟。对于耗时操作（如 bash 执行大脚本），调用方可以传入更大的 timeout
-_MAX_RETRIES: int = 2 #最多 3 次尝试（1 次初始 + 2 次重试）。不是 3 而是 2，符合 range(1, _MAX_RETRIES + 2) 的语义
+# 单个工具调用最长 2 分钟，耗时操作可由调用方传入更大 timeout
+_DEFAULT_TIMEOUT: float = 120.0
+# 最多 3 次尝试，即 1 次初始调用加 2 次重试
+_MAX_RETRIES: int = 2
 _RETRY_BASE_S: float = 2.0  # backoff base; tests can monkeypatch to 0
 _RETRYABLE: frozenset[str] = frozenset({"runtime_error", "rate_limited"})
 
@@ -46,7 +50,8 @@ async def _fail(
     attempt: int = 1,
 ) -> ToolResult:
     await bus.publish(
-        ToolCallFailedEvent( #发布 ToolCallFailedEvent——让外部观察者（TUI、日志、追踪系统）知道工具调用失败了
+        # 发布失败事件，让 TUI、日志和追踪系统知道工具调用失败
+        ToolCallFailedEvent(
             run_id=run_id,
             tool_use_id=tool_call.id,
             tool_name=tool_call.name,
@@ -71,7 +76,8 @@ async def invoke_tool(
     permission_manager: PermissionManager | None = None,
     session_id: str = "",
 ) -> ToolResult:
-    t0 = time.monotonic()# monotonic 不受系统时间调整（NTP 校时、用户改时间）的影响，保证 elapsed_ms 始终准确——即使有人在工具执行过程中调整了系统时钟。
+    # monotonic 不受 NTP 或人工校时影响，保证 elapsed_ms 准确
+    t0 = time.monotonic()
 
     await bus.publish(
         ToolCallStartedEvent(
@@ -83,11 +89,13 @@ async def invoke_tool(
         )
     )
 
-    def elapsed() -> int: #elapsed() 闭包,通过闭包捕获 t0，调用方不需要传递计时状态。每次调用返回的是从阶段 1 开始到当前的真实耗时（毫秒级），而非单次尝试的耗时
+    # 通过闭包捕获 t0，返回从阶段 1 开始到当前的真实耗时
+    def elapsed() -> int:
         return int((time.monotonic() - t0) * 1000)
 
     tool = registry.get(tool_call.name)
-    if tool is None: #LLM 可能产生幻觉，调用不存在的工具。这里做防御性检查，返回 "unknown tool" 的明确错误，LLM 看到后会纠正自己的行为。
+    # 防御 LLM 调用不存在的工具，并返回明确错误供其纠正
+    if tool is None:
         return await _fail(
             bus, run_id, tool_call,
             "runtime_error", f"unknown tool: {tool_call.name}", elapsed(),
@@ -106,7 +114,8 @@ async def invoke_tool(
         async def _emit_permission(raw: dict[str, Any]) -> None:
             await bus.publish(PermissionRequestedEvent(**raw, run_id=run_id))
 
-        allowed, decision = await permission_manager.check_and_wait( #若有 PermissionManager，调用 check_and_wait()
+        # 若有 PermissionManager，则调用 check_and_wait()
+        allowed, decision = await permission_manager.check_and_wait(
             tool_use_id=tool_call.id,
             tool_name=tool_call.name,
             params=dict(tool_call.input),
@@ -114,7 +123,8 @@ async def invoke_tool(
             event_emitter=_emit_permission,
         )
         if allowed:
-            if decision not in ("auto_allow",): #可能自动放行、自动拒绝，或发布 permission.requested 并等待客户端 permission.respond
+            # 可能自动决策，或发布 permission.requested 等待客户端响应
+            if decision not in ("auto_allow",):
                 await bus.publish(
                     PermissionGrantedEvent(
                         run_id=run_id,
@@ -185,7 +195,8 @@ async def invoke_tool(
 
         if error_class in _RETRYABLE and attempt <= _MAX_RETRIES:
             await bus.publish(
-                ToolCallFailedEvent( #每次重试前发布 ToolCallFailedEvent：这让监控系统可以追踪"这个工具在第几次尝试时失败了"
+                # 每次重试前发布失败事件，以追踪失败的 attempt
+                ToolCallFailedEvent(
                     run_id=run_id,
                     tool_use_id=tool_call.id,
                     tool_name=tool_call.name,
@@ -205,7 +216,7 @@ async def invoke_tool(
             attempt=attempt,
         )
 
-    # unreachable, but keeps mypy happy 理论上永远不会执行，for 循环的 _fail 或 return result 覆盖了所有路径），但类型检查器（mypy）需要看到函数在所有路径上都有返回值。
+    # 理论上不可达，但 mypy 需要看到所有路径都有返回值
     return ToolResult(content="internal error", is_error=True, error_type="runtime_error")
 '''
 invoke_tool(tool_call)
@@ -268,7 +279,8 @@ except TimeoutError:
 通过 event_emitter 向客户端（TUI / API）发送审批请求（生产者触发）
 await future——工具调用在此挂起，直到用户响应
 客户端通过 PermissionManager.respond(tool_use_id, decision) 来 set_result，唤醒 Future
-超时保护：asyncio.wait_for(future, timeout=self._timeout_s)，默认 60 秒。超时后返回 False, "timeout"——这算是一种安全的拒绝。
+超时保护：asyncio.wait_for(future, timeout=self._timeout_s)，默认 60 秒。\
+超时后返回 False, "timeout"——这算是一种安全的拒绝。
 
 客户端断连保护
 
@@ -281,7 +293,8 @@ def cancel_session(self, session_id: str, reason: str = "client_disconnected") -
         req = self._pending.pop(uid)
         if not req.future.done():
             req.future.set_result("deny_once")
-当客户端断开连接时，该 session 的所有待审批请求被批量拒绝（set_result("deny_once")）。这防止了 Future 永久挂起导致的内存泄漏和工具调用死锁。
+当客户端断开连接时，该 session 的所有待审批请求被批量拒绝（set_result("deny_once")）。\
+这防止了 Future 永久挂起导致的内存泄漏和工具调用死锁。
 '''
 
 '''
@@ -348,18 +361,22 @@ AgentLoop.run()                         ← 调用方
 
 '''
 模式/实践	                位置	                                价值
-永不抛异常的设计	        整个函数都返回 ToolResult	            LLM 总能收到反馈，loop 不会因工具失败而崩溃
+永不抛异常的设计	        整个函数都返回 ToolResult	            LLM 总能收到反馈，\
+loop 不会因工具失败而崩溃
 time.monotonic() 计时	t0 = time.monotonic()	                不受系统时间调整影响，耗时统计准确
 闭包式 elapsed()	    内部函数捕获 t0	                            调用方无需传计时状态，接口简洁
-Pydantic 校验先行	    权限检查之前做参数校验	                    无效参数直接拒绝，不浪费权限检查资源
+Pydantic 校验先行	    权限检查之前做参数校验	                    无效参数直接拒绝，\
+不浪费权限检查资源
 auto_* 事件抑制	    decision not in ("auto_allow",)	            缓存命中不高亮，保持日志信噪比
 依赖反转的权限回调	    _emit_permission 闭包	                    PermissionManager 不依赖 EventBus
 按特定性排序的异常捕获	RateLimitedError → TimeoutError → Exception	    语义化异常 vs 兜底泛化异常
 TimeoutError 不可重试	特殊分支直接 _fail	                        超时=任务太重，重试无意义
 指数退避重试	        2.0 × 2^(attempt-1)	                        给上游 API 恢复时间
-Mypy 兼容守卫	        # unreachable, but keeps mypy happy	        工程实际：有时需要为类型检查器妥协
+Mypy 兼容守卫	        # unreachable, but keeps mypy happy	        工程实际：\
+有时需要为类型检查器妥协
 客户端断连保护	        cancel_session	                            防止 Future 永久挂起导致内存泄漏
-对 LLM 友好的错误信息	permission_denied 的指导语	                LLM 不只是看到错误，还能知道下一步怎么做
+对 LLM 友好的错误信息	permission_denied 的指导语	                LLM 不只是看到错误，\
+还能知道下一步怎么做
 frozenset 不可变常量	_RETRYABLE	                                防止运行时意外修改配置
 测试友好的可修改常量	# tests can monkeypatch to 0	                测试不走真实退避，保持快速
 '''

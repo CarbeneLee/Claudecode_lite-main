@@ -20,26 +20,33 @@ class ExecutionContext:
     result: str = "" # 最终文本输出
     # skill 或 subagent 角色可覆盖默认 system prompt
     system_prompt_override: str | None = None #system_prompt_override 存在时，base prompt 被完全跳过
-    # 每个上下文层都通过 .strip() 检查是否为空。空文件不会产生空的 ## Global Context\n 标题，保持最终 prompt 的整洁
+    # 每个上下文层都通过 .strip() 检查是否为空。
+    # 空文件不会产生空的 ## Global Context\n 标题，保持最终 prompt 的整洁
     # 初始化消息历史，优先使用 session 完整回放内容
     def __post_init__(self) -> None:
         if self.prefill_messages: # prefill_message非空
-            self.messages = [dict(m) for m in self.prefill_messages] #防御性拷贝，直接饮用prefill_messages可能导致外部修改影响上下文(跨run数据污染)
-        elif not self.messages: #如果prefill_messages为空且messages不为空，则将goal作为用户消息追加到messages中
+            # 防御性拷贝，避免外部修改 prefill_messages 导致跨 run 数据污染
+            self.messages = [dict(m) for m in self.prefill_messages]
+        # 如果 prefill_messages 为空且 messages 不为空，则将 goal 作为用户消息追加
+        elif not self.messages:
             self.messages.append({"role": "user", "content": self.goal})
 
+    # 最终提示由 base/override、Global Context、Project Context 和 Session Notes 组成
     # 返回当前 run 的 system prompt；有 override 时跳过 base，直接注入记忆层
-    def system_prompt(self, base: str) -> str: #最终 System Prompt = [base 或 override] + [Global Context] + [Project Context] + [Session Notes]
-        parts = [self.system_prompt_override if self.system_prompt_override else base] #base硬编码在AgentLoop.run() 中
+    def system_prompt(self, base: str) -> str:
+        # base 硬编码在 AgentLoop.run() 中
+        parts = [self.system_prompt_override if self.system_prompt_override else base]
         if self.global_context.strip(): #~/.kama/context.md,跨项目记录用户偏好和全局规则
             parts.append("\n\n## Global Context\n" + self.global_context.strip())
-        if self.project_context.strip():# .kama/context.md,作用于当前项目的项目级别的上下文信息，通常包含项目目标、约束和已知事实
+        # .kama/context.md 作用于当前项目，包含项目目标、约束和已知事实
+        if self.project_context.strip():
             parts.append("\n\n## Project Context\n" + self.project_context.strip())
         if self.session_notes.strip(): #SessionStore 持久化，跨多轮对话持续记忆的事实
+            # 运行时元指令提示 LLM 可以使用持久化记忆工具
             parts.append(
                 "\n\n## Session Notes\n"
                 + self.session_notes.strip()
-                + "\n\nRemember important durable facts by calling note_save."#这行提示是运行时注入的元指令，让 LLM 知道它有一个持久化记忆工具可用。
+                + "\n\nRemember important durable facts by calling note_save."
             )
         return "".join(parts)#因为每个部分都以 \n\n 开头，用空字符串 join 比 "\n\n".join() 更精确
 
@@ -57,16 +64,19 @@ class ExecutionContext:
             "content": content,
         }
         if is_error:
-            block["is_error"] = True #ToolResult.content 作为 tool_result user block 写回 ExecutionContext；错误会带 is_error=True
+            # ToolResult.content 写回 ExecutionContext；错误会带 is_error=True
+            block["is_error"] = True
 
         last = self.messages[-1] if self.messages else None
+        # 五个条件全部满足时追加到上一条 user 消息，否则创建新消息
         if (
             last is not None #	messages 列表为空
             and last["role"] == "user" #上一条是 assistant（需要在新的 user 消息中追加）
             and isinstance(last["content"], list) #user content 是纯文本字符串（如初始 "请帮我..."）
             and last["content"] #content 列表为空（防御性检查）
-            and all(b.get("type") == "tool_result" for b in last["content"]) # content 中有 text 类型的 block（混合内容）
-        ): # 只有五个条件全部满足时，才将新的 tool_result 追加到上一条 user 消息中。否则创建一条全新的 user 消息。
+            # content 中有 text 类型的 block（混合内容）
+            and all(b.get("type") == "tool_result" for b in last["content"])
+        ):
             last["content"].append(block)
         else:
             self.messages.append({"role": "user", "content": [block]})
