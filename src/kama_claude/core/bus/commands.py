@@ -32,6 +32,7 @@ class EchoResult(BaseModel):
 class AgentRunCommand(BaseModel):
     type: Literal["agent.run"] = "agent.run"
     goal: str
+    workspace_root: str
 
 
 class AgentRunResult(BaseModel):
@@ -54,6 +55,7 @@ class SessionCreateCommand(BaseModel):
     type: Literal["session.create"] = "session.create"
     mode: SessionMode = "chat"
     title: str = ""
+    workspace_root: str
 
 
 class SessionCreateResult(BaseModel):

@@ -4,6 +4,7 @@ import asyncio
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from kama_claude.core.bus.envelope import HandlerError
@@ -53,7 +54,13 @@ class SessionManager:
         self._skill_loader = SkillLoader()
 
     # 创建新 session 并写入 meta.json
-    async def create(self, mode: SessionMode, title: str = "") -> Session:
+    async def create(
+        self,
+        mode: SessionMode,
+        title: str = "",
+        *,
+        workspace_root: Path,
+    ) -> Session:
         sid = f"sess-{uuid.uuid4().hex[:12]}"
         ts = _now()
         session = Session(
@@ -63,6 +70,7 @@ class SessionManager:
             title=title,
             created_at=ts,
             updated_at=ts,
+            workspace_root=workspace_root,
             run_ids=[],
         )
         self._sessions[sid] = session

@@ -3,7 +3,14 @@ from __future__ import annotations
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
-from kama_claude.core.bus.commands import Command, EchoCommand, PingCommand, PongResult
+from kama_claude.core.bus.commands import (
+    AgentRunCommand,
+    Command,
+    EchoCommand,
+    PingCommand,
+    PongResult,
+    SessionCreateCommand,
+)
 from kama_claude.core.bus.events import CoreStartedEvent
 
 
@@ -33,6 +40,57 @@ def test_echo_command_roundtrip_through_command_union() -> None:
     assert isinstance(cmd2, EchoCommand)
     assert cmd2.message == "你好，echo"
     assert cmd2.type == "core.echo"
+
+
+# 功能：验证 AgentRunCommand 序列化往返后保留 workspace_root
+# 设计：使用绝对路径字符串做 JSON 往返，锁定客户端到 daemon 的 wire 字段
+def test_agent_run_command_roundtrip_preserves_workspace_root() -> None:
+    cmd = AgentRunCommand(goal="inspect", workspace_root="/tmp/project")
+
+    restored = AgentRunCommand.model_validate_json(cmd.model_dump_json())
+
+    assert restored.workspace_root == "/tmp/project"
+
+
+# 功能：验证 SessionCreateCommand 序列化往返后保留 workspace_root
+# 设计：同时保留 mode 和 workspace_root，覆盖 chat session 创建命令的完整输入
+def test_session_create_command_roundtrip_preserves_workspace_root() -> None:
+    cmd = SessionCreateCommand(mode="chat", workspace_root="/tmp/project")
+
+    restored = SessionCreateCommand.model_validate_json(cmd.model_dump_json())
+
+    assert restored.mode == "chat"
+    assert restored.workspace_root == "/tmp/project"
+
+
+# 功能：验证 AgentRunCommand 缺少 workspace_root 时拒绝校验
+# 设计：直接校验最小原始 params，确认不能用默认 cwd 隐式补全
+def test_agent_run_command_missing_workspace_root_raises() -> None:
+    with pytest.raises(ValidationError):
+        AgentRunCommand.model_validate({"goal": "inspect"})
+
+
+# 功能：验证 SessionCreateCommand 缺少 workspace_root 时拒绝校验
+# 设计：不传 workspace_root 构造命令，防止旧客户端静默绑定 daemon cwd
+def test_session_create_command_missing_workspace_root_raises() -> None:
+    with pytest.raises(ValidationError):
+        SessionCreateCommand.model_validate({"mode": "chat"})
+
+
+# 功能：验证 AgentRunCommand 的 workspace_root 类型错误仍由 Pydantic 拒绝
+# 设计：传入整数而非字符串，锁定类型错误不进入 workspace domain 校验器
+def test_agent_run_command_invalid_workspace_root_type_raises() -> None:
+    with pytest.raises(ValidationError):
+        AgentRunCommand.model_validate({"goal": "inspect", "workspace_root": 123})
+
+
+# 功能：验证 SessionCreateCommand 的 workspace_root 类型错误仍由 Pydantic 拒绝
+# 设计：使用 list 触发字符串字段校验，确认 handler 不会改写 Invalid params 语义
+def test_session_create_command_invalid_workspace_root_type_raises() -> None:
+    with pytest.raises(ValidationError):
+        SessionCreateCommand.model_validate(
+            {"mode": "chat", "workspace_root": ["project"]}
+        )
 
 
 # 功能：验证 PingCommand 的 type 字段默认值为 "core.ping"

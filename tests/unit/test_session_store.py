@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+import pytest
 
 from kama_claude.core.session.model import Session
 from kama_claude.core.session.store import SessionStore
@@ -16,8 +19,10 @@ def test_store_creates_root(tmp_path: Path) -> None:
 
 # 功能：验证 session meta 写入后能完整读回
 # 设计：构造含 run_ids 的 Session，经过 JSON 文件往返后断言字段保持，覆盖 meta.json 的持久化契约
-def test_meta_roundtrip(tmp_path: Path) -> None:
+def test_session_meta_roundtrip_preserves_workspace_root(tmp_path: Path) -> None:
     store = SessionStore(tmp_path)
+    workspace_root = (tmp_path / "workspace").resolve()
+    workspace_root.mkdir()
     session = Session(
         id="sess-1",
         mode="chat",
@@ -25,11 +30,74 @@ def test_meta_roundtrip(tmp_path: Path) -> None:
         title="hello",
         created_at="t1",
         updated_at="t2",
+        workspace_root=workspace_root,
         run_ids=["run-1"],
     )
     store.write_meta(session)
     loaded = store.read_meta("sess-1")
     assert loaded == session
+
+
+# 功能：验证 Session.to_dict 将 workspace_root Path 序列化为字符串
+# 设计：直接检查 domain model 输出，隔离 JSON writer 以锁定 Path 转换边界
+def test_session_to_dict_serializes_workspace_root(tmp_path: Path) -> None:
+    session = Session(
+        id="sess-1",
+        mode="chat",
+        status="active",
+        title="",
+        created_at="t1",
+        updated_at="t1",
+        workspace_root=tmp_path.resolve(),
+    )
+
+    assert session.to_dict()["workspace_root"] == str(tmp_path.resolve())
+
+
+# 功能：验证 Session.from_dict 将 workspace_root 字符串恢复为 Path
+# 设计：传入完整 meta dict 并断言类型与值，避免只靠 dataclass 等值间接覆盖
+def test_session_from_dict_restores_workspace_root(tmp_path: Path) -> None:
+    workspace_root = tmp_path.resolve()
+    session = Session.from_dict(
+        {
+            "id": "sess-1",
+            "mode": "chat",
+            "status": "active",
+            "title": "",
+            "created_at": "t1",
+            "updated_at": "t1",
+            "workspace_root": str(workspace_root),
+            "run_ids": [],
+        }
+    )
+
+    assert isinstance(session.workspace_root, Path)
+    assert session.workspace_root == workspace_root
+
+
+# 功能：验证缺少 workspace_root 的旧 session meta 读取时明确失败
+# 设计：直接写入 legacy meta.json 再经 SessionStore 读取，确认不会 fallback 到 cwd
+def test_legacy_session_meta_without_workspace_root_raises(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    session_dir = store.session_dir("sess-legacy")
+    session_dir.mkdir()
+    (session_dir / "meta.json").write_text(
+        json.dumps(
+            {
+                "id": "sess-legacy",
+                "mode": "chat",
+                "status": "active",
+                "title": "legacy",
+                "created_at": "t1",
+                "updated_at": "t1",
+                "run_ids": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(KeyError, match="workspace_root"):
+        store.read_meta("sess-legacy")
 
 
 # 功能：验证含 tool_use/tool_result block 的 thread 消息能按 Anthropic 格式读回

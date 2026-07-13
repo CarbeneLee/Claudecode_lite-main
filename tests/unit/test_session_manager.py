@@ -48,10 +48,13 @@ async def test_create_session_writes_meta_and_event(tmp_path: Path) -> None:
     store = SessionStore(tmp_path)
     manager = SessionManager(store, lambda: _Runner(), bus)  # type: ignore[arg-type]
 
-    session = await manager.create("chat", "title")
+    workspace_root = tmp_path.resolve()
+    session = await manager.create("chat", "title", workspace_root=workspace_root)
 
     assert session.status == "active"
+    assert session.workspace_root == workspace_root
     assert store.read_meta(session.id).title == "title"
+    assert store.read_meta(session.id).workspace_root == workspace_root
     assert [e.type for e in events] == ["session.created"]  # type: ignore[attr-defined]
 
 
@@ -60,7 +63,7 @@ async def test_create_session_writes_meta_and_event(tmp_path: Path) -> None:
 async def test_send_message_chat_enters_waiting_and_writes_thread(tmp_path: Path) -> None:
     store = SessionStore(tmp_path)
     manager = SessionManager(store, lambda: _Runner(), EventBus())  # type: ignore[arg-type]
-    session = await manager.create("chat")
+    session = await manager.create("chat", workspace_root=tmp_path.resolve())
 
     run_id = await manager.send_message(session.id, "hello")
 
@@ -77,7 +80,7 @@ async def test_send_message_chat_enters_waiting_and_writes_thread(tmp_path: Path
 async def test_one_shot_auto_closes(tmp_path: Path) -> None:
     store = SessionStore(tmp_path)
     manager = SessionManager(store, lambda: _Runner(), EventBus())  # type: ignore[arg-type]
-    session = await manager.create("one_shot")
+    session = await manager.create("one_shot", workspace_root=tmp_path.resolve())
 
     await manager.send_message(session.id, "hello")
 
@@ -98,7 +101,7 @@ async def test_missing_session_raises_handler_error(tmp_path: Path) -> None:
 async def test_closed_session_rejects_message(tmp_path: Path) -> None:
     store = SessionStore(tmp_path)
     manager = SessionManager(store, lambda: _Runner(), EventBus())  # type: ignore[arg-type]
-    session = await manager.create("chat")
+    session = await manager.create("chat", workspace_root=tmp_path.resolve())
     await manager.close(session.id)
 
     with pytest.raises(HandlerError) as exc:

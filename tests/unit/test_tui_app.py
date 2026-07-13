@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
+from typing import Any
+
+import pytest
 from rich.markdown import Markdown
 from textual.widget import Widget
 
+import kama_claude.tui.app as tui_app_module
 from kama_claude.tui.app import (
     KamaTuiApp,
     LLMStreamBlock,
@@ -203,3 +209,84 @@ def test_unknown_event_silently_ignored() -> None:
 
     app._handle_event({"type": "some.unknown.type", "run_id": "r", "ts": "t"})
     assert appended == []
+
+
+# 功能：验证 TUI 的 session.create 发送当前进程的 canonical cwd
+# 设计：直接运行 socket loop 并替换 SocketClient/DOM 边界，捕获真实 send_command payload
+async def test_tui_session_create_sends_canonical_client_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[tuple[str, dict[str, Any]]] = []
+    created = asyncio.Event()
+
+    class _Client:
+        # 保留与真实 SocketClient 相同的构造界面
+        def __init__(self, host: str, port: int) -> None:
+            return None
+
+        # 模拟成功建立 IPC 连接
+        async def connect(self) -> None:
+            return None
+
+        # 保持事件循环挂起，由测试取消 socket loop
+        async def run_event_loop(self) -> None:
+            await asyncio.Event().wait()
+
+        # TUI workspace 测试不需要处理推送事件
+        def on_event(self, handler: object) -> None:
+            return None
+
+        # 记录 IPC payload，在 session.create 后通知测试停止循环
+        async def send_command(
+            self,
+            method: str,
+            params: dict[str, Any],
+        ) -> dict[str, Any]:
+            commands.append((method, params))
+            if method == "session.create":
+                created.set()
+                return {"session_id": "sess-test", "status": "active"}
+            return {"subscription_id": "sub-test"}
+
+        # 模拟关闭 IPC 连接
+        async def close(self) -> None:
+            return None
+
+    class _Header:
+        # 模拟 Label.update 以隔离 Textual DOM
+        def update(self, content: str) -> None:
+            return None
+
+    class _Prompt:
+        disabled = True
+        read_only = False
+        border_title = ""
+
+        # 模拟连接完成后输入框获得焦点
+        def focus(self) -> None:
+            return None
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(tui_app_module, "SocketClient", _Client)
+    app = KamaTuiApp("127.0.0.1", 9999)
+    prompt = _Prompt()
+    app.query_one = lambda *args, **kwargs: _Header()  # type: ignore[method-assign]
+    app._prompt = lambda: prompt  # type: ignore[method-assign]
+    app._update_header = lambda state: None  # type: ignore[method-assign]
+    app._break_llm = lambda: None  # type: ignore[method-assign]
+
+    socket_task = asyncio.create_task(app._socket_loop())
+    await asyncio.wait_for(created.wait(), timeout=1.0)
+    socket_task.cancel()
+    await asyncio.gather(socket_task, return_exceptions=True)
+
+    create_params = next(
+        params for method, params in commands if method == "session.create"
+    )
+    assert create_params == {
+        "mode": "chat",
+        "workspace_root": str(workspace.resolve()),
+    }

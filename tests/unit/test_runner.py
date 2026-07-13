@@ -241,6 +241,7 @@ async def test_session_history_and_notes_injected(tmp_path: Path) -> None:
         title="",
         created_at="t",
         updated_at="t",
+        workspace_root=tmp_path.resolve(),
     )
     store.write_meta(session)
     store.append_message("sess-1", "user", "remember python")
@@ -302,6 +303,7 @@ async def test_session_registers_note_save_tool(tmp_path: Path) -> None:
         title="",
         created_at="t",
         updated_at="t",
+        workspace_root=tmp_path.resolve(),
     )
     store.append_message("sess-1", "user", "remember")
 

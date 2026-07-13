@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from pathlib import Path
 from typing import Any
 
 from kama_claude.core.config import KamaConfig
@@ -80,7 +81,13 @@ async def _chat_async(config: KamaConfig) -> int:
                 "scope": "global",
             },
         )
-        created = await client.send_command("session.create", {"mode": "chat"})
+        created = await client.send_command(
+            "session.create",
+            {
+                "mode": "chat",
+                "workspace_root": str(Path.cwd().resolve()),
+            },
+        )
         session_id = str(created["session_id"])
         print(f"[session: {session_id}]")
 

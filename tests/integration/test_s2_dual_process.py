@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+from pathlib import Path
 from typing import Any
 
 from kama_claude.core.transport.socket_client import SocketClient
@@ -13,6 +14,7 @@ from kama_claude.core.transport.socket_client import SocketClient
 async def test_agent_run_returns_run_id_and_emits_started(
     running_daemon: subprocess.Popen[bytes],
     free_port: int,
+    tmp_path: Path,
 ) -> None:
     client = SocketClient("127.0.0.1", free_port)
     await client.connect()
@@ -30,7 +32,10 @@ async def test_agent_run_returns_run_id_and_emits_started(
 
     try:
         await client.send_command("event.subscribe", {"topics": ["run.*"], "scope": "global"})
-        result = await client.send_command("agent.run", {"goal": "hello"})
+        result = await client.send_command(
+            "agent.run",
+            {"goal": "hello", "workspace_root": str(tmp_path.resolve())},
+        )
 
         assert result.get("run_id"), "run_id must be non-empty"
         returned_run_id: str = result["run_id"]
@@ -50,6 +55,7 @@ async def test_agent_run_returns_run_id_and_emits_started(
 async def test_two_clients_both_receive_broadcast(
     running_daemon: subprocess.Popen[bytes],
     free_port: int,
+    tmp_path: Path,
 ) -> None:
     client1 = SocketClient("127.0.0.1", free_port)
     client2 = SocketClient("127.0.0.1", free_port)
@@ -76,7 +82,10 @@ async def test_two_clients_both_receive_broadcast(
     try:
         await client1.send_command("event.subscribe", {"topics": ["run.*"], "scope": "global"})
         await client2.send_command("event.subscribe", {"topics": ["run.*"], "scope": "global"})
-        await client1.send_command("agent.run", {"goal": "broadcast test"})
+        await client1.send_command(
+            "agent.run",
+            {"goal": "broadcast test", "workspace_root": str(tmp_path.resolve())},
+        )
 
         await asyncio.wait_for(
             asyncio.gather(event1.wait(), event2.wait()),
@@ -97,6 +106,7 @@ async def test_two_clients_both_receive_broadcast(
 async def test_disconnect_and_replay_from_run(
     running_daemon: subprocess.Popen[bytes],
     free_port: int,
+    tmp_path: Path,
 ) -> None:
     # Phase 1: trigger a run and wait for run.started to be written to disk
     client1 = SocketClient("127.0.0.1", free_port)
@@ -115,7 +125,10 @@ async def test_disconnect_and_replay_from_run(
 
     try:
         await client1.send_command("event.subscribe", {"topics": ["run.*"], "scope": "global"})
-        await client1.send_command("agent.run", {"goal": "replay test"})
+        await client1.send_command(
+            "agent.run",
+            {"goal": "replay test", "workspace_root": str(tmp_path.resolve())},
+        )
         await asyncio.wait_for(started_event.wait(), timeout=5.0)
     finally:
         loop1.cancel()

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+from pathlib import Path
 from typing import Any
 
 from rich.markdown import Markdown
@@ -810,7 +811,13 @@ class KamaTuiApp(App[None]):
                 if self._replay_run_id is not None:
                     params["replay_from_run"] = self._replay_run_id
                 await client.send_command("event.subscribe", params)
-                created = await client.send_command("session.create", {"mode": "chat"})
+                created = await client.send_command(
+                    "session.create",
+                    {
+                        "mode": "chat",
+                        "workspace_root": str(Path.cwd().resolve()),
+                    },
+                )
                 self._session_id = str(created["session_id"])
                 log.info("session created session_id=%s", self._session_id)
                 prompt = self._prompt()

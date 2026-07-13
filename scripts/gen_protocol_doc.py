@@ -96,7 +96,10 @@ def generate() -> str:
         "jsonrpc": "2.0",
         "id": "u-2",
         "method": "agent.run",
-        "params": {"goal": "总结 README.md 的主要章节"},
+        "params": {
+            "goal": "总结 README.md 的主要章节",
+            "workspace_root": "/Users/alice/project",
+        },
     }
     agent_run_resp_example = {
         "jsonrpc": "2.0",
@@ -123,7 +126,11 @@ def generate() -> str:
         "jsonrpc": "2.0",
         "id": "u-4",
         "method": "session.create",
-        "params": {"mode": "chat", "title": ""},
+        "params": {
+            "mode": "chat",
+            "title": "",
+            "workspace_root": "/Users/alice/project",
+        },
     }
     session_create_resp_example = {
         "jsonrpc": "2.0",
@@ -261,6 +268,7 @@ def generate() -> str:
         "| -32602 | Invalid Params | Parameter validation failed |\n",
         "| -32603 | Internal Error | Handler raised an unhandled exception |\n",
         "| -32000 | Application Error | e.g. another run already in progress |\n",
+        "| -32013 | INVALID_WORKSPACE | workspace_root is relative, missing, or not a directory |\n",
     ]
     return "".join(sections)
 
