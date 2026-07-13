@@ -225,7 +225,7 @@ class CoreApp:
 
         if self._config.trace.enabled:
             trace_path = Path(self._config.trace.file).expanduser()
-            self._trace = TraceWriter(trace_path)
+            self._trace = TraceWriter(trace_path) #daemon.jsonl 记录所有事件和 LLM 请求响应的 trace，便于调试和回放。TraceWriter 是一个异步上下文管理器，自动处理文件打开/关闭。
             await self._trace.start()
             self._bus.subscribe(self._trace_event_handler)
 

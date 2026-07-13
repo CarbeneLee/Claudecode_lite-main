@@ -183,7 +183,7 @@ class AgentRunner:
         prefill_len = len(history) #避免重复存储历史消息
 
         async with EventWriter(run_path / "events.jsonl") as writer: #EventWriter 是一个异步上下文管理器，自动处理文件打开/关闭。
-            writer.subscribe(bus)
+            writer.subscribe(bus) # events.jsonl记录每一步的事件log，包括 step.started、step.finished、run.started、run.finished 等。bus.subscribe(writer) 将 writer 订阅到事件总线，确保所有事件都被写入文件。
             await bus.publish(RunStartedEvent(run_id=run_id, goal=goal, ts=_now()))
 
             cancelled = False
