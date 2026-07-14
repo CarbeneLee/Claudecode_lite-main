@@ -11,6 +11,10 @@ from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
 from kama_claude.core.runner import AgentRunner
 from kama_claude.core.task.manager import TaskManager
+from kama_claude.core.tools.builtin.bash import BashTool
+from kama_claude.core.tools.builtin.list_dir import ListDirTool
+from kama_claude.core.tools.builtin.read_file import ReadFileTool
+from kama_claude.core.tools.builtin.write_file import WriteFileTool
 
 # --- mock provider -----------------------------------------------------------
 
@@ -146,6 +150,78 @@ def test_runner_passes_workspace_to_spawn_agent(tmp_path: Path) -> None:
 
     assert spawn_tool is not None
     assert spawn_tool._workspace_root == tmp_path.resolve(strict=True)  # type: ignore[attr-defined]
+
+
+# 功能：验证 Runner registry 的 read/list 工具绑定 Runner workspace
+# 设计：检查真实 registry 中两个工具持有的 resolver root，不执行文件操作
+def test_runner_injects_workspace_into_read_and_list_tools(tmp_path: Path) -> None:
+    runner = AgentRunner(_config(), workspace_root=tmp_path.resolve())
+
+    registry = runner._build_registry(TaskManager(tmp_path / "tasks"))
+    read_tool = registry.get("read_file")
+    list_tool = registry.get("list_dir")
+
+    assert isinstance(read_tool, ReadFileTool)
+    assert isinstance(list_tool, ListDirTool)
+    assert read_tool._resolver.root == tmp_path.resolve(strict=True)
+    assert list_tool._resolver.root == tmp_path.resolve(strict=True)
+
+
+# 功能：验证 Runner registry 的 write 工具与 Bash 启动目录绑定 Runner workspace
+# 设计：检查真实 registry 中 resolver root 和 Bash workspace，不执行命令或写入
+def test_runner_injects_workspace_into_write_and_bash_tools(tmp_path: Path) -> None:
+    runner = AgentRunner(_config(), workspace_root=tmp_path.resolve())
+
+    registry = runner._build_registry(TaskManager(tmp_path / "tasks"))
+    write_tool = registry.get("write_file")
+    bash_tool = registry.get("bash")
+
+    assert isinstance(write_tool, WriteFileTool)
+    assert isinstance(bash_tool, BashTool)
+    assert write_tool._resolver.root == tmp_path.resolve(strict=True)
+    assert bash_tool._workspace_root == tmp_path.resolve(strict=True)
+
+
+# 功能：验证 workspace A/B 的 Runner filesystem 工具实例不共享 root
+# 设计：构造两个 registry 并比较 read/write/Bash 的内部 root 与对象身份
+def test_runner_tool_instances_are_workspace_isolated(tmp_path: Path) -> None:
+    workspace_a = tmp_path / "workspace-a"
+    workspace_b = tmp_path / "workspace-b"
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+    registry_a = AgentRunner(
+        _config(), workspace_root=workspace_a
+    )._build_registry(TaskManager(tmp_path / "tasks-a"))
+    registry_b = AgentRunner(
+        _config(), workspace_root=workspace_b
+    )._build_registry(TaskManager(tmp_path / "tasks-b"))
+
+    read_a = registry_a.get("read_file")
+    read_b = registry_b.get("read_file")
+    write_a = registry_a.get("write_file")
+    write_b = registry_b.get("write_file")
+    bash_a = registry_a.get("bash")
+    bash_b = registry_b.get("bash")
+
+    assert isinstance(read_a, ReadFileTool)
+    assert isinstance(read_b, ReadFileTool)
+    assert isinstance(write_a, WriteFileTool)
+    assert isinstance(write_b, WriteFileTool)
+    assert isinstance(bash_a, BashTool)
+    assert isinstance(bash_b, BashTool)
+    assert read_a._resolver.root == workspace_a.resolve(strict=True)
+    assert read_b._resolver.root == workspace_b.resolve(strict=True)
+    assert write_a._resolver is not write_b._resolver
+    assert bash_a._workspace_root == workspace_a.resolve(strict=True)
+    assert bash_b._workspace_root == workspace_b.resolve(strict=True)
+
+
+# 功能：验证四个 workspace-bound builtin 工具拒绝零参数构造
+# 设计：逐个省略依赖并断言 TypeError，防止 production 重新引入 cwd fallback
+def test_workspace_bound_tools_require_constructor_dependencies() -> None:
+    for tool_type in (ReadFileTool, WriteFileTool, ListDirTool, BashTool):
+        with pytest.raises(TypeError):
+            tool_type()
 
 
 # 功能：验证 run 开始时发布携带正确 goal 的 run.started 事件

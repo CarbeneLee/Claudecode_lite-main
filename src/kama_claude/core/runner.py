@@ -38,6 +38,8 @@ from kama_claude.core.tools.builtin import (
 from kama_claude.core.tools.registry import ToolRegistry
 from kama_claude.core.trace.provider import TracingProvider
 from kama_claude.core.trace.writer import TraceWriter
+from kama_claude.core.workspace.policy import WorkspaceAccessPolicy
+from kama_claude.core.workspace.resolver import WorkspacePathResolver
 
 
 def _now() -> str: # 生成当前 UTC 时间的 ISO 格式字符串，用于事件时间戳。
@@ -67,7 +69,9 @@ class AgentRunner:
         mcp_manager: McpServerManager | None = None,
     ) -> None:
         self._config = config
-        self._workspace_root = workspace_root.resolve(strict=True)
+        self._path_resolver = WorkspacePathResolver(workspace_root)
+        self._workspace_root = self._path_resolver.root
+        self._access_policy = WorkspaceAccessPolicy(self._workspace_root)
         self._bus = bus
         self._provider = provider
         self._extra_handlers: list[EventHandler] = extra_handlers or []
@@ -98,7 +102,12 @@ class AgentRunner:
             return allowed is None or name in allowed
 
         registry = ToolRegistry()
-        for t in [ReadFileTool(), BashTool(), WriteFileTool(), ListDirTool()]:
+        for t in [
+            ReadFileTool(self._path_resolver, self._access_policy),
+            BashTool(self._workspace_root),
+            WriteFileTool(self._path_resolver, self._access_policy),
+            ListDirTool(self._path_resolver, self._access_policy),
+        ]:
             if _ok(t.name):
                 registry.register(t)
         for t in [

@@ -26,6 +26,8 @@ from kama_claude.core.tools.builtin.task_list import TaskListTool
 from kama_claude.core.tools.builtin.task_update import TaskUpdateTool
 from kama_claude.core.tools.builtin.write_file import WriteFileTool
 from kama_claude.core.tools.registry import ToolRegistry
+from kama_claude.core.workspace.policy import WorkspaceAccessPolicy
+from kama_claude.core.workspace.resolver import WorkspacePathResolver
 
 if TYPE_CHECKING:
     from kama_claude.core.llm.base import LLMProvider
@@ -94,7 +96,9 @@ class SpawnAgentTool(BaseTool):
         depth: int = 0,
     ) -> None:
         self._provider = provider
-        self._workspace_root = workspace_root.resolve(strict=True)
+        self._path_resolver = WorkspacePathResolver(workspace_root)
+        self._workspace_root = self._path_resolver.root
+        self._access_policy = WorkspaceAccessPolicy(self._workspace_root)
         self._profile_loader = AgentProfileLoader(self._workspace_root)
         self._parent_bus = parent_bus
         self._parent_run_id = parent_run_id
@@ -242,10 +246,10 @@ class SpawnAgentTool(BaseTool):
 
         registry = ToolRegistry()
         _all_tools = [
-            ReadFileTool(),
-            BashTool(),
-            WriteFileTool(),
-            ListDirTool(),
+            ReadFileTool(self._path_resolver, self._access_policy),
+            BashTool(self._workspace_root),
+            WriteFileTool(self._path_resolver, self._access_policy),
+            ListDirTool(self._path_resolver, self._access_policy),
         ]
         for t in _all_tools:
             if _allowed(t.name):

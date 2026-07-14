@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from pydantic import BaseModel, ConfigDict
 
 from kama_claude.core.tools.base import BaseTool, ToolResult
+from kama_claude.core.workspace.errors import WorkspaceEscapeError
+from kama_claude.core.workspace.policy import WorkspaceAccessPolicy
+from kama_claude.core.workspace.resolver import WorkspacePathResolver
 
 _MAX_BYTES = 1 * 1024 * 1024  # 1 MB
 
@@ -21,7 +22,7 @@ class WriteFileTool(BaseTool):
     description = (
         "Write text content to a file, creating it (and any parent directories) if it "
         "does not exist, or overwriting it if it does. "
-        "Path must be relative to the current working directory. "
+        "Path must be relative to the session workspace. "
         "Content size is limited to 1 MB."
     )
     input_schema: dict[str, object] = {
@@ -29,7 +30,7 @@ class WriteFileTool(BaseTool):
         "properties": {
             "path": {
                 "type": "string",
-                "description": "Relative path to the file (relative to current working directory).",
+                "description": "Path relative to the session workspace.",
             },
             "content": {
                 "type": "string",
@@ -39,14 +40,22 @@ class WriteFileTool(BaseTool):
         "required": ["path", "content"],
     }
 
-    # 写入文件内容；超 1MB 拒绝；禁止 .. 路径遍历；自动创建父目录
+    # 注入 workspace 路径解析器与敏感路径策略
+    def __init__(
+        self,
+        resolver: WorkspacePathResolver,
+        access_policy: WorkspaceAccessPolicy,
+    ) -> None:
+        self._resolver = resolver
+        self._access_policy = access_policy
+
+    # 安全写入 workspace 内文件并保持 1MB 上限和自动建目录行为
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = WriteFileParams.model_validate(params)
         path_str = p.path
         content = p.content
-
-        if ".." in Path(path_str).parts:
-            raise PermissionError(f"path traversal not allowed: {path_str}")
+        path = self._resolver.resolve_for_write(path_str)
+        self._access_policy.ensure_allowed(path_str, path)
 
         encoded = content.encode("utf-8")
         if len(encoded) > _MAX_BYTES:
@@ -56,8 +65,10 @@ class WriteFileTool(BaseTool):
                 error_type="runtime_error",
             )
 
-        path = Path(path_str)
         path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_parent = path.parent.resolve(strict=True)
+        if not resolved_parent.is_relative_to(self._resolver.root):
+            raise WorkspaceEscapeError("path escapes workspace")
         path.write_text(content, encoding="utf-8")
 
         return ToolResult(content=f"wrote {len(encoded)} bytes to {path_str}")

@@ -12,3 +12,15 @@ class InvalidWorkspaceError(ValueError):
     def __init__(self, reason: InvalidWorkspaceReason) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class InvalidWorkspacePathError(ValueError):
+    pass
+
+
+class WorkspaceEscapeError(PermissionError):
+    pass
+
+
+class SensitivePathError(PermissionError):
+    pass
