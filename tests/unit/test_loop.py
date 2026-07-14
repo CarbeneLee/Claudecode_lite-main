@@ -25,6 +25,7 @@ class _MockProvider:
     ) -> None:
         self._responses = iter(responses)
         self._exc = exc
+        self.seen_messages: list[list[dict[str, object]]] = []
 
     async def chat(
         self,
@@ -36,6 +37,7 @@ class _MockProvider:
         step: int = 0,
         system: str | None = None,
     ) -> LlmResponse:
+        self.seen_messages.append([dict(message) for message in messages])
         if self._exc is not None:
             raise self._exc
         return next(self._responses)
@@ -61,6 +63,16 @@ class _FailTool(BaseTool):
 
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         raise RuntimeError("tool error")
+
+
+class _CancelledTool(BaseTool):
+    name = "cancelled"
+    description = "Always cancels"
+    input_schema: dict[str, object] = {"type": "object", "properties": {}, "required": []}
+
+    # 抛出取消信号以验证工具阶段能中断 AgentLoop
+    async def invoke(self, params: dict[str, object]) -> ToolResult:
+        raise asyncio.CancelledError
 
 
 # --- helpers -----------------------------------------------------------------
@@ -187,6 +199,48 @@ async def test_tool_failure_result_is_error_in_context() -> None:
     tool_result_msg = ctx.messages[2]
     block = tool_result_msg["content"][0]  # type: ignore[index]
     assert block.get("is_error") is True
+
+
+# 功能：验证未知工具异常的稳定安全摘要会进入下一轮 LLM context
+# 设计：记录 provider 每轮收到的 messages，直接检查第二轮 tool_result 的 content 与 is_error，不依赖最终 context 的事后状态
+async def test_safe_tool_error_is_visible_to_next_llm_turn() -> None:
+    provider = _MockProvider([
+        LlmResponse(stop_reason="tool_use", tool_calls=[_tc("fail", {})]),
+        LlmResponse(stop_reason="end_turn", text="handled safely"),
+    ])
+    registry = ToolRegistry()
+    registry.register(_FailTool())
+    loop, _ = _make_loop(provider, registry)
+    ctx = _ctx()
+
+    await loop.run(ctx)
+
+    tool_result_message = provider.seen_messages[1][2]
+    content = tool_result_message["content"]
+    assert isinstance(content, list)
+    block = content[0]
+    assert isinstance(block, dict)
+    assert block["content"] == "tool execution failed"
+    assert block["is_error"] is True
+    assert "tool error" not in str(block["content"])
+
+
+# 功能：验证工具执行期间的 CancelledError 可穿过 invoke_tool 中断 AgentLoop
+# 设计：让 provider 发起真实 tool_use、工具随后取消，断言 loop 原样上抛且不会继续请求下一轮 LLM
+async def test_tool_cancelled_error_interrupts_agent_loop() -> None:
+    provider = _MockProvider([
+        LlmResponse(stop_reason="tool_use", tool_calls=[_tc("cancelled", {})]),
+        LlmResponse(stop_reason="end_turn"),
+    ])
+    registry = ToolRegistry()
+    registry.register(_CancelledTool())
+    loop, _ = _make_loop(provider, registry)
+    ctx = _ctx()
+
+    with pytest.raises(asyncio.CancelledError):
+        await loop.run(ctx)
+
+    assert len(provider.seen_messages) == 1
 
 
 # 功能：验证收到 CancelledError 时 loop 将 context 标记为 cancelled 后继续上抛 CancelledError

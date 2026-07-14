@@ -7,8 +7,6 @@ import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from pydantic import ValidationError
-
 from kama_claude.core.bus.events import (
     PermissionDeniedEvent,
     PermissionGrantedEvent,
@@ -20,7 +18,11 @@ from kama_claude.core.bus.events import (
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import ToolCallBlock
 from kama_claude.core.tools.base import ToolResult
-from kama_claude.core.tools.errors import RateLimitedError
+from kama_claude.core.tools.errors import (
+    RETRYABLE_ERROR_TYPES,
+    classify_tool_exception,
+    normalize_tool_error,
+)
 from kama_claude.core.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
@@ -31,7 +33,6 @@ _DEFAULT_TIMEOUT: float = 120.0
 # 最多 3 次尝试，即 1 次初始调用加 2 次重试
 _MAX_RETRIES: int = 2
 _RETRY_BASE_S: float = 2.0  # backoff base; tests can monkeypatch to 0
-_RETRYABLE: frozenset[str] = frozenset({"runtime_error", "rate_limited"})
 
 
 def _now() -> str:
@@ -65,7 +66,7 @@ async def _fail(
     return ToolResult(content=error_message, is_error=True, error_type=error_class)
 
 
-# 校验参数、检查权限、限时调用工具、发布进度事件，失败时指数退避重试，返回 ToolResult（不抛异常）
+# 校验参数、检查权限、限时调用工具并发布事件；普通失败返回 ToolResult，取消信号原样传播
 async def invoke_tool(
     registry: ToolRegistry,
     tool_call: ToolCallBlock,
@@ -98,16 +99,17 @@ async def invoke_tool(
     if tool is None:
         return await _fail(
             bus, run_id, tool_call,
-            "runtime_error", f"unknown tool: {tool_call.name}", elapsed(),
+            "unknown_tool", f"unknown tool: {tool_call.name}", elapsed(),
         )
 
     if tool.params_model is not None:
         try:
             tool.params_model.model_validate(dict(tool_call.input)) # Pydantic 的 model_validate
-        except ValidationError as exc: #校验失败返回 schema_error，工具不会执行
+        except Exception as exc:
+            validation_error_class, validation_error_message = classify_tool_exception(exc)
             return await _fail(
                 bus, run_id, tool_call,
-                "schema_error", str(exc), elapsed(),
+                validation_error_class, validation_error_message, elapsed(),
             )
 # 权限检查
     if permission_manager is not None:
@@ -162,8 +164,10 @@ async def invoke_tool(
             ms = elapsed()
 
             if result.is_error:
-                error_class = result.error_type or "runtime_error"
-                error_message = result.content
+                error_class, error_message = normalize_tool_error(
+                    result.error_type,
+                    result.content,
+                )
             else:
                 await bus.publish(
                     ToolCallFinishedEvent(
@@ -177,23 +181,15 @@ async def invoke_tool(
                 )
                 return result
 
-        except RateLimitedError as exc:
-            error_class = "rate_limited"
-            error_message = str(exc)
-        except TimeoutError:
-            return await _fail(
-                bus, run_id, tool_call,
-                "timeout", f"tool timed out after {timeout}s", elapsed(),
-                attempt=attempt,
-            )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            error_class = "runtime_error"
-            error_message = str(exc)
+            error_class, error_message = classify_tool_exception(exc)
 
         assert error_class is not None and error_message is not None
         ms = elapsed() # 
 
-        if error_class in _RETRYABLE and attempt <= _MAX_RETRIES:
+        if error_class in RETRYABLE_ERROR_TYPES and attempt <= _MAX_RETRIES:
             await bus.publish(
                 # 每次重试前发布失败事件，以追踪失败的 attempt
                 ToolCallFailedEvent(
@@ -217,7 +213,11 @@ async def invoke_tool(
         )
 
     # 理论上不可达，但 mypy 需要看到所有路径都有返回值
-    return ToolResult(content="internal error", is_error=True, error_type="runtime_error")
+    return ToolResult(
+        content="tool execution failed",
+        is_error=True,
+        error_type="execution_error",
+    )
 '''
 invoke_tool(tool_call)
 │
@@ -234,7 +234,7 @@ invoke_tool(tool_call)
     │   ├── is_error=True → error_class → 判断是否可重试
     │   ├── RateLimitedError  → "rate_limited" → 可重试
     │   ├── TimeoutError      → _fail("timeout") → 退出
-    │   └── 其他异常          → "runtime_error" → 可重试
+    │   └── 其他异常          → "execution_error" → 不重试
     │
     ├── 可重试 && attempt ≤ 2?
     │   ├── YES → ToolCallFailedEvent + 指数退避 → continue
@@ -328,7 +328,7 @@ invoke_tool(registry, tool_call, bus, run_id)
       │   ├── is_error → 继续重试判断
       │   ├── RateLimitedError → "rate_limited"
       │   ├── TimeoutError → _fail("timeout")
-      │   └── Exception → "runtime_error"
+      │   └── Exception → "execution_error"
       │
       ├── 可重试 && attempt ≤ 2?
       │   ├── YES → ToolCallFailedEvent + sleep(2^attempt) → continue
@@ -377,6 +377,6 @@ Mypy 兼容守卫	        # unreachable, but keeps mypy happy	        工程实�
 客户端断连保护	        cancel_session	                            防止 Future 永久挂起导致内存泄漏
 对 LLM 友好的错误信息	permission_denied 的指导语	                LLM 不只是看到错误，\
 还能知道下一步怎么做
-frozenset 不可变常量	_RETRYABLE	                                防止运行时意外修改配置
+frozenset 不可变常量	RETRYABLE_ERROR_TYPES	                     防止运行时意外修改配置
 测试友好的可修改常量	# tests can monkeypatch to 0	                测试不走真实退避，保持快速
 '''

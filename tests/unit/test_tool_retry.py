@@ -1,179 +1,216 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import BaseModel
 
 import kama_claude.core.tools.invocation as inv_mod
+from kama_claude.core.bus.events import (
+    ToolCallFailedEvent,
+    ToolCallFinishedEvent,
+    ToolCallStartedEvent,
+)
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import ToolCallBlock
 from kama_claude.core.tools.base import BaseTool, ToolResult
-from kama_claude.core.tools.errors import RateLimitedError
+from kama_claude.core.tools.errors import (
+    RETRYABLE_ERROR_TYPES,
+    RateLimitedError,
+)
 from kama_claude.core.tools.invocation import invoke_tool
 from kama_claude.core.tools.registry import ToolRegistry
 
-# --- stub tools --------------------------------------------------------------
 
-class _FailNTimes(BaseTool):
-    """Fails with runtime_error for the first n calls, then succeeds."""
-    name = "fail_n"
-    description = "Fails n times then succeeds"
+class _ResultErrorTool(BaseTool):
+    name = "result_error"
+    description = "Returns a configured ToolResult error"
     input_schema: dict[str, object] = {"type": "object", "properties": {}, "required": []}
 
-    def __init__(self, n: int, *, error_type: str = "runtime_error") -> None:
-        self._remaining = n
+    # 保存错误类型并记录真实 invoke 次数
+    def __init__(self, error_type: str | None) -> None:
         self._error_type = error_type
+        self.calls = 0
 
+    # 返回配置的错误结果以测试归一化和重试判定
     async def invoke(self, params: dict[str, object]) -> ToolResult:
-        if self._remaining > 0:
-            self._remaining -= 1
-            return ToolResult(content="transient error", is_error=True, error_type=self._error_type)
+        self.calls += 1
+        return ToolResult(
+            content="original tool payload",
+            is_error=True,
+            error_type=self._error_type,
+        )
+
+
+class _TransientResultNTimes(BaseTool):
+    name = "transient_n"
+    description = "Returns a transient error n times then succeeds"
+    input_schema: dict[str, object] = {"type": "object", "properties": {}, "required": []}
+
+    # 保存失败次数并初始化调用计数
+    def __init__(self, failures: int) -> None:
+        self._failures = failures
+        self.calls = 0
+
+    # 在指定次数内返回显式瞬态错误，随后成功
+    async def invoke(self, params: dict[str, object]) -> ToolResult:
+        self.calls += 1
+        if self.calls <= self._failures:
+            return ToolResult(
+                content="provider transient payload",
+                is_error=True,
+                error_type="transient_error",
+            )
         return ToolResult(content="ok")
 
 
 class _RateLimitedNTimes(BaseTool):
-    """Raises RateLimitedError for the first n calls, then succeeds."""
     name = "rate_n"
-    description = "Rate-limits n times then succeeds"
+    description = "Raises a rate-limit error n times then succeeds"
     input_schema: dict[str, object] = {"type": "object", "properties": {}, "required": []}
 
-    def __init__(self, n: int) -> None:
-        self._remaining = n
+    # 保存失败次数并初始化调用计数
+    def __init__(self, failures: int) -> None:
+        self._failures = failures
+        self.calls = 0
 
+    # 在指定次数内抛出限流异常，随后成功
     async def invoke(self, params: dict[str, object]) -> ToolResult:
-        if self._remaining > 0:
-            self._remaining -= 1
-            raise RateLimitedError("429 Too Many Requests")
+        self.calls += 1
+        if self.calls <= self._failures:
+            raise RateLimitedError("429 vendor payload")
         return ToolResult(content="ok")
 
 
-class _AlwaysFails(BaseTool):
-    name = "always_fail"
-    description = "Always fails"
-    input_schema: dict[str, object] = {"type": "object", "properties": {}, "required": []}
-
-    def __init__(self, error_type: str = "runtime_error") -> None:
-        self._error_type = error_type
-
-    async def invoke(self, params: dict[str, object]) -> ToolResult:
-        return ToolResult(content="permanent error", is_error=True, error_type=self._error_type)
-
-
-# --- helper ------------------------------------------------------------------
-
+# 构造固定标识的空参数工具调用
 def _call(name: str) -> ToolCallBlock:
     return ToolCallBlock(id="t1", name=name, input={})
 
 
-async def _run(tool: BaseTool, *, monkeypatch: pytest.MonkeyPatch) -> tuple[ToolResult, list]:
+# 执行一次 logical invocation 并收集其完整事件序列
+async def _run(
+    tool: BaseTool,
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[ToolResult, list[BaseModel]]:
     monkeypatch.setattr(inv_mod, "_RETRY_BASE_S", 0.0)
     registry = ToolRegistry()
     registry.register(tool)
     bus = EventBus()
-    events: list = []
+    events: list[BaseModel] = []
 
-    async def _collect(e: object) -> None:
-        events.append(e)
+    # 收集事件对象以断言 schema 与顺序
+    async def _collect(event: BaseModel) -> None:
+        events.append(event)
 
     bus.subscribe(_collect)
     result = await invoke_tool(registry, _call(tool.name), bus, run_id="r")
     return result, events
 
 
-# --- tests -------------------------------------------------------------------
+# 从事件列表筛选失败 attempt
+def _failed(events: list[BaseModel]) -> list[ToolCallFailedEvent]:
+    return [event for event in events if isinstance(event, ToolCallFailedEvent)]
 
 
-# 功能：验证 runtime_error 在首次失败后自动重试，最多 2 次，第 2 次成功时返回 ok
-# 设计：_FailNTimes(1) 第一次返回 runtime_error，第二次成功；monkeypatch 消除 sleep 延迟
-async def test_runtime_error_retries_and_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
-    result, events = await _run(_FailNTimes(1), monkeypatch=monkeypatch)
+# 功能：验证自动重试只允许冻结的 transient_error 与 rate_limited
+# 设计：直接断言唯一 source of truth 的不可变集合，防止未来退化为 denylist 或重新加入 runtime_error
+def test_retry_allowlist_is_explicit_and_frozen() -> None:
+    assert RETRYABLE_ERROR_TYPES == frozenset({"transient_error", "rate_limited"})
+
+
+@pytest.mark.parametrize(
+    ("error_type", "expected_error_type"),
+    [
+        ("not_found", "not_found"),
+        ("invalid_path", "invalid_path"),
+        ("sensitive_path", "sensitive_path"),
+        ("permission_error", "permission_error"),
+        ("is_directory", "is_directory"),
+        ("not_directory", "not_directory"),
+        ("execution_error", "execution_error"),
+        ("timeout", "timeout"),
+        ("schema_error", "schema_error"),
+        ("permission_denied", "permission_denied"),
+        ("command_failed", "command_failed"),
+        ("runtime_error", "execution_error"),
+        (None, "execution_error"),
+        ("vendor_specific_error", "execution_error"),
+    ],
+)
+# 功能：验证永久、legacy、缺失与未知 ToolResult error_type 均只执行一次
+# 设计：同一计数工具参数化覆盖所有非重试类型，并同时锁定 legacy/未知归一化和单个 failed attempt
+async def test_non_retryable_tool_results_run_once(
+    error_type: str | None,
+    expected_error_type: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool = _ResultErrorTool(error_type)
+
+    result, events = await _run(tool, monkeypatch=monkeypatch)
+
+    assert tool.calls == 1
+    assert result.is_error
+    assert result.error_type == expected_error_type
+    assert len([event for event in events if isinstance(event, ToolCallStartedEvent)]) == 1
+    assert [event.attempt for event in _failed(events)] == [1]
+    assert not any(isinstance(event, ToolCallFinishedEvent) for event in events)
+    if error_type in {"runtime_error", None, "vendor_specific_error"}:
+        assert result.content == "tool execution failed"
+        assert "original tool payload" not in result.content
+
+
+@pytest.mark.parametrize(
+    ("tool", "expected_error_type", "expected_message"),
+    [
+        (_TransientResultNTimes(2), "transient_error", "temporary tool failure"),
+        (_RateLimitedNTimes(2), "rate_limited", "tool rate limit exceeded"),
+    ],
+)
+# 功能：验证两类显式瞬态错误失败两次后第三次成功
+# 设计：分别用 ToolResult 与异常进入 retry loop，断言调用次数、attempt、事件序列和供应商消息净化
+async def test_retryable_error_succeeds_on_third_attempt(
+    tool: _TransientResultNTimes | _RateLimitedNTimes,
+    expected_error_type: str,
+    expected_message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, events = await _run(tool, monkeypatch=monkeypatch)
+
+    failed = _failed(events)
+    assert tool.calls == 3
     assert not result.is_error
     assert result.content == "ok"
-    failed_events = [e for e in events if e.type == "tool.call_failed"]  # type: ignore[attr-defined]
-    assert len(failed_events) == 1
-    assert failed_events[0].attempt == 1  # type: ignore[attr-defined]
+    assert [event.attempt for event in failed] == [1, 2]
+    assert [event.error_class for event in failed] == [expected_error_type] * 2
+    assert [event.error_message for event in failed] == [expected_message] * 2
+    assert [type(event) for event in events] == [
+        ToolCallStartedEvent,
+        ToolCallFailedEvent,
+        ToolCallFailedEvent,
+        ToolCallFinishedEvent,
+    ]
 
 
-# 功能：验证 rate_limited 异常触发重试，重试成功后返回正常结果
-# 设计：_RateLimitedNTimes(1) 抛 RateLimitedError 一次，第二次成功；检查 error_class 字段
-async def test_rate_limited_retries_and_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
-    result, events = await _run(_RateLimitedNTimes(1), monkeypatch=monkeypatch)
-    assert not result.is_error
-    failed_events = [e for e in events if e.type == "tool.call_failed"]  # type: ignore[attr-defined]
-    assert len(failed_events) == 1
-    assert failed_events[0].error_class == "rate_limited"  # type: ignore[attr-defined]
+@pytest.mark.parametrize(
+    ("tool", "expected_error_type"),
+    [
+        (_TransientResultNTimes(10), "transient_error"),
+        (_RateLimitedNTimes(10), "rate_limited"),
+    ],
+)
+# 功能：验证两类显式瞬态错误耗尽三个 attempt 后返回最终错误
+# 设计：让异常持续超过最大尝试次数，断言恰好调用三次、failed 编号 1/2/3 且绝不发布 success finished
+async def test_retryable_error_exhausts_three_attempts(
+    tool: _TransientResultNTimes | _RateLimitedNTimes,
+    expected_error_type: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, events = await _run(tool, monkeypatch=monkeypatch)
 
-
-# 功能：验证 runtime_error 超过 2 次重试后最终返回失败，attempt 字段递增
-# 设计：_AlwaysFails 三次都失败；断言最终结果 is_error + 收到 3 个 failed 事件，attempt 为 1/2/3
-async def test_runtime_error_exhausts_retries(monkeypatch: pytest.MonkeyPatch) -> None:
-    result, events = await _run(_AlwaysFails("runtime_error"), monkeypatch=monkeypatch)
+    failed = _failed(events)
+    assert tool.calls == 3
     assert result.is_error
-    assert result.error_type == "runtime_error"
-    failed_events = [e for e in events if e.type == "tool.call_failed"]  # type: ignore[attr-defined]
-    assert len(failed_events) == 3
-    attempts = [e.attempt for e in failed_events]  # type: ignore[attr-defined]
-    assert attempts == [1, 2, 3]
-
-
-# 功能：验证 rate_limited 耗尽重试后最终返回失败，error_class 为 rate_limited
-# 设计：_RateLimitedNTimes(10) 始终抛异常，断言 3 个 failed 事件且 error_class 统一
-async def test_rate_limited_exhausts_retries(monkeypatch: pytest.MonkeyPatch) -> None:
-    result, events = await _run(_RateLimitedNTimes(10), monkeypatch=monkeypatch)
-    assert result.is_error
-    assert result.error_type == "rate_limited"
-    failed_events = [e for e in events if e.type == "tool.call_failed"]  # type: ignore[attr-defined]
-    assert len(failed_events) == 3
-    assert all(e.error_class == "rate_limited" for e in failed_events)  # type: ignore[attr-defined]
-
-
-# 功能：验证 schema_error 不触发重试，直接失败
-# 设计：_AlwaysFails("schema_error") 首次即 schema 错误，断言只发一次 failed 事件且 attempt=1
-async def test_schema_error_no_retry(monkeypatch: pytest.MonkeyPatch) -> None:
-    result, events = await _run(_AlwaysFails("schema_error"), monkeypatch=monkeypatch)
-    assert result.is_error
-    assert result.error_type == "schema_error"
-    failed_events = [e for e in events if e.type == "tool.call_failed"]  # type: ignore[attr-defined]
-    assert len(failed_events) == 1
-    assert failed_events[0].attempt == 1  # type: ignore[attr-defined]
-
-
-# 功能：验证 timeout_error 不触发重试，直接失败
-# 设计：SlowTool 配合极短超时触发 TimeoutError；断言只发一次 failed 事件，不重试（重试会再次超时）
-async def test_timeout_no_retry(monkeypatch: pytest.MonkeyPatch) -> None:
-    import asyncio
-
-    class _SlowTool(BaseTool):
-        name = "slow"
-        description = "sleeps"
-        input_schema: dict[str, object] = {"type": "object", "properties": {}, "required": []}
-
-        async def invoke(self, params: dict[str, object]) -> ToolResult:
-            await asyncio.sleep(60)
-            return ToolResult(content="done")
-
-    monkeypatch.setattr(inv_mod, "_RETRY_BASE_S", 0.0)
-    registry = ToolRegistry()
-    registry.register(_SlowTool())
-    bus = EventBus()
-    events: list = []
-
-    async def _collect(e: object) -> None:
-        events.append(e)
-
-    bus.subscribe(_collect)
-    result = await invoke_tool(registry, _call("slow"), bus, run_id="r", timeout=0.05)
-
-    assert result.is_error
-    assert result.error_type == "timeout"
-    failed_events = [e for e in events if e.type == "tool.call_failed"]  # type: ignore[attr-defined]
-    assert len(failed_events) == 1
-
-
-# 功能：验证成功后的 tool.call_failed 事件中 error_class 字段存在且取值合法
-# 设计：_FailNTimes(2) 两次失败后成功，检查所有 failed 事件的 error_class 均在合法枚举内
-async def test_failed_event_has_valid_error_class(monkeypatch: pytest.MonkeyPatch) -> None:
-    valid_classes = {"runtime_error", "timeout", "schema_error", "permission_denied", "rate_limited"}
-    result, events = await _run(_FailNTimes(2), monkeypatch=monkeypatch)
-    assert not result.is_error
-    for e in events:
-        if e.type == "tool.call_failed":  # type: ignore[attr-defined]
-            assert e.error_class in valid_classes  # type: ignore[attr-defined]
+    assert result.error_type == expected_error_type
+    assert [event.attempt for event in failed] == [1, 2, 3]
+    assert [event.error_class for event in failed] == [expected_error_type] * 3
+    assert len([event for event in events if isinstance(event, ToolCallStartedEvent)]) == 1
+    assert not any(isinstance(event, ToolCallFinishedEvent) for event in events)
