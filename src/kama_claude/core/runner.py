@@ -57,6 +57,7 @@ class AgentRunner:
         self,
         config: KamaConfig, #唯一必须参数
         *, # 通过*传递的可选参数
+        workspace_root: Path,
         bus: EventBus | None = None,
         provider: LLMProvider | None = None,
         extra_handlers: list[EventHandler] | None = None,
@@ -66,6 +67,7 @@ class AgentRunner:
         mcp_manager: McpServerManager | None = None,
     ) -> None:
         self._config = config
+        self._workspace_root = workspace_root.resolve(strict=True)
         self._bus = bus
         self._provider = provider
         self._extra_handlers: list[EventHandler] = extra_handlers or []
@@ -117,6 +119,7 @@ class AgentRunner:
                 registry.register(
                     SpawnAgentTool(
                         provider=provider,
+                        workspace_root=self._workspace_root,
                         parent_bus=bus,
                         parent_run_id=run_id,
                         permission_manager=self._permission_manager,
@@ -164,7 +167,7 @@ class AgentRunner:
         run_path.mkdir(parents=True, exist_ok=True)
 
         global_ctx = load_context_file(Path("~/.kama/context.md").expanduser())
-        project_ctx = load_context_file(Path(".kama/context.md"))
+        project_ctx = load_context_file(self._workspace_root / ".kama" / "context.md")
 
         # TaskManager 存储在 run_path / ".tasks"，每个 run 相互隔离
         task_manager = TaskManager(run_path / ".tasks")

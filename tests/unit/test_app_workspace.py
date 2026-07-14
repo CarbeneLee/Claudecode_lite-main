@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
+import kama_claude.core.app as app_module
 from kama_claude.core.app import CoreApp
 from kama_claude.core.bus.envelope import HandlerError
+from kama_claude.core.config import KamaConfig
 from kama_claude.core.session.model import Session, SessionMode
 from kama_claude.core.workspace.errors import INVALID_WORKSPACE
 
@@ -156,3 +159,52 @@ async def test_session_create_handler_rejects_file_workspace(tmp_path: Path) -> 
     assert exc.value.code == INVALID_WORKSPACE
     assert str(exc.value) == "invalid workspace_root"
     assert exc.value.data == {"reason": "not_directory"}
+
+
+# 功能：验证 CoreApp 的 runner_factory 将收到的 workspace 传给 AgentRunner
+# 设计：在 SessionManager 组装点调用真实 factory，用哨兵异常在 socket 启动前停止 app.run
+async def test_core_app_runner_factory_passes_workspace_to_agent_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path.resolve()
+    captured: list[Path] = []
+    config = KamaConfig()
+    config.trace.enabled = False
+
+    class _StopAfterWiring(Exception):
+        pass
+
+    class _SessionManager:
+        # 调用 CoreApp 注入的 runner factory 后立即停止启动流程
+        def __init__(
+            self,
+            store: object,
+            runner_factory: Callable[[Path], object],
+            bus: object,
+            provider: object,
+        ) -> None:
+            runner_factory(workspace)
+            raise _StopAfterWiring
+
+    # 捕获 CoreApp 构造 AgentRunner 时的显式 workspace 参数
+    def fake_agent_runner(
+        config_arg: KamaConfig,
+        *,
+        workspace_root: Path,
+        **kwargs: object,
+    ) -> object:
+        captured.append(workspace_root)
+        return object()
+
+    monkeypatch.setattr(app_module, "get_config", lambda: config)
+    monkeypatch.setattr(app_module, "setup_logging", lambda config_arg: None)
+    monkeypatch.setattr(app_module, "SessionStore", lambda root: object())
+    monkeypatch.setattr(app_module, "AnthropicProvider", lambda model: object())
+    monkeypatch.setattr(app_module, "SessionManager", _SessionManager)
+    monkeypatch.setattr(app_module, "AgentRunner", fake_agent_runner)
+
+    with pytest.raises(_StopAfterWiring):
+        await CoreApp().run()
+
+    assert captured == [workspace]

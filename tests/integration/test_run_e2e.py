@@ -58,7 +58,11 @@ async def test_run_e2e_reads_file_and_succeeds(
     config = KamaConfig()
     config.agent.max_steps = 5
 
-    runner = AgentRunner(config, runs_dir=runs_dir)
+    runner = AgentRunner(
+        config,
+        workspace_root=tmp_path.resolve(),
+        runs_dir=runs_dir,
+    )
     await runner.run(goal)
 
     # ── events.jsonl must exist ──────────────────────────────────────────────

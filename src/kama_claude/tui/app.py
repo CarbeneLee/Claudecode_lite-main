@@ -540,7 +540,7 @@ class KamaTuiApp(App[None]):
     def _build_slash_items(self) -> list[tuple[str, str]]:
         items: list[tuple[str, str]] = [("compact", "compress context window")]
         try:
-            loader = SkillLoader()
+            loader = SkillLoader(Path.cwd().resolve(strict=True))
             for skill in loader.list_all_skills():
                 desc = skill.description.splitlines()[0] if skill.description else ""
                 if len(desc) > 60:

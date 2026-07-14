@@ -46,7 +46,11 @@ async def test_create_session_writes_meta_and_event(tmp_path: Path) -> None:
 
     bus.subscribe(collect)
     store = SessionStore(tmp_path)
-    manager = SessionManager(store, lambda: _Runner(), bus)  # type: ignore[arg-type]
+    manager = SessionManager(
+        store,
+        lambda _workspace_root: _Runner(),
+        bus,
+    )  # type: ignore[arg-type]
 
     workspace_root = tmp_path.resolve()
     session = await manager.create("chat", "title", workspace_root=workspace_root)
@@ -62,7 +66,11 @@ async def test_create_session_writes_meta_and_event(tmp_path: Path) -> None:
 # 设计：mock runner 主动追加 assistant 消息，确认 send_message 负责 user 消息、状态流转和 run_id 记录
 async def test_send_message_chat_enters_waiting_and_writes_thread(tmp_path: Path) -> None:
     store = SessionStore(tmp_path)
-    manager = SessionManager(store, lambda: _Runner(), EventBus())  # type: ignore[arg-type]
+    manager = SessionManager(
+        store,
+        lambda _workspace_root: _Runner(),
+        EventBus(),
+    )  # type: ignore[arg-type]
     session = await manager.create("chat", workspace_root=tmp_path.resolve())
 
     run_id = await manager.send_message(session.id, "hello")
@@ -79,7 +87,11 @@ async def test_send_message_chat_enters_waiting_and_writes_thread(tmp_path: Path
 # 设计：复用 mock runner 的成功路径，聚焦 mode 对最终状态的影响，保证 kama run 的统一路径正确
 async def test_one_shot_auto_closes(tmp_path: Path) -> None:
     store = SessionStore(tmp_path)
-    manager = SessionManager(store, lambda: _Runner(), EventBus())  # type: ignore[arg-type]
+    manager = SessionManager(
+        store,
+        lambda _workspace_root: _Runner(),
+        EventBus(),
+    )  # type: ignore[arg-type]
     session = await manager.create("one_shot", workspace_root=tmp_path.resolve())
 
     await manager.send_message(session.id, "hello")
@@ -90,7 +102,11 @@ async def test_one_shot_auto_closes(tmp_path: Path) -> None:
 # 功能：验证不存在的 session_id 返回 session_not_found 错误码
 # 设计：直接调用 get_history 的查找路径，断言 HandlerError code，覆盖 IPC handler 可结构化返回错误
 async def test_missing_session_raises_handler_error(tmp_path: Path) -> None:
-    manager = SessionManager(SessionStore(tmp_path), lambda: _Runner(), EventBus())  # type: ignore[arg-type]
+    manager = SessionManager(
+        SessionStore(tmp_path),
+        lambda _workspace_root: _Runner(),
+        EventBus(),
+    )  # type: ignore[arg-type]
     with pytest.raises(HandlerError) as exc:
         await manager.get_history("missing")
     assert exc.value.code == SESSION_NOT_FOUND
@@ -100,10 +116,102 @@ async def test_missing_session_raises_handler_error(tmp_path: Path) -> None:
 # 设计：先显式 close，再发送消息，断言 session_closed 错误码，覆盖状态机拒绝路径
 async def test_closed_session_rejects_message(tmp_path: Path) -> None:
     store = SessionStore(tmp_path)
-    manager = SessionManager(store, lambda: _Runner(), EventBus())  # type: ignore[arg-type]
+    manager = SessionManager(
+        store,
+        lambda _workspace_root: _Runner(),
+        EventBus(),
+    )  # type: ignore[arg-type]
     session = await manager.create("chat", workspace_root=tmp_path.resolve())
     await manager.close(session.id)
 
     with pytest.raises(HandlerError) as exc:
         await manager.send_message(session.id, "again")
     assert exc.value.code == SESSION_CLOSED
+
+
+# 功能：验证 SessionManager 用 Session.workspace_root 构造每次 AgentRunner
+# 设计：runner_factory 只记录实际收到的 Path，不读 process cwd，直接锁定 session→runner 边界
+async def test_runner_factory_receives_session_workspace(tmp_path: Path) -> None:
+    workspace = (tmp_path / "workspace").resolve()
+    workspace.mkdir()
+    received: list[Path] = []
+
+    # 记录 runner factory 收到的 workspace 并返回测试 runner
+    def runner_factory(workspace_root: Path) -> _Runner:
+        received.append(workspace_root)
+        return _Runner()
+
+    manager = SessionManager(
+        SessionStore(tmp_path / "sessions"),
+        runner_factory,
+        EventBus(),
+    )  # type: ignore[arg-type]
+    session = await manager.create("chat", workspace_root=workspace)
+
+    await manager.send_message(session.id, "hello")
+
+    assert received == [workspace]
+
+
+# 功能：验证两个 Session 的 runner 分别绑定 workspace A/B 且不受 daemon cwd 影响
+# 设计：将 process cwd 切到第三个目录，依次发送 A/B 消息并断言 factory 的调用序列
+async def test_runner_factory_isolated_between_session_workspaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    daemon_cwd = tmp_path / "daemon"
+    workspace_a = (tmp_path / "workspace-a").resolve()
+    workspace_b = (tmp_path / "workspace-b").resolve()
+    daemon_cwd.mkdir()
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+    monkeypatch.chdir(daemon_cwd)
+    received: list[Path] = []
+
+    # 记录多 Session 构造 runner 时的 workspace 顺序
+    def runner_factory(workspace_root: Path) -> _Runner:
+        received.append(workspace_root)
+        return _Runner()
+
+    manager = SessionManager(
+        SessionStore(tmp_path / "sessions"),
+        runner_factory,
+        EventBus(),
+    )  # type: ignore[arg-type]
+    session_a = await manager.create("chat", workspace_root=workspace_a)
+    session_b = await manager.create("chat", workspace_root=workspace_b)
+
+    await manager.send_message(session_a.id, "from a")
+    await manager.send_message(session_b.id, "from b")
+
+    assert received == [workspace_a, workspace_b]
+
+
+# 功能：验证 SessionManager 按各 Session workspace 解析同名 slash skill
+# 设计：A/B 写入不同模板并复用真实 manager，通过各自 thread 中 runner 回显的 goal 判断解析来源
+async def test_slash_skills_are_isolated_by_session_workspace(tmp_path: Path) -> None:
+    workspace_a = tmp_path / "workspace-a"
+    workspace_b = tmp_path / "workspace-b"
+    for workspace, prompt in ((workspace_a, "prompt-a"), (workspace_b, "prompt-b")):
+        skills = workspace / ".kama" / "skills"
+        skills.mkdir(parents=True)
+        (skills / "local.md").write_text(
+            f"---\nname: local\ndescription: local\n---\n{prompt} $ARGUMENTS\n",
+            encoding="utf-8",
+        )
+    store = SessionStore(tmp_path / "sessions")
+    manager = SessionManager(
+        store,
+        lambda _workspace_root: _Runner(),
+        EventBus(),
+    )  # type: ignore[arg-type]
+    session_a = await manager.create("chat", workspace_root=workspace_a.resolve())
+    session_b = await manager.create("chat", workspace_root=workspace_b.resolve())
+
+    await manager.send_message(session_a.id, "/local alpha")
+    await manager.send_message(session_b.id, "/local beta")
+
+    message_a = store.read_messages(session_a.id)[1]["content"][0]["text"]
+    message_b = store.read_messages(session_b.id)[1]["content"][0]["text"]
+    assert message_a == "done prompt-a alpha"
+    assert message_b == "done prompt-b beta"

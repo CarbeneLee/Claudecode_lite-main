@@ -84,6 +84,7 @@ def _runner(
     config.agent.max_steps = max_steps
     return AgentRunner(
         config,
+        workspace_root=tmp_path.resolve(),
         bus=bus,
         provider=provider,  # type: ignore[arg-type]
         permission_manager=manager,

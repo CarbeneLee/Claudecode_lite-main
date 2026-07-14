@@ -282,8 +282,9 @@ class CoreApp:
 
         self._sessions = SessionManager(
             store,
-            runner_factory=lambda: AgentRunner(
+            runner_factory=lambda workspace_root: AgentRunner(
                 self._config,  # type: ignore[arg-type]
+                workspace_root=workspace_root,
                 bus=self._bus,
                 trace=self._trace,
                 permission_manager=self._permission_manager,

@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from pydantic import BaseModel
 
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
 from kama_claude.core.runner import AgentRunner
+from kama_claude.core.task.manager import TaskManager
 
 # --- mock provider -----------------------------------------------------------
 
@@ -97,6 +99,7 @@ async def _run(
     cfg = config or _config()
     runner = AgentRunner(
         cfg,
+        workspace_root=tmp_path.resolve(),
         provider=provider or _EndTurnProvider(),  # type: ignore[arg-type]
         extra_handlers=[_collect],
         runs_dir=tmp_path,
@@ -106,6 +109,43 @@ async def _run(
 
 
 # --- tests -------------------------------------------------------------------
+
+
+# 功能：验证 AgentRunner 构造必须显式提供 workspace_root
+# 设计：直接调用最小构造器并期待 TypeError，防止未来加入 Path.cwd 默认值
+def test_agent_runner_requires_workspace_root() -> None:
+    with pytest.raises(TypeError):
+        AgentRunner(_config())
+
+
+# 功能：验证 AgentRunner 内部保存 canonical workspace Path
+# 设计：通过指向真实 workspace 的 symlink 构造 runner，断言内部值已 strict resolve
+def test_agent_runner_canonicalizes_workspace_root(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    alias = tmp_path / "workspace-link"
+    alias.symlink_to(workspace, target_is_directory=True)
+
+    runner = AgentRunner(_config(), workspace_root=alias)
+
+    assert runner._workspace_root == workspace.resolve(strict=True)
+
+
+# 功能：验证 AgentRunner 构造顶层 SpawnAgentTool 时传递自身 workspace
+# 设计：调用 registry 组装路径并检查注册工具的 canonical root，不执行 LLM
+def test_runner_passes_workspace_to_spawn_agent(tmp_path: Path) -> None:
+    runner = AgentRunner(_config(), workspace_root=tmp_path.resolve())
+
+    registry = runner._build_registry(
+        TaskManager(tmp_path / "tasks"),
+        run_id="run-1",
+        provider=_EndTurnProvider(),
+        bus=EventBus(),
+    )
+    spawn_tool = registry.get("spawn_agent")
+
+    assert spawn_tool is not None
+    assert spawn_tool._workspace_root == tmp_path.resolve(strict=True)  # type: ignore[attr-defined]
 
 
 # 功能：验证 run 开始时发布携带正确 goal 的 run.started 事件
@@ -174,6 +214,7 @@ async def test_extra_handlers_receive_events(tmp_path: Path) -> None:
     cfg = _config()
     runner = AgentRunner(
         cfg,
+        workspace_root=tmp_path.resolve(),
         provider=_EndTurnProvider(),  # type: ignore[arg-type]
         extra_handlers=[_second],
         runs_dir=tmp_path,
@@ -216,6 +257,7 @@ async def test_injected_bus_receives_events(tmp_path: Path) -> None:
 
     runner = AgentRunner(
         _config(),
+        workspace_root=tmp_path.resolve(),
         bus=external_bus,
         provider=_EndTurnProvider(),  # type: ignore[arg-type]
         runs_dir=tmp_path,
@@ -248,7 +290,12 @@ async def test_session_history_and_notes_injected(tmp_path: Path) -> None:
     store.append_note("sess-1", "Python 3.12", "run-old")
 
     provider = _CapturingProvider(LlmResponse(stop_reason="end_turn", text="done"))
-    runner = AgentRunner(_config(), provider=provider, runs_dir=tmp_path / "runs")
+    runner = AgentRunner(
+        _config(),
+        workspace_root=session.workspace_root,
+        provider=provider,
+        runs_dir=tmp_path / "runs",
+    )
 
     await runner.run_and_capture("remember python", run_id="run-new", session=session, store=store)
 
@@ -307,7 +354,69 @@ async def test_session_registers_note_save_tool(tmp_path: Path) -> None:
     )
     store.append_message("sess-1", "user", "remember")
 
-    runner = AgentRunner(_config(max_steps=3), provider=_NoteProvider(), runs_dir=tmp_path)
+    runner = AgentRunner(
+        _config(max_steps=3),
+        workspace_root=session.workspace_root,
+        provider=_NoteProvider(),
+        runs_dir=tmp_path,
+    )
     await runner.run_and_capture("remember", run_id="run-1", session=session, store=store)
 
     assert "Use Python 3.12" in store.read_notes("sess-1")
+
+
+# 功能：验证 Runner 只加载显式 workspace 下的项目 context 而不读取 daemon cwd
+# 设计：daemon A 与 workspace B 写入冲突内容，捕获 system prompt 并断言仅包含 B
+async def test_project_context_uses_runner_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    daemon_cwd = tmp_path / "daemon"
+    workspace = tmp_path / "workspace"
+    (daemon_cwd / ".kama").mkdir(parents=True)
+    (workspace / ".kama").mkdir(parents=True)
+    (daemon_cwd / ".kama" / "context.md").write_text("daemon-context", encoding="utf-8")
+    (workspace / ".kama" / "context.md").write_text("workspace-context", encoding="utf-8")
+    monkeypatch.chdir(daemon_cwd)
+    provider = _CapturingProvider(LlmResponse(stop_reason="end_turn", text="done"))
+    runner = AgentRunner(
+        _config(),
+        workspace_root=workspace.resolve(),
+        provider=provider,
+        runs_dir=tmp_path / "runs",
+    )
+
+    await runner.run("inspect context")
+
+    assert provider.system is not None
+    assert "workspace-context" in provider.system
+    assert "daemon-context" not in provider.system
+
+
+# 功能：验证 workspace A/B 的 Runner 分别加载各自项目 context
+# 设计：两个 capturing provider 独立运行，直接比较各自收到的 system prompt
+async def test_project_context_isolated_between_runners(tmp_path: Path) -> None:
+    workspace_a = tmp_path / "workspace-a"
+    workspace_b = tmp_path / "workspace-b"
+    for workspace, content in ((workspace_a, "context-a"), (workspace_b, "context-b")):
+        kama_dir = workspace / ".kama"
+        kama_dir.mkdir(parents=True)
+        (kama_dir / "context.md").write_text(content, encoding="utf-8")
+    provider_a = _CapturingProvider(LlmResponse(stop_reason="end_turn", text="done"))
+    provider_b = _CapturingProvider(LlmResponse(stop_reason="end_turn", text="done"))
+
+    for workspace, provider in ((workspace_a, provider_a), (workspace_b, provider_b)):
+        runner = AgentRunner(
+            _config(),
+            workspace_root=workspace.resolve(),
+            provider=provider,
+            runs_dir=tmp_path / "runs",
+        )
+        await runner.run("inspect context")
+
+    assert provider_a.system is not None
+    assert provider_b.system is not None
+    assert "context-a" in provider_a.system
+    assert "context-b" not in provider_a.system
+    assert "context-b" in provider_b.system
+    assert "context-a" not in provider_b.system
