@@ -117,6 +117,7 @@ class PermissionManager:
 
         # ASK 路径（来自 OUTSIDE_CWD 强制 ASK，或 default=ASK）
         loop = asyncio.get_event_loop()
+        # await future：工具调用在此挂起，直到用户响应
         future: asyncio.Future[str] = loop.create_future()
         self._pending[tool_use_id] = _PendingRequest(
             future=future,

@@ -9,8 +9,13 @@ import pytest
 
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, UsageStats
+from kama_claude.core.subagent import tool as subagent_tool_module
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.subagent.tool import AgentResultTool, SpawnAgentTool
+from kama_claude.core.tools.builtin.bash import BashTool
+from kama_claude.core.tools.builtin.list_dir import ListDirTool
+from kama_claude.core.tools.builtin.read_file import ReadFileTool
+from kama_claude.core.tools.builtin.write_file import WriteFileTool
 
 
 def _make_provider(result_text: str = "child done") -> Any:
@@ -41,6 +46,7 @@ def _make_tool(
     registry = BackgroundTaskRegistry()
     tool = SpawnAgentTool(
         provider=provider or _make_provider(),
+        workspace_root=tmp_path.resolve(),
         parent_bus=bus,
         parent_run_id="parent-run-01",
         permission_manager=None,
@@ -51,6 +57,153 @@ def _make_tool(
         depth=depth,
     )
     return tool, registry, bus
+
+
+# 功能：验证 SpawnAgentTool 必须显式接收 workspace_root
+# 设计：省略该 keyword 构造工具并断言 TypeError，防止引入 cwd fallback
+def test_spawn_agent_requires_workspace_root(tmp_path: Path) -> None:
+    with pytest.raises(TypeError):
+        SpawnAgentTool(
+            provider=_make_provider(),
+            parent_bus=EventBus(),
+            parent_run_id="parent",
+            permission_manager=None,
+            max_steps=5,
+            task_registry=BackgroundTaskRegistry(),
+            runs_dir=tmp_path,
+            session_id="session",
+        )
+
+
+# 功能：验证 SpawnAgentTool 保存 canonical workspace root
+# 设计：通过目录 symlink 构造工具并检查内部路径已 strict resolve
+def test_spawn_agent_canonicalizes_workspace_root(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    alias = tmp_path / "workspace-link"
+    alias.symlink_to(workspace, target_is_directory=True)
+
+    tool, _, _ = _make_tool(alias)
+
+    assert tool._workspace_root == workspace.resolve(strict=True)
+
+
+# 功能：验证 nested SpawnAgentTool 继承 parent 的同一 canonical workspace
+# 设计：直接构建 child registry 并检查其中 spawn_agent 的 workspace 状态
+def test_nested_spawn_agent_inherits_workspace(tmp_path: Path) -> None:
+    tool, _, _ = _make_tool(tmp_path)
+
+    registry = tool._build_child_registry(EventBus(), "child-run", None)
+    nested = registry.get("spawn_agent")
+
+    assert isinstance(nested, SpawnAgentTool)
+    assert nested._workspace_root == tmp_path.resolve(strict=True)
+
+
+# 功能：验证 child registry 的 read/list 工具绑定 parent workspace
+# 设计：直接检查 child registry 工具 resolver root，隔离 LLM 与文件系统执行
+def test_child_registry_injects_workspace_into_read_and_list_tools(
+    tmp_path: Path,
+) -> None:
+    tool, _, _ = _make_tool(tmp_path)
+
+    registry = tool._build_child_registry(EventBus(), "child-run", None)
+    read_tool = registry.get("read_file")
+    list_tool = registry.get("list_dir")
+
+    assert isinstance(read_tool, ReadFileTool)
+    assert isinstance(list_tool, ListDirTool)
+    assert read_tool._resolver.root == tmp_path.resolve(strict=True)
+    assert list_tool._resolver.root == tmp_path.resolve(strict=True)
+
+
+# 功能：验证 child registry 的 write 工具与 Bash 继承 parent workspace
+# 设计：检查 child 工具内部 root，不执行有副作用操作
+def test_child_registry_injects_workspace_into_write_and_bash_tools(
+    tmp_path: Path,
+) -> None:
+    tool, _, _ = _make_tool(tmp_path)
+
+    registry = tool._build_child_registry(EventBus(), "child-run", None)
+    write_tool = registry.get("write_file")
+    bash_tool = registry.get("bash")
+
+    assert isinstance(write_tool, WriteFileTool)
+    assert isinstance(bash_tool, BashTool)
+    assert write_tool._resolver.root == tmp_path.resolve(strict=True)
+    assert bash_tool._workspace_root == tmp_path.resolve(strict=True)
+
+
+# 功能：验证 nested subagent 的 filesystem 工具继续继承同一 workspace
+# 设计：从 parent child registry 取 nested tool，再构建下一层 registry 检查四个工具 root
+def test_nested_child_registry_keeps_workspace_bound_tools(tmp_path: Path) -> None:
+    tool, _, _ = _make_tool(tmp_path)
+    child_registry = tool._build_child_registry(EventBus(), "child-run", None)
+    nested = child_registry.get("spawn_agent")
+    assert isinstance(nested, SpawnAgentTool)
+
+    nested_registry = nested._build_child_registry(EventBus(), "nested-run", None)
+    read_tool = nested_registry.get("read_file")
+    write_tool = nested_registry.get("write_file")
+    list_tool = nested_registry.get("list_dir")
+    bash_tool = nested_registry.get("bash")
+
+    assert isinstance(read_tool, ReadFileTool)
+    assert isinstance(write_tool, WriteFileTool)
+    assert isinstance(list_tool, ListDirTool)
+    assert isinstance(bash_tool, BashTool)
+    assert read_tool._resolver.root == tmp_path.resolve(strict=True)
+    assert write_tool._resolver.root == tmp_path.resolve(strict=True)
+    assert list_tool._resolver.root == tmp_path.resolve(strict=True)
+    assert bash_tool._workspace_root == tmp_path.resolve(strict=True)
+
+
+# 功能：验证不同 workspace 的 subagent 分别加载各自 profile 与 project context
+# 设计：A/B 使用同名 profile 和不同 context，捕获 provider system 参数并交叉排除污染
+async def test_subagents_isolate_profile_and_context_by_workspace(tmp_path: Path) -> None:
+    systems: list[str] = []
+    for name in ("a", "b"):
+        workspace = tmp_path / f"workspace-{name}"
+        agents = workspace / ".kama" / "agents"
+        agents.mkdir(parents=True)
+        (workspace / ".kama" / "context.md").write_text(
+            f"context-{name}",
+            encoding="utf-8",
+        )
+        (agents / "planner.toml").write_text(
+            '[agent]\ndescription = "local"\n'
+            f'system_prompt = "profile-{name}"\nallowed_tools = ["read_file"]\n',
+            encoding="utf-8",
+        )
+        provider = _make_provider()
+        tool, _, _ = _make_tool(workspace, provider)
+
+        await tool.invoke(
+            {
+                "description": "inspect",
+                "prompt": "inspect workspace",
+                "subagent_type": "planner",
+            }
+        )
+
+        system = provider.chat.await_args.kwargs["system"]
+        assert isinstance(system, str)
+        systems.append(system)
+
+    assert "profile-a" in systems[0]
+    assert "context-a" in systems[0]
+    assert "profile-b" not in systems[0]
+    assert "context-b" not in systems[0]
+    assert "profile-b" in systems[1]
+    assert "context-b" in systems[1]
+    assert "profile-a" not in systems[1]
+    assert "context-a" not in systems[1]
+
+
+# 功能：验证 subagent 模块不保留绑定项目目录的全局 profile loader
+# 设计：直接检查模块命名空间，锁定跨 workspace 共享实例被移除
+def test_subagent_has_no_module_profile_loader() -> None:
+    assert not hasattr(subagent_tool_module, "_profile_loader")
 
 
 # 功能：前台模式下 spawn_agent 应阻塞直到子 agent 完成并返回其结果

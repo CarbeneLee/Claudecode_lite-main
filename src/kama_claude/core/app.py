@@ -35,7 +35,7 @@ from kama_claude.core.bus.commands import (
     SessionSendMessageCommand,
     SessionSendMessageResult,
 )
-from kama_claude.core.bus.envelope import EventPushEnvelope
+from kama_claude.core.bus.envelope import EventPushEnvelope, HandlerError
 from kama_claude.core.config import KamaConfig, get_config
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.provider import AnthropicProvider
@@ -50,6 +50,8 @@ from kama_claude.core.trace.record import TraceRecord
 from kama_claude.core.trace.writer import TraceWriter
 from kama_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
 from kama_claude.core.transport.socket_server import SocketServer, get_connection_writer
+from kama_claude.core.workspace.errors import INVALID_WORKSPACE, InvalidWorkspaceError
+from kama_claude.core.workspace.validation import validate_workspace_root
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +111,19 @@ class CoreApp:
     async def _agent_run_handler(self, params: dict[str, Any]) -> AgentRunResult:
         assert self._sessions is not None
         cmd = AgentRunCommand.model_validate(params)
-        session = await self._sessions.create(mode="one_shot", title=cmd.goal[:40])
+        try:
+            workspace_root = validate_workspace_root(cmd.workspace_root)
+        except InvalidWorkspaceError as exc:
+            raise HandlerError(
+                INVALID_WORKSPACE,
+                "invalid workspace_root",
+                {"reason": exc.reason},
+            ) from exc
+        session = await self._sessions.create(
+            mode="one_shot",
+            title=cmd.goal[:40],
+            workspace_root=workspace_root,
+        )
         run_id = new_run_id()
         run_task = asyncio.create_task(
             self._sessions.send_message(session.id, cmd.goal, run_id=run_id)
@@ -122,7 +136,19 @@ class CoreApp:
     async def _session_create_handler(self, params: dict[str, Any]) -> SessionCreateResult:
         assert self._sessions is not None
         cmd = SessionCreateCommand.model_validate(params)
-        session = await self._sessions.create(mode=cmd.mode, title=cmd.title)
+        try:
+            workspace_root = validate_workspace_root(cmd.workspace_root)
+        except InvalidWorkspaceError as exc:
+            raise HandlerError(
+                INVALID_WORKSPACE,
+                "invalid workspace_root",
+                {"reason": exc.reason},
+            ) from exc
+        session = await self._sessions.create(
+            mode=cmd.mode,
+            title=cmd.title,
+            workspace_root=workspace_root,
+        )
         return SessionCreateResult(session_id=session.id, status=session.status)
 
     # 向 session 发送一条用户消息并同步等待对应 run 完成
@@ -225,6 +251,8 @@ class CoreApp:
 
         if self._config.trace.enabled:
             trace_path = Path(self._config.trace.file).expanduser()
+            # daemon.jsonl 记录所有事件和 LLM 请求响应的 trace，便于调试和回放。
+            # TraceWriter 是异步上下文管理器，自动处理文件打开和关闭。
             self._trace = TraceWriter(trace_path)
             await self._trace.start()
             self._bus.subscribe(self._trace_event_handler)
@@ -254,8 +282,9 @@ class CoreApp:
 
         self._sessions = SessionManager(
             store,
-            runner_factory=lambda: AgentRunner(
+            runner_factory=lambda workspace_root: AgentRunner(
                 self._config,  # type: ignore[arg-type]
+                workspace_root=workspace_root,
                 bus=self._bus,
                 trace=self._trace,
                 permission_manager=self._permission_manager,

@@ -9,8 +9,8 @@ from kama_claude.core.skills.loader import Skill, SkillLoader
 
 # 功能：内建 review skill 应能被 SkillLoader 查找到
 # 设计：直接调用 resolve("review")，不依赖文件系统之外的任何状态
-def test_builtin_skill_found() -> None:
-    loader = SkillLoader()
+def test_builtin_skill_found(tmp_path: Path) -> None:
+    loader = SkillLoader(tmp_path.resolve())
     skill = loader.resolve("review")
     assert skill is not None
     assert skill.name == "review"
@@ -21,24 +21,24 @@ def test_builtin_skill_found() -> None:
 # 功能：内建 init / summarize / orchestrate skill 均可找到
 # 设计：列举所有内建 skill 名，断言均能解析
 @pytest.mark.parametrize("name", ["init", "review", "summarize", "orchestrate"])
-def test_all_builtin_skills_found(name: str) -> None:
-    loader = SkillLoader()
+def test_all_builtin_skills_found(name: str, tmp_path: Path) -> None:
+    loader = SkillLoader(tmp_path.resolve())
     skill = loader.resolve(name)
     assert skill is not None, f"builtin skill '{name}' not found"
 
 
 # 功能：不存在的 skill 名应返回 None
 # 设计：查找一个不存在的名称，断言 resolve 返回 None 而非抛异常
-def test_unknown_skill_returns_none() -> None:
-    loader = SkillLoader()
+def test_unknown_skill_returns_none(tmp_path: Path) -> None:
+    loader = SkillLoader(tmp_path.resolve())
     result = loader.resolve("nonexistent_skill_xyz")
     assert result is None
 
 
 # 功能：render_prompt 应将 $ARGUMENTS 替换为传入的参数字符串
 # 设计：构造含 $ARGUMENTS 的 skill，验证 render_prompt 结果不含 "$ARGUMENTS" 且含参数值
-def test_arguments_substituted() -> None:
-    loader = SkillLoader()
+def test_arguments_substituted(tmp_path: Path) -> None:
+    loader = SkillLoader(tmp_path.resolve())
     skill = Skill(
         name="test",
         description="test skill",
@@ -90,17 +90,47 @@ def test_no_frontmatter(tmp_path: Path) -> None:
 
 
 # 功能：项目本地 skill 应覆盖内建同名 skill
-# 设计：在 .kama/skills/ 中写入同名文件，用 monkeypatch 修改 cwd，断言加载到的是本地版本
+# 设计：daemon cwd 放置冲突版本，loader 显式绑定另一个 workspace，断言只读取绑定目录
 def test_project_overrides_global(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    local_skills = tmp_path / ".kama" / "skills"
+    workspace = tmp_path / "workspace"
+    daemon_cwd = tmp_path / "daemon"
+    local_skills = workspace / ".kama" / "skills"
+    daemon_skills = daemon_cwd / ".kama" / "skills"
     local_skills.mkdir(parents=True)
+    daemon_skills.mkdir(parents=True)
     (local_skills / "review.md").write_text(
         "---\nname: review\ndescription: local override\n---\nlocal system prompt $ARGUMENTS\n",
         encoding="utf-8",
     )
-    monkeypatch.chdir(tmp_path)
-    loader = SkillLoader()
+    (daemon_skills / "review.md").write_text(
+        "---\nname: review\ndescription: daemon override\n---\ndaemon prompt\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(daemon_cwd)
+    loader = SkillLoader(workspace.resolve())
     skill = loader.resolve("review")
     assert skill is not None
     assert skill.description == "local override"
     assert "local system prompt" in skill.system_prompt_template
+
+
+# 功能：验证两个 SkillLoader 对同名项目 skill 保持 workspace 隔离
+# 设计：A/B 各写不同描述，通过两个显式 root loader 解析并比较结果
+def test_skill_loaders_isolate_project_overrides(tmp_path: Path) -> None:
+    workspace_a = tmp_path / "workspace-a"
+    workspace_b = tmp_path / "workspace-b"
+    for workspace, description in ((workspace_a, "skill-a"), (workspace_b, "skill-b")):
+        skills = workspace / ".kama" / "skills"
+        skills.mkdir(parents=True)
+        (skills / "local.md").write_text(
+            f"---\nname: local\ndescription: {description}\n---\n{description} $ARGUMENTS\n",
+            encoding="utf-8",
+        )
+
+    skill_a = SkillLoader(workspace_a.resolve()).resolve("local")
+    skill_b = SkillLoader(workspace_b.resolve()).resolve("local")
+
+    assert skill_a is not None
+    assert skill_b is not None
+    assert skill_a.description == "skill-a"
+    assert skill_b.description == "skill-b"

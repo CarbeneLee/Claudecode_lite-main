@@ -41,13 +41,9 @@ def sample_file(tmp_path: Path) -> Path:
 async def test_run_e2e_reads_file_and_succeeds(
     sample_file: Path,
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not os.environ.get("ANTHROPIC_API_KEY"):
         pytest.skip("ANTHROPIC_API_KEY not set")
-
-    # ReadFileTool resolves paths relative to CWD — point it at tmp_path
-    monkeypatch.chdir(tmp_path)
 
     goal = (
         "Use the read_file tool to read the file 'sample.txt' "
@@ -58,7 +54,11 @@ async def test_run_e2e_reads_file_and_succeeds(
     config = KamaConfig()
     config.agent.max_steps = 5
 
-    runner = AgentRunner(config, runs_dir=runs_dir)
+    runner = AgentRunner(
+        config,
+        workspace_root=tmp_path.resolve(),
+        runs_dir=runs_dir,
+    )
     await runner.run(goal)
 
     # ── events.jsonl must exist ──────────────────────────────────────────────

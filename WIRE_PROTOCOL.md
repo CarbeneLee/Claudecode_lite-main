@@ -108,6 +108,7 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
 |---|---|---|
 | `type` | `string` | no |
 | `goal` | `string` | yes |
+| `workspace_root` | `string` | yes |
 
 ```json
 {
@@ -121,10 +122,15 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
     "goal": {
       "title": "Goal",
       "type": "string"
+    },
+    "workspace_root": {
+      "title": "Workspace Root",
+      "type": "string"
     }
   },
   "required": [
-    "goal"
+    "goal",
+    "workspace_root"
   ],
   "title": "AgentRunCommand",
   "type": "object"
@@ -139,7 +145,8 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
   "id": "u-2",
   "method": "agent.run",
   "params": {
-    "goal": "\u603b\u7ed3 README.md \u7684\u4e3b\u8981\u7ae0\u8282"
+    "goal": "\u603b\u7ed3 README.md \u7684\u4e3b\u8981\u7ae0\u8282",
+    "workspace_root": "/Users/alice/project"
   }
 }
 ```
@@ -297,6 +304,7 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
 | `type` | `string` | no |
 | `mode` | `string` | no |
 | `title` | `string` | no |
+| `workspace_root` | `string` | yes |
 
 ```json
 {
@@ -320,8 +328,15 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
       "default": "",
       "title": "Title",
       "type": "string"
+    },
+    "workspace_root": {
+      "title": "Workspace Root",
+      "type": "string"
     }
   },
+  "required": [
+    "workspace_root"
+  ],
   "title": "SessionCreateCommand",
   "type": "object"
 }
@@ -336,7 +351,8 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
   "method": "session.create",
   "params": {
     "mode": "chat",
-    "title": ""
+    "title": "",
+    "workspace_root": "/Users/alice/project"
   }
 }
 ```
@@ -1643,3 +1659,4 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | -32602 | Invalid Params | Parameter validation failed |
 | -32603 | Internal Error | Handler raised an unhandled exception |
 | -32000 | Application Error | e.g. another run already in progress |
+| -32013 | INVALID_WORKSPACE | workspace_root is relative, missing, or not a directory |

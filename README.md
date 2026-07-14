@@ -149,6 +149,12 @@ CLI 和 TUI 只是客户端。
 | S6 | 上下文治理 | 长会话下有 context 水位、tool_result 截断和 compact |
 | S7 | 扩展边界 | Skills、Subagents、MCP 让 Agent 可组织、可派生、可接外部工具 |
 
+### Workspace 工具边界
+
+内建 `read_file`、`list_dir` 和 `write_file` 只接受相对于当前 session workspace 的路径。绝对路径、canonicalize 后逃逸 workspace 的路径，以及选定的敏感路径（例如 `.git`、环境变量文件和常见私钥文件）会被拒绝。
+
+`bash` 子进程从 session workspace 启动，但这不是 OS 级 sandbox。Shell 仍可通过绝对路径、`cd ..`、子进程或网络访问 workspace 外部，也可以绕过 filesystem tools 的敏感路径策略。MCP 工具不受这一 builtin filesystem boundary 约束。针对路径校验与实际 I/O 之间 TOCTOU 的 `openat` / `O_NOFOLLOW` 加固仍属于后续工作。
+
 从第一章开始，项目就不是“先写一个脚本，后面再慢慢重构”。
 
 KamaClaude 在 S0 就先把 `kama` CLI 和 `kama-core` daemon 拆开，通过 TCP NDJSON + JSON-RPC 2.0 通信。
@@ -339,7 +345,6 @@ Python
 如果是 C++、Java、Go或者其他语言选手，做个项目没问题，这个项目写简历上，面试官也不会问你语言问题，而是聚焦Agent的设计与实现。
 
 我们项目专栏上，简历写法，项目亮点，都不强调编程语言，都聚焦Agent原理。
-
 
 
 

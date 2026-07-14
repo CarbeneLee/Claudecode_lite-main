@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from kama_claude.core.tools.base import BaseTool, ToolResult
+from kama_claude.core.workspace.resolver import WorkspacePathResolver
 
 _MAX_OUTPUT_BYTES = 64 * 1024  # 64 KB
 _DEFAULT_TIMEOUT = 60
@@ -39,7 +41,11 @@ class BashTool(BaseTool):
         "required": ["command"],
     }
 
-    # 在子进程中执行 shell 命令，合并 stdout/stderr，超时或非零退出码时返回错误
+    # 绑定 shell 子进程的 canonical 启动 workspace
+    def __init__(self, workspace_root: Path) -> None:
+        self._workspace_root = WorkspacePathResolver(workspace_root).root
+
+    # 从 workspace 启动 shell，合并 stdout/stderr，处理超时与非零退出码
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = BashParams.model_validate(params)
         command = p.command
@@ -48,6 +54,7 @@ class BashTool(BaseTool):
         try:
             proc = await asyncio.create_subprocess_shell(
                 command,
+                cwd=str(self._workspace_root),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )

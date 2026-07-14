@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+from pathlib import Path
 from typing import Any
 
 from rich.markdown import Markdown
@@ -539,7 +540,7 @@ class KamaTuiApp(App[None]):
     def _build_slash_items(self) -> list[tuple[str, str]]:
         items: list[tuple[str, str]] = [("compact", "compress context window")]
         try:
-            loader = SkillLoader()
+            loader = SkillLoader(Path.cwd().resolve(strict=True))
             for skill in loader.list_all_skills():
                 desc = skill.description.splitlines()[0] if skill.description else ""
                 if len(desc) > 60:
@@ -810,7 +811,13 @@ class KamaTuiApp(App[None]):
                 if self._replay_run_id is not None:
                     params["replay_from_run"] = self._replay_run_id
                 await client.send_command("event.subscribe", params)
-                created = await client.send_command("session.create", {"mode": "chat"})
+                created = await client.send_command(
+                    "session.create",
+                    {
+                        "mode": "chat",
+                        "workspace_root": str(Path.cwd().resolve()),
+                    },
+                )
                 self._session_id = str(created["session_id"])
                 log.info("session created session_id=%s", self._session_id)
                 prompt = self._prompt()

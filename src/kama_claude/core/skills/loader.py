@@ -69,6 +69,10 @@ def _parse_skill_file(path: Path) -> Skill:
 class SkillLoader:
     _BUILTIN_DIR = Path(__file__).parent / "builtin"
 
+    # 绑定 canonical workspace，作为项目 skill 的唯一查找根目录
+    def __init__(self, workspace_root: Path) -> None:
+        self._workspace_root = workspace_root.resolve(strict=True)
+
     # 按优先级查找 skill 文件；未找到返回 None
     def resolve(self, name: str) -> Skill | None:
         for path in self._search_paths(name):
@@ -82,7 +86,7 @@ class SkillLoader:
     # 返回候选路径列表，同时支持扁平文件（name.md）和目录式（name/SKILL.md）两种格式
     def _search_paths(self, name: str) -> list[Path]:
         dirs = [
-            Path(".kama/skills"),
+            self._workspace_root / ".kama" / "skills",
             Path("~/.kama/skills").expanduser(),
             self._BUILTIN_DIR,
         ]
@@ -98,7 +102,7 @@ class SkillLoader:
         for d in [
             self._BUILTIN_DIR,
             Path("~/.kama/skills").expanduser(),
-            Path(".kama/skills"),
+            self._workspace_root / ".kama" / "skills",
         ]:
             if d.exists():
                 for f in sorted(d.glob("*.md")):
@@ -113,7 +117,7 @@ class SkillLoader:
         for d in [
             self._BUILTIN_DIR,
             Path("~/.kama/skills").expanduser(),
-            Path(".kama/skills"),
+            self._workspace_root / ".kama" / "skills",
         ]:
             if d.exists():
                 for f in sorted(d.glob("*.md")):

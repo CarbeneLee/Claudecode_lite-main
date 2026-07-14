@@ -4,6 +4,7 @@ import asyncio
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from kama_claude.core.bus.envelope import HandlerError
@@ -40,7 +41,7 @@ class SessionManager:
     def __init__(
         self,
         store: SessionStore,
-        runner_factory: Callable[[], AgentRunner],
+        runner_factory: Callable[[Path], AgentRunner],
         bus: EventBus,
         provider: LLMProvider | None = None,
     ) -> None:
@@ -50,10 +51,15 @@ class SessionManager:
         self._provider = provider
         self._sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
-        self._skill_loader = SkillLoader()
 
     # 创建新 session 并写入 meta.json
-    async def create(self, mode: SessionMode, title: str = "") -> Session:
+    async def create(
+        self,
+        mode: SessionMode,
+        title: str = "",
+        *,
+        workspace_root: Path,
+    ) -> Session:
         sid = f"sess-{uuid.uuid4().hex[:12]}"
         ts = _now()
         session = Session(
@@ -63,6 +69,7 @@ class SessionManager:
             title=title,
             created_at=ts,
             updated_at=ts,
+            workspace_root=workspace_root,
             run_ids=[],
         )
         self._sessions[sid] = session
@@ -103,12 +110,13 @@ class SessionManager:
             system_prompt_override: str | None = None
             tool_whitelist: list[str] | None = None
             if content.startswith("/"):
+                skill_loader = SkillLoader(session.workspace_root)
                 parts = content[1:].split(None, 1)
                 skill_name = parts[0]
                 arguments = parts[1] if len(parts) > 1 else ""
-                skill = self._skill_loader.resolve(skill_name)
+                skill = skill_loader.resolve(skill_name)
                 if skill is not None:
-                    goal = self._skill_loader.render_prompt(skill, arguments)
+                    goal = skill_loader.render_prompt(skill, arguments)
                     system_prompt_override = skill.system_prompt_template
                     tool_whitelist = skill.allowed_tools or None
                     await self._bus.publish(
@@ -120,7 +128,7 @@ class SessionManager:
                         )
                     )
 
-            runner = self._runner_factory()
+            runner = self._runner_factory(session.workspace_root)
             await runner.run_and_capture(
                 goal,
                 run_id=run_id,

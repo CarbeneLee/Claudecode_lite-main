@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+from pathlib import Path
 
 
 # 发送一条 JSON-RPC 请求并返回响应对象
@@ -25,6 +26,7 @@ async def _send_recv(
 async def test_session_create_history_close_over_ipc(
     running_daemon: subprocess.Popen[bytes],
     free_port: int,
+    tmp_path: Path,
 ) -> None:
     reader, writer = await asyncio.open_connection("127.0.0.1", free_port)
 
@@ -32,7 +34,11 @@ async def test_session_create_history_close_over_ipc(
         reader,
         writer,
         "session.create",
-        {"mode": "chat", "title": "ipc test"},
+        {
+            "mode": "chat",
+            "title": "ipc test",
+            "workspace_root": str(tmp_path.resolve()),
+        },
         req_id="create",
     )
     assert "result" in created, created
@@ -57,5 +63,30 @@ async def test_session_create_history_close_over_ipc(
     )
     assert closed["result"]["status"] == "closed"
 
+    writer.close()
+    await writer.wait_closed()
+
+
+# 功能：验证真实 daemon 对相对 workspace_root 返回稳定 JSON-RPC domain error
+# 设计：发送原始 NDJSON 请求并断言 code、message、data，覆盖 SocketServer 的 HandlerError 转换
+async def test_session_create_rejects_relative_workspace_over_ipc(
+    running_daemon: subprocess.Popen[bytes],
+    free_port: int,
+) -> None:
+    reader, writer = await asyncio.open_connection("127.0.0.1", free_port)
+
+    response = await _send_recv(
+        reader,
+        writer,
+        "session.create",
+        {"mode": "chat", "workspace_root": "relative/project"},
+        req_id="invalid-workspace",
+    )
+
+    assert response["error"] == {
+        "code": -32013,
+        "message": "invalid workspace_root",
+        "data": {"reason": "not_absolute"},
+    }
     writer.close()
     await writer.wait_closed()

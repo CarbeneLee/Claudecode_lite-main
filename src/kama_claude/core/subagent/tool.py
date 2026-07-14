@@ -13,6 +13,7 @@ from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.events.writer import EventWriter
 from kama_claude.core.loop import AgentLoop
+from kama_claude.core.memory.loader import load_context_file
 from kama_claude.core.runs import new_run_id
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.tools.base import BaseTool, ToolResult
@@ -25,13 +26,12 @@ from kama_claude.core.tools.builtin.task_list import TaskListTool
 from kama_claude.core.tools.builtin.task_update import TaskUpdateTool
 from kama_claude.core.tools.builtin.write_file import WriteFileTool
 from kama_claude.core.tools.registry import ToolRegistry
+from kama_claude.core.workspace.policy import WorkspaceAccessPolicy
+from kama_claude.core.workspace.resolver import WorkspacePathResolver
 
 if TYPE_CHECKING:
     from kama_claude.core.llm.base import LLMProvider
     from kama_claude.core.permissions.manager import PermissionManager
-
-_profile_loader = AgentProfileLoader()
-
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
@@ -85,6 +85,7 @@ class SpawnAgentTool(BaseTool):
     def __init__(
         self,
         provider: LLMProvider,
+        workspace_root: Path,
         parent_bus: EventBus,
         parent_run_id: str,
         permission_manager: PermissionManager | None,
@@ -95,6 +96,10 @@ class SpawnAgentTool(BaseTool):
         depth: int = 0,
     ) -> None:
         self._provider = provider
+        self._path_resolver = WorkspacePathResolver(workspace_root)
+        self._workspace_root = self._path_resolver.root
+        self._access_policy = WorkspaceAccessPolicy(self._workspace_root)
+        self._profile_loader = AgentProfileLoader(self._workspace_root)
         self._parent_bus = parent_bus
         self._parent_run_id = parent_run_id
         self._permission_manager = permission_manager
@@ -117,13 +122,19 @@ class SpawnAgentTool(BaseTool):
 
         profile: AgentProfile | None = None
         if p.subagent_type:
-            profile = _profile_loader.load(p.subagent_type)
+            profile = self._profile_loader.load(p.subagent_type)
 
         child_run_id = new_run_id()
+        global_ctx = load_context_file(Path("~/.kama/context.md").expanduser())
+        project_ctx = load_context_file(
+            self._workspace_root / ".kama" / "context.md"
+        )
         child_context = ExecutionContext(
             run_id=child_run_id,
             goal=p.prompt,
             max_steps=self._max_steps,
+            global_context=global_ctx,
+            project_context=project_ctx,
             system_prompt_override=profile.system_prompt if profile else None,
         )
 
@@ -235,10 +246,10 @@ class SpawnAgentTool(BaseTool):
 
         registry = ToolRegistry()
         _all_tools = [
-            ReadFileTool(),
-            BashTool(),
-            WriteFileTool(),
-            ListDirTool(),
+            ReadFileTool(self._path_resolver, self._access_policy),
+            BashTool(self._workspace_root),
+            WriteFileTool(self._path_resolver, self._access_policy),
+            ListDirTool(self._path_resolver, self._access_policy),
         ]
         for t in _all_tools:
             if _allowed(t.name):
@@ -257,6 +268,7 @@ class SpawnAgentTool(BaseTool):
         if self._depth < 1:
             nested = SpawnAgentTool(
                 provider=self._provider,
+                workspace_root=self._workspace_root,
                 parent_bus=child_bus,
                 parent_run_id=child_run_id,
                 permission_manager=self._permission_manager,

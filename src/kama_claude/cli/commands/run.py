@@ -4,6 +4,7 @@ import asyncio
 import json
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from kama_claude.core.config import KamaConfig
@@ -94,7 +95,13 @@ async def _run_async(goal: str, config: KamaConfig) -> int:
                 "scope": "global",
             },
         )
-        await client.send_command("agent.run", {"goal": goal})
+        await client.send_command(
+            "agent.run",
+            {
+                "goal": goal,
+                "workspace_root": str(Path.cwd().resolve()),
+            },
+        )
     except IpcError as e:
         print(f"error: {e}", file=sys.stderr)
         loop_task.cancel()

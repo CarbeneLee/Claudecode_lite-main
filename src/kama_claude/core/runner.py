@@ -38,25 +38,28 @@ from kama_claude.core.tools.builtin import (
 from kama_claude.core.tools.registry import ToolRegistry
 from kama_claude.core.trace.provider import TracingProvider
 from kama_claude.core.trace.writer import TraceWriter
+from kama_claude.core.workspace.policy import WorkspaceAccessPolicy
+from kama_claude.core.workspace.resolver import WorkspacePathResolver
 
 
-def _now() -> str:
+def _now() -> str: # 生成当前 UTC 时间的 ISO 格式字符串，用于事件时间戳。
     return datetime.now(UTC).isoformat()
-
+# 返回str而非datetime对象，方便JSONL序列化和日志记录。
 
 @dataclass
 class RunOutcome:
-    status: str
-    result: str
-    reason: str | None
-
+    status: str # 运行状态，例如 "success" 或 "failure"
+    result: str  # 运行结果的文本输出，可能为 None
+    reason: str | None # 运行失败的原因，如果有的话
+# 一次运行后的不可变快照结果
 
 class AgentRunner:
     # 组装所有运行时依赖，准备执行一次完整的 agent run
     def __init__(
         self,
-        config: KamaConfig,
-        *,
+        config: KamaConfig, #唯一必须参数
+        *, # 通过*传递的可选参数
+        workspace_root: Path,
         bus: EventBus | None = None,
         provider: LLMProvider | None = None,
         extra_handlers: list[EventHandler] | None = None,
@@ -66,6 +69,9 @@ class AgentRunner:
         mcp_manager: McpServerManager | None = None,
     ) -> None:
         self._config = config
+        self._path_resolver = WorkspacePathResolver(workspace_root)
+        self._workspace_root = self._path_resolver.root
+        self._access_policy = WorkspaceAccessPolicy(self._workspace_root)
         self._bus = bus
         self._provider = provider
         self._extra_handlers: list[EventHandler] = extra_handlers or []
@@ -77,8 +83,8 @@ class AgentRunner:
         self._task_registry = BackgroundTaskRegistry()
 
     # 构建工具注册表，注入 TaskManager（任务工具共享同一实例）；可选注入 SpawnAgentTool
-    def _build_registry(
-        self,
+    def _build_registry( #条件化工具注入
+        self, 
         task_manager: TaskManager,
         *,
         session: Session | None = None,
@@ -96,7 +102,12 @@ class AgentRunner:
             return allowed is None or name in allowed
 
         registry = ToolRegistry()
-        for t in [ReadFileTool(), BashTool(), WriteFileTool(), ListDirTool()]:
+        for t in [
+            ReadFileTool(self._path_resolver, self._access_policy),
+            BashTool(self._workspace_root),
+            WriteFileTool(self._path_resolver, self._access_policy),
+            ListDirTool(self._path_resolver, self._access_policy),
+        ]:
             if _ok(t.name):
                 registry.register(t)
         for t in [
@@ -117,6 +128,7 @@ class AgentRunner:
                 registry.register(
                     SpawnAgentTool(
                         provider=provider,
+                        workspace_root=self._workspace_root,
                         parent_bus=bus,
                         parent_run_id=run_id,
                         permission_manager=self._permission_manager,
@@ -124,7 +136,7 @@ class AgentRunner:
                         task_registry=self._task_registry,
                         runs_dir=runs_dir,
                         session_id=session_id,
-                        depth=0,
+                        depth=0, # 防止agent无限递归调用自身，depth=0表示这是顶层agent
                     )
                 )
             if _ok("agent_result"):
@@ -145,7 +157,9 @@ class AgentRunner:
         goal: str,
         *,
         run_id: str | None = None,
+        # 无 session 时创建最小历史，作为一次性执行
         session: Session | None = None,
+        # 有 session 时将运行结果存入 SessionStore，实现上下文延续
         store: SessionStore | None = None,
         system_prompt_override: str | None = None,
         tool_whitelist: list[str] | None = None,
@@ -162,27 +176,33 @@ class AgentRunner:
         run_path.mkdir(parents=True, exist_ok=True)
 
         global_ctx = load_context_file(Path("~/.kama/context.md").expanduser())
-        project_ctx = load_context_file(Path(".kama/context.md"))
+        project_ctx = load_context_file(self._workspace_root / ".kama" / "context.md")
 
+        # TaskManager 存储在 run_path / ".tasks"，每个 run 相互隔离
         task_manager = TaskManager(run_path / ".tasks")
 
         bus = self._bus if self._bus is not None else EventBus()
         for h in self._extra_handlers:
             bus.subscribe(h)
 
+        # 创建包含本次运行基本信息和状态的执行上下文
         context = ExecutionContext(
             run_id=run_id,
             goal=goal,
+            # max_steps 来自 agent 配置
             max_steps=self._config.agent.max_steps,
+            # messages 使用完整对话历史进行预填充
             prefill_messages=history,
             session_notes=notes,
             global_context=global_ctx,
             project_context=project_ctx,
             system_prompt_override=system_prompt_override,
         )
-        prefill_len = len(history)
+        prefill_len = len(history) #避免重复存储历史消息
 
+        # EventWriter 是异步上下文管理器，自动处理文件打开和关闭
         async with EventWriter(run_path / "events.jsonl") as writer:
+            # 订阅事件总线，确保所有运行和步骤事件写入 events.jsonl
             writer.subscribe(bus)
             await bus.publish(RunStartedEvent(run_id=run_id, goal=goal, ts=_now()))
 
@@ -224,12 +244,13 @@ class AgentRunner:
                     provider, registry, bus,
                     permission_manager=self._permission_manager,
                     compactor=compactor,
-                    compact_threshold=self._config.compaction.auto_threshold,
+                    compact_threshold=self._config.compaction.auto_threshold, #触发压缩上下文的阈值
                     session_id=session_id_str,
                 )
                 await loop.run(context)
+            # CancelledError 单独处理，并通过标志位在退出前恢复取消传播
             except asyncio.CancelledError:
-                cancelled = True
+                cancelled = True #确保取消不丢失数据
                 if not context.is_done():
                     context.mark_failed("cancelled")
             except Exception:
