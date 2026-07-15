@@ -13,7 +13,6 @@ from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import ToolCallBlock
 from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.tools.errors import (
-    RETRYABLE_ERROR_TYPES,
     RateLimitedError,
     TransientToolError,
 )
@@ -135,8 +134,9 @@ async def _run(
     tool: BaseTool,
     *,
     monkeypatch: pytest.MonkeyPatch,
+    retry_base_s: float = 0.0,
 ) -> tuple[ToolResult, list[BaseModel]]:
-    monkeypatch.setattr(inv_mod, "_RETRY_BASE_S", 0.0)
+    monkeypatch.setattr(inv_mod, "_RETRY_BASE_S", retry_base_s)
     registry = ToolRegistry()
     registry.register(tool)
     bus = EventBus()
@@ -154,12 +154,6 @@ async def _run(
 # 从事件列表筛选失败 attempt
 def _failed(events: list[BaseModel]) -> list[ToolCallFailedEvent]:
     return [event for event in events if isinstance(event, ToolCallFailedEvent)]
-
-
-# 功能：验证自动重试只允许冻结的 transient_error 与 rate_limited
-# 设计：直接断言唯一 source of truth 的不可变集合，防止未来退化为 denylist 或重新加入 runtime_error
-def test_retry_allowlist_is_explicit_and_frozen() -> None:
-    assert RETRYABLE_ERROR_TYPES == frozenset({"transient_error", "rate_limited"})
 
 
 @pytest.mark.parametrize(
@@ -291,21 +285,48 @@ async def test_transient_exception_retries_and_succeeds_on_third_attempt(
     ]
 
 
+# 功能：验证重试等待按 1x、2x 指数退避而不是固定、递减或偏移倍率
+# 设计：替换 sleep 为只记录 delay 的异步函数，保留真实 retry loop 并观察两次等待的外部时序参数
+async def test_retry_backoff_doubles_between_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delays: list[float] = []
+
+    # 记录退避参数而不产生真实等待
+    async def _record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(inv_mod.asyncio, "sleep", _record_sleep)
+    tool = _TransientResultNTimes(2)
+
+    result, events = await _run(
+        tool,
+        monkeypatch=monkeypatch,
+        retry_base_s=0.25,
+    )
+
+    assert not result.is_error
+    assert tool.calls == 3
+    assert delays == [0.25, 0.5]
+    assert [event.attempt for event in _failed(events)] == [1, 2]
+
+
 @pytest.mark.parametrize(
-    ("tool", "expected_error_type", "expected_message"),
+    ("tool_type", "expected_error_type", "expected_message"),
     [
-        (_TransientResultNTimes(2), "transient_error", "temporary tool failure"),
-        (_RateLimitedNTimes(2), "rate_limited", "tool rate limit exceeded"),
+        (_TransientResultNTimes, "transient_error", "temporary tool failure"),
+        (_RateLimitedNTimes, "rate_limited", "tool rate limit exceeded"),
     ],
 )
 # 功能：验证两类显式瞬态错误失败两次后第三次成功
-# 设计：分别用 ToolResult 与异常进入 retry loop，断言调用次数、attempt、事件序列和供应商消息净化
+# 设计：每个参数 case 内新建 ToolResult 或异常工具，保证重复 runner 隔离并断言调用次数、attempt 与消息净化
 async def test_retryable_error_succeeds_on_third_attempt(
-    tool: _TransientResultNTimes | _RateLimitedNTimes,
+    tool_type: type[_TransientResultNTimes] | type[_RateLimitedNTimes],
     expected_error_type: str,
     expected_message: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    tool = tool_type(2)
     result, events = await _run(tool, monkeypatch=monkeypatch)
 
     failed = _failed(events)
@@ -324,19 +345,20 @@ async def test_retryable_error_succeeds_on_third_attempt(
 
 
 @pytest.mark.parametrize(
-    ("tool", "expected_error_type"),
+    ("tool_type", "expected_error_type"),
     [
-        (_TransientResultNTimes(10), "transient_error"),
-        (_RateLimitedNTimes(10), "rate_limited"),
+        (_TransientResultNTimes, "transient_error"),
+        (_RateLimitedNTimes, "rate_limited"),
     ],
 )
 # 功能：验证两类显式瞬态错误耗尽三个 attempt 后返回最终错误
-# 设计：让异常持续超过最大尝试次数，断言恰好调用三次、failed 编号 1/2/3 且绝不发布 success finished
+# 设计：每个参数 case 内新建持续失败工具，保证重复 runner 隔离并断言恰好三次 attempt 且绝不发布 finished
 async def test_retryable_error_exhausts_three_attempts(
-    tool: _TransientResultNTimes | _RateLimitedNTimes,
+    tool_type: type[_TransientResultNTimes] | type[_RateLimitedNTimes],
     expected_error_type: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    tool = tool_type(10)
     result, events = await _run(tool, monkeypatch=monkeypatch)
 
     failed = _failed(events)

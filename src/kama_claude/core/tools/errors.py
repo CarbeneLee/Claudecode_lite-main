@@ -41,6 +41,8 @@ _SAFE_ERROR_MESSAGES: dict[str, str] = {
     "rate_limited": "tool rate limit exceeded",
 }
 _MAX_VALIDATION_ERRORS = 5
+_MAX_VALIDATION_MESSAGE_CHARS = 512
+_MAX_SCHEMA_REF_HOPS = 64
 
 
 class RateLimitedError(Exception):
@@ -55,7 +57,9 @@ class TransientToolError(Exception):
 def _resolve_schema_ref(node: object, root: dict[str, object]) -> object:
     current = node
     seen: set[str] = set()
-    while isinstance(current, dict):
+    for _ in range(_MAX_SCHEMA_REF_HOPS):
+        if not isinstance(current, dict):
+            break
         ref = current.get("$ref")
         if not isinstance(ref, str) or not ref.startswith("#/") or ref in seen:
             break
@@ -78,7 +82,9 @@ def _schema_options(
     pending = list(nodes)
     options: list[dict[str, object]] = []
     while pending:
-        node = _resolve_schema_ref(pending.pop(), root)
+        candidate = pending[-1]
+        del pending[-1]
+        node = _resolve_schema_ref(candidate, root)
         if not isinstance(node, dict):
             continue
         variants: list[object] = []
@@ -175,6 +181,8 @@ def format_validation_error(
     remaining = len(errors) - len(summaries)
     if remaining > 0:
         message += f"; ... and {remaining} more"
+    if len(message) > _MAX_VALIDATION_MESSAGE_CHARS:
+        message = message[: _MAX_VALIDATION_MESSAGE_CHARS - len("...")] + "..."
     return message
 
 
