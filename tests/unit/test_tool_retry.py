@@ -15,9 +15,15 @@ from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.tools.errors import (
     RETRYABLE_ERROR_TYPES,
     RateLimitedError,
+    TransientToolError,
 )
 from kama_claude.core.tools.invocation import invoke_tool
 from kama_claude.core.tools.registry import ToolRegistry
+from kama_claude.core.workspace.errors import (
+    InvalidWorkspacePathError,
+    SensitivePathError,
+    WorkspaceEscapeError,
+)
 
 
 class _ResultErrorTool(BaseTool):
@@ -26,15 +32,20 @@ class _ResultErrorTool(BaseTool):
     input_schema: dict[str, object] = {"type": "object", "properties": {}, "required": []}
 
     # 保存错误类型并记录真实 invoke 次数
-    def __init__(self, error_type: str | None) -> None:
+    def __init__(
+        self,
+        error_type: str | None,
+        content: str = "original tool payload",
+    ) -> None:
         self._error_type = error_type
+        self._content = content
         self.calls = 0
 
     # 返回配置的错误结果以测试归一化和重试判定
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         self.calls += 1
         return ToolResult(
-            content="original tool payload",
+            content=self._content,
             is_error=True,
             error_type=self._error_type,
         )
@@ -77,6 +88,40 @@ class _RateLimitedNTimes(BaseTool):
         self.calls += 1
         if self.calls <= self._failures:
             raise RateLimitedError("429 vendor payload")
+        return ToolResult(content="ok")
+
+
+class _ExceptionTool(BaseTool):
+    name = "exception"
+    description = "Raises a configured exception"
+    input_schema: dict[str, object] = {"type": "object", "properties": {}, "required": []}
+
+    # 保存待抛异常并初始化调用计数
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+        self.calls = 0
+
+    # 记录调用后抛出配置的真实异常
+    async def invoke(self, params: dict[str, object]) -> ToolResult:
+        self.calls += 1
+        raise self._exc
+
+
+class _TransientExceptionNTimes(BaseTool):
+    name = "transient_exception_n"
+    description = "Raises TransientToolError n times then succeeds"
+    input_schema: dict[str, object] = {"type": "object", "properties": {}, "required": []}
+
+    # 保存瞬态失败次数并初始化调用计数
+    def __init__(self, failures: int) -> None:
+        self._failures = failures
+        self.calls = 0
+
+    # 在指定次数内抛出显式瞬态异常，随后成功
+    async def invoke(self, params: dict[str, object]) -> ToolResult:
+        self.calls += 1
+        if self.calls <= self._failures:
+            raise TransientToolError("provider transient secret")
         return ToolResult(content="ok")
 
 
@@ -153,9 +198,97 @@ async def test_non_retryable_tool_results_run_once(
     assert len([event for event in events if isinstance(event, ToolCallStartedEvent)]) == 1
     assert [event.attempt for event in _failed(events)] == [1]
     assert not any(isinstance(event, ToolCallFinishedEvent) for event in events)
-    if error_type in {"runtime_error", None, "vendor_specific_error"}:
+    if expected_error_type == "execution_error":
         assert result.content == "tool execution failed"
         assert "original tool payload" not in result.content
+    else:
+        assert result.content == "original tool payload"
+
+
+# 功能：验证显式 execution_error ToolResult 经 invoke_tool 后强制净化且不重试
+# 设计：工具返回含路径和 token 的 content，断言最终结果与 failed event 都只保留固定摘要并记录一次调用
+async def test_execution_error_tool_result_is_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "/private/.env token=secret"
+    tool = _ResultErrorTool("execution_error", content=secret)
+
+    result, events = await _run(tool, monkeypatch=monkeypatch)
+
+    failed = _failed(events)
+    assert tool.calls == 1
+    assert result.is_error
+    assert result.error_type == "execution_error"
+    assert result.content == "tool execution failed"
+    assert secret not in result.content
+    assert [event.error_message for event in failed] == ["tool execution failed"]
+    assert all(secret not in event.error_message for event in failed)
+    assert [event.attempt for event in failed] == [1]
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected_error_type"),
+    [
+        (FileNotFoundError("missing secret"), "not_found"),
+        (InvalidWorkspacePathError("invalid secret"), "invalid_path"),
+        (WorkspaceEscapeError("escape secret"), "invalid_path"),
+        (SensitivePathError("sensitive secret"), "sensitive_path"),
+        (PermissionError("permission secret"), "permission_error"),
+        (IsADirectoryError("directory secret"), "is_directory"),
+        (NotADirectoryError("not-directory secret"), "not_directory"),
+    ],
+)
+# 功能：验证永久异常经 invoke_tool 分类后只执行一次并发布单个失败 attempt
+# 设计：参数化覆盖 filesystem/workspace 父子类，联合断言调用次数、最终类型和 started/failed/finished 事件
+async def test_permanent_exceptions_run_once_through_invocation_pipeline(
+    exc: Exception,
+    expected_error_type: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool = _ExceptionTool(exc)
+
+    result, events = await _run(tool, monkeypatch=monkeypatch)
+
+    failed = _failed(events)
+    assert tool.calls == 1
+    assert result.is_error
+    assert result.error_type == expected_error_type
+    assert len([event for event in events if isinstance(event, ToolCallStartedEvent)]) == 1
+    assert len(failed) == 1
+    assert [event.error_class for event in failed] == [expected_error_type]
+    assert [event.attempt for event in failed] == [1]
+    assert not any(isinstance(event, ToolCallFinishedEvent) for event in events)
+
+
+# 功能：验证 TransientToolError 异常失败两次后第三次成功
+# 设计：通过真实 exception classifier 进入 retry loop，锁定调用次数、attempt、固定摘要和最终 finished 事件
+async def test_transient_exception_retries_and_succeeds_on_third_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool = _TransientExceptionNTimes(2)
+
+    result, events = await _run(tool, monkeypatch=monkeypatch)
+
+    failed = _failed(events)
+    assert tool.calls == 3
+    assert not result.is_error
+    assert result.content == "ok"
+    assert [event.attempt for event in failed] == [1, 2]
+    assert [event.error_class for event in failed] == [
+        "transient_error",
+        "transient_error",
+    ]
+    assert [event.error_message for event in failed] == [
+        "temporary tool failure",
+        "temporary tool failure",
+    ]
+    assert all("provider transient secret" not in event.error_message for event in failed)
+    assert [type(event) for event in events] == [
+        ToolCallStartedEvent,
+        ToolCallFailedEvent,
+        ToolCallFailedEvent,
+        ToolCallFinishedEvent,
+    ]
 
 
 @pytest.mark.parametrize(

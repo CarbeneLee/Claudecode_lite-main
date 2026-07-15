@@ -47,6 +47,84 @@ class _EchoTool(BaseTool):
         return ToolResult(content=str(params["msg"]))
 
 
+class _TrackedSchemaTool(BaseTool):
+    name = "tracked_schema"
+    description = "Tracks whether schema-invalid calls reach invoke"
+    input_schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"msg": {"type": "string"}},
+        "required": ["msg"],
+    }
+    params_model = _EchoParams
+
+    # 初始化真实工具调用计数
+    def __init__(self) -> None:
+        self.calls = 0
+
+    # 记录调用并返回消息内容
+    async def invoke(self, params: dict[str, object]) -> ToolResult:
+        self.calls += 1
+        return ToolResult(content=str(params["msg"]))
+
+
+class _MappingParams(BaseModel):
+    mapping: dict[str, int]
+
+
+class _IntegerMappingParams(BaseModel):
+    mapping: dict[int, int]
+
+
+class _TrackedMappingTool(BaseTool):
+    name = "tracked_mapping"
+    description = "Tracks whether mapping-invalid calls reach invoke"
+    input_schema: dict[str, object] = {
+        "type": "object",
+        "properties": {
+            "mapping": {
+                "type": "object",
+                "additionalProperties": {"type": "integer"},
+            }
+        },
+        "required": ["mapping"],
+    }
+    params_model = _MappingParams
+
+    # 初始化真实工具调用计数
+    def __init__(self) -> None:
+        self.calls = 0
+
+    # 记录调用以证明 schema_error 不会进入工具执行
+    async def invoke(self, params: dict[str, object]) -> ToolResult:
+        self.calls += 1
+        return ToolResult(content="ok")
+
+
+class _TrackedIntegerMappingTool(BaseTool):
+    name = "tracked_integer_mapping"
+    description = "Tracks whether integer-mapping-invalid calls reach invoke"
+    input_schema: dict[str, object] = {
+        "type": "object",
+        "properties": {
+            "mapping": {
+                "type": "object",
+                "additionalProperties": {"type": "integer"},
+            }
+        },
+        "required": ["mapping"],
+    }
+    params_model = _IntegerMappingParams
+
+    # 初始化真实工具调用计数
+    def __init__(self) -> None:
+        self.calls = 0
+
+    # 记录调用以证明整数 mapping schema_error 不会进入工具执行
+    async def invoke(self, params: dict[str, object]) -> ToolResult:
+        self.calls += 1
+        return ToolResult(content="ok")
+
+
 class _SlowTool(BaseTool):
     name = "slow"
     description = "Sleeps forever"
@@ -148,12 +226,73 @@ async def test_unknown_tool_returns_unknown_tool() -> None:
 # 设计：注册需要 msg 参数的 EchoTool 但传空 input，确认错误分类准确，schema 错误与运行时错误对 S4 重试策略有不同影响
 async def test_missing_required_param_gives_schema_error() -> None:
     registry = ToolRegistry()
-    registry.register(_EchoTool())
-    result, events = await _run(registry, _call("echo", {}))  # "msg" is required
+    tool = _TrackedSchemaTool()
+    registry.register(tool)
+    result, events = await _run(registry, _call("tracked_schema", {}))
     assert result.is_error
     assert result.error_type == "schema_error"
-    types = [e.type for e in events]  # type: ignore[attr-defined]
-    assert "tool.call_failed" in types
+    assert result.content == "invalid tool input: msg [missing]"
+    assert tool.calls == 0
+    failed = [event for event in events if isinstance(event, ToolCallFailedEvent)]
+    assert [event.error_message for event in failed] == [
+        "invalid tool input: msg [missing]"
+    ]
+    assert [event.attempt for event in failed] == [1]
+    assert not any(isinstance(event, ToolCallFinishedEvent) for event in events)
+
+
+# 功能：验证 invoke_tool 返回的 schema_error 不泄露 mapping 用户键和值
+# 设计：通过真实参数校验管线触发动态键错误，并断言工具未执行且 failed event 同步使用安全摘要
+async def test_mapping_validation_error_redacts_user_controlled_key() -> None:
+    registry = ToolRegistry()
+    tool = _TrackedMappingTool()
+    registry.register(tool)
+
+    result, events = await _run(
+        registry,
+        _call(
+            "tracked_mapping",
+            {"mapping": {"token=secret": "raw-value"}},
+        ),
+    )
+
+    assert result.is_error
+    assert result.error_type == "schema_error"
+    assert result.content == "invalid tool input: mapping.<key> [int_parsing]"
+    assert "token=secret" not in result.content
+    assert "raw-value" not in result.content
+    assert tool.calls == 0
+    failed = [event for event in events if isinstance(event, ToolCallFailedEvent)]
+    assert [event.error_message for event in failed] == [result.content]
+    assert [event.attempt for event in failed] == [1]
+    assert not any(isinstance(event, ToolCallFinishedEvent) for event in events)
+
+
+# 功能：验证 invoke_tool 不会把整数 mapping 键作为数组索引回显
+# 设计：真实管线传入动态整数键，断言结果与 failed event 均使用 <key> 且工具未执行
+async def test_mapping_validation_error_redacts_integer_key() -> None:
+    registry = ToolRegistry()
+    tool = _TrackedIntegerMappingTool()
+    registry.register(tool)
+
+    result, events = await _run(
+        registry,
+        _call(
+            "tracked_integer_mapping",
+            {"mapping": {8_675_309: "raw-value"}},
+        ),
+    )
+
+    assert result.is_error
+    assert result.error_type == "schema_error"
+    assert result.content == "invalid tool input: mapping.<key> [int_parsing]"
+    assert "8675309" not in result.content
+    assert "raw-value" not in result.content
+    assert tool.calls == 0
+    failed = [event for event in events if isinstance(event, ToolCallFailedEvent)]
+    assert [event.error_message for event in failed] == [result.content]
+    assert [event.attempt for event in failed] == [1]
+    assert not any(isinstance(event, ToolCallFinishedEvent) for event in events)
 
 
 # 功能：验证工具执行超时时返回 timeout 类型错误而非 runtime_error
