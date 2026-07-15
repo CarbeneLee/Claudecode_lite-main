@@ -7,6 +7,9 @@ from kama_claude.core.tools.builtin.bash import BashParams
 from kama_claude.core.tools.builtin.list_dir import ListDirParams
 from kama_claude.core.tools.builtin.note_save import NoteSaveParams
 from kama_claude.core.tools.builtin.read_file import ReadFileParams
+from kama_claude.core.tools.builtin.task_create import TaskCreateTool
+from kama_claude.core.tools.builtin.task_get import TaskGetTool
+from kama_claude.core.tools.builtin.task_update import TaskUpdateTool
 from kama_claude.core.tools.builtin.write_file import WriteFileParams
 
 
@@ -104,3 +107,47 @@ def test_note_save_params_valid() -> None:
 def test_note_save_params_missing_content() -> None:
     with pytest.raises(ValidationError):
         NoteSaveParams.model_validate({})
+
+
+# 功能：验证 task_create 参数模型提供安全默认值且列表不共享
+# 设计：通过公开 params_model 校验两组最小输入，断言字段含义与 default_factory 隔离性
+def test_task_create_params_defaults_are_isolated() -> None:
+    model = TaskCreateTool.params_model
+    assert model is not None
+
+    first = model.model_validate({"subject": "first"})
+    second = model.model_validate({"subject": "second"})
+
+    assert first.model_dump() == {
+        "subject": "first",
+        "description": "",
+        "blocked_by": [],
+    }
+    assert getattr(first, "blocked_by") is not getattr(second, "blocked_by")
+
+
+# 功能：验证 task_get 参数模型只接受整数 task_id
+# 设计：合法整数通过、不可解析字符串触发 Pydantic ValidationError
+def test_task_get_params_require_integer_id() -> None:
+    model = TaskGetTool.params_model
+    assert model is not None
+
+    assert model.model_validate({"task_id": 7}).model_dump() == {"task_id": 7}
+    with pytest.raises(ValidationError):
+        model.model_validate({"task_id": "not-an-id"})
+
+
+# 功能：验证 task_update 参数模型的状态约束和列表默认值
+# 设计：最小输入锁定 None/空列表默认值，非法 Literal 状态触发 schema 校验失败
+def test_task_update_params_defaults_and_status_validation() -> None:
+    model = TaskUpdateTool.params_model
+    assert model is not None
+
+    assert model.model_validate({"task_id": 3}).model_dump() == {
+        "task_id": 3,
+        "status": None,
+        "add_blocked_by": [],
+        "remove_blocked_by": [],
+    }
+    with pytest.raises(ValidationError):
+        model.model_validate({"task_id": 3, "status": "paused"})

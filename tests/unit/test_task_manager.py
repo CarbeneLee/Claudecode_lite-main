@@ -1,10 +1,25 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 
+from kama_claude.core.task.errors import (
+    TaskError,
+    TaskNotFoundError,
+    TaskValidationError,
+)
 from kama_claude.core.task.manager import TaskManager
+from kama_claude.core.task.model import TaskStatus
+
+
+# 功能：验证 task domain exceptions 存在并保持 ValueError 兼容关系
+# 设计：直接锁定两类具体异常经 TaskError 继承 ValueError 的兼容契约
+def test_task_domain_errors_are_value_errors() -> None:
+    assert issubclass(TaskError, ValueError)
+    assert issubclass(TaskNotFoundError, TaskError)
+    assert issubclass(TaskValidationError, TaskError)
 
 
 # 功能：验证 create 写入 JSON 文件并返回正确的 Task 对象
@@ -28,11 +43,11 @@ def test_create_increments_id(tmp_path: Path) -> None:
     assert t2.id == 2
 
 
-# 功能：验证 create 传入不存在的 blocked_by 抛出 ValueError
-# 设计：blocked_by=[99] 引用不存在的任务，预期 ValueError
+# 功能：验证 create 传入不存在的 blocked_by 抛出 TaskValidationError
+# 设计：blocked_by=[99] 引用不存在的任务，锁定业务输入与资源不存在的类型边界
 def test_create_invalid_blocked_by_raises(tmp_path: Path) -> None:
     mgr = TaskManager(tmp_path)
-    with pytest.raises(ValueError, match="not found"):
+    with pytest.raises(TaskValidationError, match="not found"):
         mgr.create("dependent", blocked_by=[99])
 
 
@@ -45,12 +60,22 @@ def test_get_returns_task(tmp_path: Path) -> None:
     assert task.subject == "hello"
 
 
-# 功能：验证 get 不存在的 ID 抛出 ValueError
-# 设计：不创建任何任务，直接 get(999)，预期 ValueError
+# 功能：验证 get 不存在的 ID 抛出 TaskNotFoundError
+# 设计：不创建任何任务，直接 get(999)，锁定资源缺失的 domain exception
 def test_get_nonexistent_raises(tmp_path: Path) -> None:
     mgr = TaskManager(tmp_path)
-    with pytest.raises(ValueError):
+    with pytest.raises(TaskNotFoundError):
         mgr.get(999)
+
+
+# 功能：验证 update 非法业务状态抛出 TaskValidationError
+# 设计：用 cast 绕过静态 Literal 边界模拟外部坏输入，断言 manager 不靠字符串分类
+def test_update_invalid_status_raises_task_validation_error(tmp_path: Path) -> None:
+    mgr = TaskManager(tmp_path)
+    mgr.create("work")
+
+    with pytest.raises(TaskValidationError, match="invalid status"):
+        mgr.update(1, status=cast(TaskStatus, "paused"))
 
 
 # 功能：验证 update 修改 status 并写回文件

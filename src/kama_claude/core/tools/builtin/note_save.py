@@ -42,7 +42,7 @@ class NoteSaveTool(BaseTool):
             return ToolResult(
                 content="empty content",
                 is_error=True,
-                error_type="runtime_error",
+                error_type="invalid_input",
             )
         self._store.append_note(self._session_id, content, self._run_id)
         return ToolResult(content="saved")
