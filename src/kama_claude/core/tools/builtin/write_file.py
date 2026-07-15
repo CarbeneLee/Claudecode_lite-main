@@ -62,7 +62,7 @@ class WriteFileTool(BaseTool):
             return ToolResult(
                 content=f"content too large: {len(encoded)} bytes (limit 1 MB)",
                 is_error=True,
-                error_type="runtime_error",
+                error_type="invalid_input",
             )
 
         path.parent.mkdir(parents=True, exist_ok=True)

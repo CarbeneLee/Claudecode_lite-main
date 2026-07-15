@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from pydantic import BaseModel, field_validator
@@ -20,6 +20,7 @@ from kama_claude.core.bus.events import (
 )
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import ToolCallBlock
+from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.tools.invocation import invoke_tool
 from kama_claude.core.tools.registry import ToolRegistry
@@ -242,6 +243,7 @@ async def _run(
         events.append(e)
 
     bus.subscribe(_collect)
+    typed_permission_manager = cast(PermissionManager | None, permission_manager)
     if session_id is None:
         result = await invoke_tool(
             registry,
@@ -249,7 +251,7 @@ async def _run(
             bus,
             run_id="r1",
             timeout=timeout,
-            permission_manager=permission_manager,  # type: ignore[arg-type]
+            permission_manager=typed_permission_manager,
         )
     else:
         result = await invoke_tool(
@@ -258,7 +260,7 @@ async def _run(
             bus,
             run_id="r1",
             timeout=timeout,
-            permission_manager=permission_manager,  # type: ignore[arg-type]
+            permission_manager=typed_permission_manager,
             session_id=session_id,
         )
     return result, events
@@ -281,11 +283,10 @@ async def test_success_returns_content_and_finished_event() -> None:
     assert "tool.call_failed" not in types
     finished = [event for event in events if isinstance(event, ToolCallFinishedEvent)]
     assert [event.output for event in finished] == ["hi"]
-    assert all(datetime.fromisoformat(event.ts).utcoffset() is not None for event in events)
-    assert all(
-        datetime.fromisoformat(event.ts).utcoffset().total_seconds() == 0  # type: ignore[union-attr]
-        for event in events
-    )
+    for event in events:
+        offset = datetime.fromisoformat(event.ts).utcoffset()
+        assert offset is not None
+        assert offset.total_seconds() == 0
 
 
 # 功能：验证调用不存在的工具时返回 unknown_tool 并发布 failed 事件而非 finished

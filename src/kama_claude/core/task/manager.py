@@ -4,6 +4,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+from kama_claude.core.task.errors import TaskNotFoundError, TaskValidationError
 from kama_claude.core.task.model import Task, TaskStatus
 
 
@@ -31,7 +32,7 @@ class TaskManager:
     def _load(self, task_id: int) -> Task:
         path = self._dir / f"task_{task_id}.json"
         if not path.exists():
-            raise ValueError(f"task {task_id} not found")
+            raise TaskNotFoundError(f"task {task_id} not found")
         return Task.from_dict(json.loads(path.read_text()))
 
     # 将任务写入对应 JSON 文件
@@ -48,7 +49,7 @@ class TaskManager:
     ) -> Task:
         for dep_id in (blocked_by or []):
             if not (self._dir / f"task_{dep_id}.json").exists():
-                raise ValueError(f"blocked_by task {dep_id} not found")
+                raise TaskValidationError(f"blocked_by task {dep_id} not found")
         now = _now()
         task = Task(
             id=self._next_id,
@@ -79,7 +80,7 @@ class TaskManager:
         task = self._load(task_id)
         if status is not None:
             if status not in ("pending", "in_progress", "completed"):
-                raise ValueError(f"invalid status: {status!r}")
+                raise TaskValidationError(f"invalid status: {status!r}")
             task.status = status
             if status == "completed":
                 self._clear_dependency(task_id)

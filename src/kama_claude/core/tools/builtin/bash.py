@@ -51,27 +51,24 @@ class BashTool(BaseTool):
         command = p.command
         timeout = p.timeout
 
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            cwd=str(self._workspace_root),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
         try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
-                cwd=str(self._workspace_root),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+            stdout_bytes, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
             )
-            try:
-                stdout_bytes, _ = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout
-                )
-            except TimeoutError:
-                proc.kill()
-                await proc.communicate()
-                return ToolResult(
-                    content=f"[timeout after {timeout}s]",
-                    is_error=True,
-                    error_type="timeout",
-                )
-        except Exception as exc:
-            return ToolResult(content=str(exc), is_error=True, error_type="runtime_error")
+        except TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            return ToolResult(
+                content=f"[timeout after {timeout}s]",
+                is_error=True,
+                error_type="timeout",
+            )
 
         output = stdout_bytes.decode("utf-8", errors="replace")
         truncated = len(stdout_bytes) > _MAX_OUTPUT_BYTES
@@ -83,6 +80,6 @@ class BashTool(BaseTool):
             return ToolResult(
                 content=f"[exit {returncode}]\n{output}",
                 is_error=True,
-                error_type="runtime_error",
+                error_type="command_failed",
             )
         return ToolResult(content=output or "[no output]")

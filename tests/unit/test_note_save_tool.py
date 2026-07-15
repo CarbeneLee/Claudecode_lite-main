@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from kama_claude.core.session.store import SessionStore
 from kama_claude.core.tools.builtin.note_save import NoteSaveTool
 
@@ -19,14 +21,18 @@ async def test_note_save_appends_note(tmp_path: Path) -> None:
     assert "Python 3.12" in store.read_notes("sess-1")
 
 
-# 功能：验证空 content 会返回工具错误且不写入 notes.md
-# 设计：传入空白字符串，断言 is_error 与 error_type，覆盖 schema 之外的业务校验
-async def test_note_save_rejects_empty_content(tmp_path: Path) -> None:
+# 功能：验证空字符串和纯空白 content 都是永久输入错误
+# 设计：参数化 stripped 后为空的代表输入，断言 invalid_input 且不产生 notes 副作用
+@pytest.mark.parametrize("content", ["", "   ", "\n\t"])
+async def test_note_save_rejects_empty_content(
+    tmp_path: Path,
+    content: str,
+) -> None:
     store = SessionStore(tmp_path)
     tool = NoteSaveTool(store, "sess-1", "run-1")
 
-    result = await tool.invoke({"content": "   "})
+    result = await tool.invoke({"content": content})
 
     assert result.is_error
-    assert result.error_type == "runtime_error"
+    assert result.error_type == "invalid_input"
     assert store.read_notes("sess-1") == ""

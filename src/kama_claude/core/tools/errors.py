@@ -82,8 +82,7 @@ def _schema_options(
     pending = list(nodes)
     options: list[dict[str, object]] = []
     while pending:
-        candidate = pending[-1]
-        del pending[-1]
+        candidate = pending.pop()
         node = _resolve_schema_ref(candidate, root)
         if not isinstance(node, dict):
             continue
