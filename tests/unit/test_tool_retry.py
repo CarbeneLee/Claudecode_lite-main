@@ -13,6 +13,7 @@ from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import ToolCallBlock
 from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.tools.errors import (
+    RETRYABLE_ERROR_TYPES,
     RateLimitedError,
     TransientToolError,
 )
@@ -23,6 +24,14 @@ from kama_claude.core.workspace.errors import (
     SensitivePathError,
     WorkspaceEscapeError,
 )
+
+
+# 功能：验证只有显式瞬态错误类型属于可重试安全策略
+# 设计：直接锁定 allowlist 契约，防止新增或删除错误类型静默改变重试边界
+def test_only_explicit_transient_errors_are_retryable() -> None:
+    assert RETRYABLE_ERROR_TYPES == frozenset(
+        {"transient_error", "rate_limited"}
+    )
 
 
 class _ResultErrorTool(BaseTool):

@@ -19,6 +19,24 @@ from kama_claude.core.workspace.errors import (
     WorkspaceEscapeError,
 )
 
+_MAX_SCHEMA_RESOLVER_CALLS_PER_TEST = 256
+
+
+@pytest.fixture(autouse=True)
+# 为每个测试限制 schema resolver 调用次数，使无进展 traversal mutation 快速失败
+def _bound_schema_resolver_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    resolve_calls = 0
+    original_resolver = error_mod._resolve_schema_ref
+
+    # 统计单个测试内的 resolver 调用并在异常循环耗尽 mutation 超时前失败
+    def _bounded_resolver(node: object, root: dict[str, object]) -> object:
+        nonlocal resolve_calls
+        resolve_calls += 1
+        assert resolve_calls <= _MAX_SCHEMA_RESOLVER_CALLS_PER_TEST
+        return original_resolver(node, root)
+
+    monkeypatch.setattr(error_mod, "_resolve_schema_ref", _bounded_resolver)
+
 
 class _ValidatedParams(BaseModel):
     count: int
@@ -347,11 +365,14 @@ def test_format_validation_error_enforces_count_boundary(
     message = error_mod.format_validation_error(exc_info.value, _SevenErrorsParams)
 
     assert message.count("[int_parsing]") == expected_visible
+    for field_name in field_names[:expected_visible]:
+        assert f"{field_name} [int_parsing]" in message
+    for field_name in field_names[expected_visible:]:
+        assert f"{field_name} [int_parsing]" not in message
     if expected_more is None:
         assert "more" not in message
     else:
         assert expected_more in message
-    assert ("sixth [int_parsing]" in message) is (expected_visible >= 6)
     assert "secret" not in message
 
 
