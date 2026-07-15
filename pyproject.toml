@@ -35,6 +35,7 @@ dev = [
     "mypy>=1.10",           # 静态类型检查
     "pytest>=8.0",          # 单元测试
     "pytest-asyncio>=0.23", # 异步测试支持
+    "mutmut==3.6.0",
 ]
 
 # ---- Ruff：统一代码风格 ----
@@ -64,4 +65,18 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
     "integration: marks tests that call the real Anthropic API (require ANTHROPIC_API_KEY)",
+]
+
+# ---- Mutmut：Phase 4A.2 专项 mutation gate ----
+[tool.mutmut]
+source_paths = ["src/kama_claude"]
+only_mutate = [
+    "src/kama_claude/core/tools/errors.py",
+    "src/kama_claude/core/tools/invocation.py",
+]
+pytest_add_cli_args_test_selection = [
+    "tests/unit/test_tool_error_classification.py",
+    "tests/unit/test_invocation.py",
+    "tests/unit/test_tool_retry.py",
+    "tests/unit/test_loop.py",
 ]

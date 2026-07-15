@@ -106,7 +106,10 @@ async def invoke_tool(
         try:
             tool.params_model.model_validate(dict(tool_call.input)) # Pydantic 的 model_validate
         except Exception as exc:
-            validation_error_class, validation_error_message = classify_tool_exception(exc)
+            validation_error_class, validation_error_message = classify_tool_exception(
+                exc,
+                validation_model=tool.params_model,
+            )
             return await _fail(
                 bus, run_id, tool_call,
                 validation_error_class, validation_error_message, elapsed(),
