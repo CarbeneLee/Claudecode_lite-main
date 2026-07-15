@@ -65,7 +65,7 @@ class ToolCallFailedEvent(BaseModel):
     run_id: str
     tool_use_id: str
     tool_name: str
-    # "runtime_error" | "timeout" | "schema_error" | "permission_denied" | "rate_limited"
+    # 与 tools.errors 的稳定 error_type taxonomy 一致；字段保持 str 以兼容 trace/replay
     error_class: str
     error_message: str
     elapsed_ms: int

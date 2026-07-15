@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import asyncio
 
-from pydantic import BaseModel
+import pytest
+from pydantic import BaseModel, field_validator
 
+from kama_claude.core.bus.events import (
+    ToolCallFailedEvent,
+    ToolCallFinishedEvent,
+    ToolCallStartedEvent,
+)
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import ToolCallBlock
 from kama_claude.core.tools.base import BaseTool, ToolResult
@@ -15,6 +21,16 @@ from kama_claude.core.tools.registry import ToolRegistry
 
 class _EchoParams(BaseModel):
     msg: str
+
+
+class _ExplodingParams(BaseModel):
+    value: int
+
+    @field_validator("value")
+    @classmethod
+    # 通过真实 Pydantic validator 抛出未知异常
+    def reject_value(cls, value: int) -> int:
+        raise RuntimeError("/private/workspace/.env token=validator-secret")
 
 
 class _EchoTool(BaseTool):
@@ -48,6 +64,31 @@ class _BrokenTool(BaseTool):
 
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         raise RuntimeError("boom")
+
+
+class _CancelledTool(BaseTool):
+    name = "cancelled"
+    description = "Always cancels"
+    input_schema: dict[str, object] = {"type": "object", "properties": {}, "required": []}
+
+    # 抛出取消信号以验证 invocation lifecycle 原样传播
+    async def invoke(self, params: dict[str, object]) -> ToolResult:
+        raise asyncio.CancelledError
+
+
+class _ValidatorBrokenTool(BaseTool):
+    name = "validator_broken"
+    description = "Has a validator that raises an unknown exception"
+    input_schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"value": {"type": "integer"}},
+        "required": ["value"],
+    }
+    params_model = _ExplodingParams
+
+    # validator 失败时不应到达真实工具执行
+    async def invoke(self, params: dict[str, object]) -> ToolResult:
+        raise AssertionError("tool invoke should not run")
 
 
 # --- helpers -----------------------------------------------------------------
@@ -90,12 +131,12 @@ async def test_success_returns_content_and_finished_event() -> None:
     assert "tool.call_failed" not in types
 
 
-# 功能：验证调用不存在的工具时返回 runtime_error 并发布 failed 事件而非 finished
-# 设计：传入空 registry，确认 error_type 和事件类型同时正确，排除"未知工具却发布了 finished"的情况
-async def test_unknown_tool_returns_runtime_error() -> None:
+# 功能：验证调用不存在的工具时返回 unknown_tool 并发布 failed 事件而非 finished
+# 设计：传入空 registry，确认稳定 error_type 和事件类型同时正确，排除未知工具被误当 execution_error
+async def test_unknown_tool_returns_unknown_tool() -> None:
     result, events = await _run(ToolRegistry(), _call("nonexistent"))
     assert result.is_error
-    assert result.error_type == "runtime_error"
+    assert result.error_type == "unknown_tool"
     assert "unknown tool" in result.content
     types = [e.type for e in events]  # type: ignore[attr-defined]
     assert "tool.call_started" in types
@@ -127,15 +168,38 @@ async def test_timeout_gives_timeout_error() -> None:
     assert "tool.call_failed" in types
 
 
-# 功能：验证工具内部抛出异常时被捕获并转为 runtime_error，错误信息保留原始异常消息
-# 设计：工具直接 raise RuntimeError，确认异常不向上传播（invoke_tool 的"不抛异常"契约），error_message 包含 "boom"
-async def test_runtime_exception_gives_runtime_error() -> None:
+# 功能：验证未知工具异常转为 execution_error 且不向 LLM 暴露原始异常文本
+# 设计：工具直接抛带敏感文本的 RuntimeError，同时断言稳定摘要与 failed event 内容均已净化
+async def test_unknown_exception_gives_safe_execution_error() -> None:
     registry = ToolRegistry()
     registry.register(_BrokenTool())
     result, events = await _run(registry, _call("broken"))
     assert result.is_error
-    assert result.error_type == "runtime_error"
-    assert "boom" in result.content
+    assert result.error_type == "execution_error"
+    assert result.content == "tool execution failed"
+    assert "boom" not in result.content
+    failed = [event for event in events if isinstance(event, ToolCallFailedEvent)]
+    assert [event.error_message for event in failed] == ["tool execution failed"]
+
+
+# 功能：验证参数 validator 抛未知异常时仍转为安全 execution_error
+# 设计：使用真实 Pydantic field_validator 抛含敏感文本的 RuntimeError，锁定 pre-invoke 分类与 failed event
+async def test_validator_unknown_exception_gives_safe_execution_error() -> None:
+    registry = ToolRegistry()
+    registry.register(_ValidatorBrokenTool())
+
+    result, events = await _run(
+        registry,
+        _call("validator_broken", {"value": 1}),
+    )
+
+    assert result.is_error
+    assert result.error_type == "execution_error"
+    assert result.content == "tool execution failed"
+    assert "validator-secret" not in result.content
+    failed = [event for event in events if isinstance(event, ToolCallFailedEvent)]
+    assert [event.error_class for event in failed] == ["execution_error"]
+    assert [event.error_message for event in failed] == ["tool execution failed"]
 
 
 # 功能：验证 tool.call_started 始终是第一个被发布的事件，即使工具调用最终失败
@@ -143,3 +207,55 @@ async def test_runtime_exception_gives_runtime_error() -> None:
 async def test_started_event_always_first() -> None:
     result, events = await _run(ToolRegistry(), _call("nonexistent"))
     assert events[0].type == "tool.call_started"  # type: ignore[attr-defined]
+
+
+# 功能：验证工具执行期间的 CancelledError 原样传播且不伪造普通失败事件
+# 设计：捕获取消信号后检查唯一事件是 started，锁定 cancellation 不重试、不 failed、不 finished 的语义
+async def test_cancelled_error_propagates_without_failed_event() -> None:
+    registry = ToolRegistry()
+    registry.register(_CancelledTool())
+    bus = EventBus()
+    events: list[BaseModel] = []
+
+    # 收集取消发生前发布的事件
+    async def _collect(event: BaseModel) -> None:
+        events.append(event)
+
+    bus.subscribe(_collect)
+    with pytest.raises(asyncio.CancelledError):
+        await invoke_tool(registry, _call("cancelled"), bus, run_id="r1")
+
+    assert [type(event) for event in events] == [ToolCallStartedEvent]
+
+
+# 功能：验证 tool started/failed/finished 事件字段形状保持 wire schema 不变
+# 设计：直接锁定三个 Pydantic model 的字段名集合，防止 taxonomy 改造意外新增或删除 wire 字段
+def test_tool_event_field_shapes_are_unchanged() -> None:
+    assert set(ToolCallStartedEvent.model_fields) == {
+        "type",
+        "run_id",
+        "tool_use_id",
+        "tool_name",
+        "params",
+        "ts",
+    }
+    assert set(ToolCallFailedEvent.model_fields) == {
+        "type",
+        "run_id",
+        "tool_use_id",
+        "tool_name",
+        "error_class",
+        "error_message",
+        "elapsed_ms",
+        "attempt",
+        "ts",
+    }
+    assert set(ToolCallFinishedEvent.model_fields) == {
+        "type",
+        "run_id",
+        "tool_use_id",
+        "tool_name",
+        "elapsed_ms",
+        "output",
+        "ts",
+    }

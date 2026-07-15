@@ -11,7 +11,7 @@ from pydantic import BaseModel
 class ToolResult:
     content: str
     is_error: bool = False
-    # "runtime_error" | "timeout" | "schema_error" | "permission_denied"
+    # 稳定 error_type taxonomy 定义在 tools.errors，None 会在 invocation 边界归一化
     error_type: str | None = None
 
 
