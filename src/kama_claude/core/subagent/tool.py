@@ -179,12 +179,32 @@ class SpawnAgentTool(BaseTool):
         )
 
         if p.run_in_background:
+            lifecycle_entered = asyncio.Event()
             task: asyncio.Task[None] = asyncio.create_task(
                 self._run_background(
-                    child_loop, child_context, child_bus, child_run_path, child_run_id
+                    child_loop,
+                    child_context,
+                    child_bus,
+                    child_run_path,
+                    child_run_id,
+                    lifecycle_entered,
                 )
             )
             self._task_registry.register(child_run_id, task, child_context)
+            try:
+                await lifecycle_entered.wait()
+            except asyncio.CancelledError:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    _LOGGER.exception(
+                        "background cleanup failure treated as secondary run_id=%s",
+                        child_run_id,
+                    )
+                raise
             return ToolResult(
                 content=(
                     f"Subagent started in background. run_id={child_run_id}. "
@@ -218,30 +238,52 @@ class SpawnAgentTool(BaseTool):
         bus: EventBus,
         run_path: Path,
         run_id: str,
+        lifecycle_entered: asyncio.Event | None = None,
     ) -> None:
-        failure: BaseException | None = None
+        primary_failure: BaseException | None = None
+        delivery_failure: BaseException | None = None
         try:
+            if lifecycle_entered is not None:
+                lifecycle_entered.set()
             async with EventWriter(run_path / "events.jsonl") as writer:
                 writer.subscribe(bus)
                 await loop.run(context)
         except asyncio.CancelledError as exc:
             context.mark_failed("cancelled")
-            failure = exc
+            primary_failure = exc
         except Exception as exc:
             _LOGGER.exception("subagent execution failed run_id=%s", run_id)
             context.mark_failed("subagent_error")
-            failure = exc
+            primary_failure = exc
 
-        await self._parent_bus.publish(
-            SubagentFinishedEvent(
-                run_id=run_id,
-                parent_run_id=self._parent_run_id,
-                status=context.status,
-                ts=_now(),
+        try:
+            await self._parent_bus.publish(
+                SubagentFinishedEvent(
+                    run_id=run_id,
+                    parent_run_id=self._parent_run_id,
+                    status=context.status,
+                    ts=_now(),
+                )
             )
-        )
-        if failure is not None:
-            raise failure
+        except asyncio.CancelledError as exc:
+            delivery_failure = exc
+        except Exception as exc:
+            delivery_failure = exc
+
+        if primary_failure is not None:
+            if delivery_failure is not None:
+                _LOGGER.error(
+                    "finished delivery failure treated as secondary run_id=%s",
+                    run_id,
+                    exc_info=(
+                        type(delivery_failure),
+                        delivery_failure,
+                        delivery_failure.__traceback__,
+                    ),
+                )
+            raise primary_failure
+        if delivery_failure is not None:
+            raise delivery_failure
 
     # 后台任务协程：写事件文件，运行 loop，发布完成事件
     async def _run_background(
@@ -251,8 +293,16 @@ class SpawnAgentTool(BaseTool):
         bus: EventBus,
         run_path: Path,
         run_id: str,
+        lifecycle_entered: asyncio.Event,
     ) -> None:
-        await self._run_child(loop, context, bus, run_path, run_id)
+        await self._run_child(
+            loop,
+            context,
+            bus,
+            run_path,
+            run_id,
+            lifecycle_entered,
+        )
 
     # 构造子 registry；基于角色配置过滤工具，深度允许时注册嵌套 SpawnAgentTool
     def _build_child_registry(
