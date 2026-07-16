@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from kama_claude.core.mcp.client import (
@@ -31,21 +32,17 @@ class McpTool(BaseTool):
         try:
             content = await self._client.call_tool(self._tool_def.name, dict(params))
             return ToolResult(content=content)
-        except McpServerUnavailableError as exc:
+        except asyncio.CancelledError:
+            raise
+        except McpServerUnavailableError:
             return ToolResult(
-                content=f"mcp server '{self._server_name}' unavailable: {exc}",
+                content="MCP server is unavailable.",
                 is_error=True,
-                error_type="runtime_error",
+                error_type="execution_error",
             )
-        except McpToolError as exc:
+        except McpToolError:
             return ToolResult(
-                content=f"mcp tool '{self.name}' error: {exc}",
+                content="MCP tool reported an error.",
                 is_error=True,
-                error_type="runtime_error",
-            )
-        except Exception as exc:
-            return ToolResult(
-                content=f"mcp tool '{self.name}' unexpected error: {exc}",
-                is_error=True,
-                error_type="runtime_error",
+                error_type="command_failed",
             )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -32,6 +33,10 @@ from kama_claude.core.workspace.resolver import WorkspacePathResolver
 if TYPE_CHECKING:
     from kama_claude.core.llm.base import LLMProvider
     from kama_claude.core.permissions.manager import PermissionManager
+
+
+_LOGGER = logging.getLogger(__name__)
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
@@ -70,11 +75,17 @@ class SpawnAgentTool(BaseTool):
             },
             "run_in_background": {
                 "type": "boolean",
-                "description": "When true, returns immediately with a run_id; use agent_result to poll.",  # noqa: E501
+                "description": (
+                    "When true, returns immediately with a run_id; "
+                    "use agent_result to poll."
+                ),
             },
             "subagent_type": {
                 "type": "string",
-                "description": "Agent role profile (planner/executor/reviewer). Leave empty for default.",  # noqa: E501
+                "description": (
+                    "Agent role profile (planner/executor/reviewer). "
+                    "Leave empty for default."
+                ),
             },
         },
         "required": ["description", "prompt"],
@@ -117,7 +128,7 @@ class SpawnAgentTool(BaseTool):
             return ToolResult(
                 content="Subagent nesting limit (2) reached; cannot spawn further subagents.",
                 is_error=True,
-                error_type="runtime_error",
+                error_type="invalid_input",
             )
 
         profile: AgentProfile | None = None
@@ -155,6 +166,9 @@ class SpawnAgentTool(BaseTool):
             session_id=self._session_id,
         )
 
+        child_run_path = self._runs_dir / child_run_id
+        child_run_path.mkdir(parents=True, exist_ok=True)
+
         await self._parent_bus.publish(
             SubagentStartedEvent(
                 run_id=child_run_id,
@@ -163,9 +177,6 @@ class SpawnAgentTool(BaseTool):
                 ts=_now(),
             )
         )
-
-        child_run_path = self._runs_dir / child_run_id
-        child_run_path.mkdir(parents=True, exist_ok=True)
 
         if p.run_in_background:
             task: asyncio.Task[None] = asyncio.create_task(
@@ -181,17 +192,12 @@ class SpawnAgentTool(BaseTool):
                 )
             )
 
-        async with EventWriter(child_run_path / "events.jsonl") as writer:
-            writer.subscribe(child_bus)
-            await child_loop.run(child_context)
-
-        await self._parent_bus.publish(
-            SubagentFinishedEvent(
-                run_id=child_run_id,
-                parent_run_id=self._parent_run_id,
-                status=child_context.status,
-                ts=_now(),
-            )
+        await self._run_child(
+            child_loop,
+            child_context,
+            child_bus,
+            child_run_path,
+            child_run_id,
         )
 
         if child_context.status == "success":
@@ -199,13 +205,43 @@ class SpawnAgentTool(BaseTool):
                 content=child_context.result or "Subagent completed with no text output."
             )
         return ToolResult(
-            content=(
-                child_context.result
-                or f"Subagent failed (status={child_context.status}, reason={child_context.reason})"
-            ),
+            content=(child_context.result or "Subagent failed to complete the delegated task."),
             is_error=True,
-            error_type="runtime_error",
+            error_type="command_failed",
         )
+
+    # 运行 child 并在所有 started 后终态发布一次 finished，再恢复原异常控制流
+    async def _run_child(
+        self,
+        loop: AgentLoop,
+        context: ExecutionContext,
+        bus: EventBus,
+        run_path: Path,
+        run_id: str,
+    ) -> None:
+        failure: BaseException | None = None
+        try:
+            async with EventWriter(run_path / "events.jsonl") as writer:
+                writer.subscribe(bus)
+                await loop.run(context)
+        except asyncio.CancelledError as exc:
+            context.mark_failed("cancelled")
+            failure = exc
+        except Exception as exc:
+            _LOGGER.exception("subagent execution failed run_id=%s", run_id)
+            context.mark_failed("subagent_error")
+            failure = exc
+
+        await self._parent_bus.publish(
+            SubagentFinishedEvent(
+                run_id=run_id,
+                parent_run_id=self._parent_run_id,
+                status=context.status,
+                ts=_now(),
+            )
+        )
+        if failure is not None:
+            raise failure
 
     # 后台任务协程：写事件文件，运行 loop，发布完成事件
     async def _run_background(
@@ -216,17 +252,7 @@ class SpawnAgentTool(BaseTool):
         run_path: Path,
         run_id: str,
     ) -> None:
-        async with EventWriter(run_path / "events.jsonl") as writer:
-            writer.subscribe(bus)
-            await loop.run(context)
-        await self._parent_bus.publish(
-            SubagentFinishedEvent(
-                run_id=run_id,
-                parent_run_id=self._parent_run_id,
-                status=context.status,
-                ts=_now(),
-            )
-        )
+        await self._run_child(loop, context, bus, run_path, run_id)
 
     # 构造子 registry；基于角色配置过滤工具，深度允许时注册嵌套 SpawnAgentTool
     def _build_child_registry(
@@ -319,22 +345,33 @@ class AgentResultTool(BaseTool):
         entry = self._task_registry.get(p.run_id)
         if entry is None:
             return ToolResult(
-                content=f"Unknown run_id: {p.run_id}. Only background subagents can be queried.",
+                content=f"Unknown background subagent run_id: {p.run_id}.",
                 is_error=True,
-                error_type="runtime_error",
+                error_type="not_found",
             )
         task, context = entry
         if not task.done():
             return ToolResult(content="still running")
         if task.cancelled():
             return ToolResult(
-                content="Subagent was cancelled.", is_error=True, error_type="runtime_error"
+                content="Subagent was cancelled.",
+                is_error=True,
+                error_type="command_failed",
             )
         exc = task.exception()
         if exc is not None:
             return ToolResult(
-                content=f"Subagent raised an exception: {exc}",
+                content="Subagent execution failed.",
                 is_error=True,
-                error_type="runtime_error",
+                error_type="execution_error",
+            )
+        if context.status == "failed":
+            return ToolResult(
+                content=(
+                    context.result
+                    or "Subagent failed to complete the delegated task."
+                ),
+                is_error=True,
+                error_type="command_failed",
             )
         return ToolResult(content=context.result or "Subagent completed with no text result.")
