@@ -41,28 +41,34 @@ def test_tool_name_prefixed() -> None:
     assert tool.name == "filesystem__read_file"
 
 
-# 功能：client 抛 McpServerUnavailableError 时应返回 is_error=True 且不重新抛出
-# 设计：mock client.call_tool 抛该异常，断言 ToolResult.is_error=True 且消息含 server 名称
+# 功能：client 抛 McpServerUnavailableError 时返回固定安全 execution_error
+# 设计：异常携带 secret，断言 direct ToolResult 不回显 server 名、异常文本或内部状态
 @pytest.mark.asyncio
 async def test_unavailable_returns_error() -> None:
     tool, client = _make_tool()
-    client.call_tool = AsyncMock(side_effect=McpServerUnavailableError("process died"))
+    client.call_tool = AsyncMock(
+        side_effect=McpServerUnavailableError("/private/socket token=secret")
+    )
     result = await tool.invoke({"path": "/tmp/x.txt"})
     assert result.is_error
-    assert result.error_type == "runtime_error"
-    assert "filesystem" in result.content
+    assert result.error_type == "execution_error"
+    assert result.content == "MCP server is unavailable."
+    assert "secret" not in result.content
+    assert "filesystem" not in result.content
 
 
-# 功能：client 抛其他异常时应返回 runtime_error 类型的 ToolResult
-# 设计：mock client.call_tool 抛 RuntimeError，断言 ToolResult 被正确包装
+# 功能：client 抛其他异常时 McpTool direct invoke 原样传播
+# 设计：保存异常对象并断言身份相同，证明 generic exception 留给中央 classifier
 @pytest.mark.asyncio
-async def test_runtime_error_caught() -> None:
+async def test_runtime_error_propagates() -> None:
     tool, client = _make_tool()
-    client.call_tool = AsyncMock(side_effect=RuntimeError("unexpected failure"))
-    result = await tool.invoke({"path": "/tmp/y.txt"})
-    assert result.is_error
-    assert result.error_type == "runtime_error"
-    assert "unexpected failure" in result.content
+    error = RuntimeError("unexpected failure")
+    client.call_tool = AsyncMock(side_effect=error)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await tool.invoke({"path": "/tmp/y.txt"})
+
+    assert exc_info.value is error
 
 
 # 功能：input_schema 应直接使用 MCP tool_def 中的 schema，而非 pydantic model

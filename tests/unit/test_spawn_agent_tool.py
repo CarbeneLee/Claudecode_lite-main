@@ -268,7 +268,10 @@ async def test_agent_result_pending(tmp_path: Path) -> None:
     assert not result.is_error
 
     event.set()
-    await asyncio.sleep(0.05)
+    entry = registry.get(run_id)
+    assert entry is not None
+    task, _ = entry
+    await task
 
 
 # 功能：后台任务完成后 agent_result 应返回子 agent 的最终文本
@@ -305,6 +308,7 @@ async def test_nesting_limit(tmp_path: Path) -> None:
         "prompt": "do nested work",
     })
     assert result.is_error
+    assert result.error_type == "invalid_input"
     assert "nesting limit" in result.content
     provider.chat.assert_not_called()
 
@@ -317,6 +321,7 @@ async def test_agent_result_unknown_run_id(tmp_path: Path) -> None:
     tool = AgentResultTool(registry)
     result = await tool.invoke({"run_id": "nonexistent-id"})
     assert result.is_error
+    assert result.error_type == "not_found"
     assert "Unknown" in result.content
 
 

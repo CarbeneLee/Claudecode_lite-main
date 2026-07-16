@@ -15,7 +15,6 @@ from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
 from kama_claude.core.loop import AgentLoop
-from kama_claude.core.task.errors import TaskValidationError
 from kama_claude.core.task.manager import TaskManager
 from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.tools.builtin.task_create import TaskCreateTool
@@ -51,11 +50,10 @@ async def _invoke(
 
 
 # 功能：按测试 case 构造四类永久 task producer 错误
-# 设计：资源缺失走真实 manager，update 业务校验用明确 domain exception 模拟未来规则
+# 设计：四类错误全部走真实 manager domain path，不使用异常 side_effect 模拟业务规则
 def _permanent_case(
     tmp_path: Path,
     case: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[BaseTool, dict[str, object], str]:
     manager = TaskManager(tmp_path / case)
     if case == "create_invalid":
@@ -70,12 +68,11 @@ def _permanent_case(
         return TaskUpdateTool(manager), {"task_id": 999}, "not_found"
 
     manager.create("work")
-    monkeypatch.setattr(
-        manager,
-        "update",
-        Mock(side_effect=TaskValidationError("invalid task update")),
+    return (
+        TaskUpdateTool(manager),
+        {"task_id": 1, "add_blocked_by": [999]},
+        "invalid_input",
     )
-    return TaskUpdateTool(manager), {"task_id": 1}, "invalid_input"
 
 
 class _TaskLoopProvider:
@@ -140,23 +137,18 @@ async def test_task_update_missing_id_is_not_found(tmp_path: Path) -> None:
     assert result.error_type == "not_found"
 
 
-# 功能：验证 task_update 将明确业务校验异常映射为 invalid_input
-# 设计：manager 注入 TaskValidationError，避免依赖异常消息字符串决定分类
-async def test_task_update_validation_error_is_invalid_input(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+# 功能：验证 task_update 通过真实缺失依赖业务路径返回 invalid_input
+# 设计：真实 manager 校验 add_blocked_by=[999]，不使用 Mock 制造 domain exception
+async def test_task_update_missing_dependency_is_invalid_input(tmp_path: Path) -> None:
     manager = TaskManager(tmp_path)
     manager.create("work")
-    monkeypatch.setattr(
-        manager,
-        "update",
-        Mock(side_effect=TaskValidationError("invalid task update")),
+
+    result = await TaskUpdateTool(manager).invoke(
+        {"task_id": 1, "add_blocked_by": [999]}
     )
 
-    result = await TaskUpdateTool(manager).invoke({"task_id": 1})
-
     assert result.error_type == "invalid_input"
+    assert manager.get(1).blocked_by == []
 
 
 # 功能：验证三个 task 工具的 direct invoke 与中央参数校验保持一致
@@ -205,9 +197,8 @@ async def test_task_params_error_is_schema_error_without_retry(tmp_path: Path) -
 async def test_task_permanent_errors_emit_one_failed_attempt(
     tmp_path: Path,
     case: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    tool, params, expected_type = _permanent_case(tmp_path, case, monkeypatch)
+    tool, params, expected_type = _permanent_case(tmp_path, case)
 
     result, events = await _invoke(tool, params)
 
