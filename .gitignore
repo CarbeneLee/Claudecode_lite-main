@@ -17,7 +17,7 @@ uv.lock
 .DS_Store
 *.log
 /workspace/
-docs
+/docs/
 requirements.txt
 kamaclaude key prompt.md.codegraph/
 .codex
