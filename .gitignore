@@ -18,6 +18,7 @@ uv.lock
 *.log
 /workspace/
 /docs/
+/doc/learning/devlog/
 requirements.txt
 kamaclaude key prompt.md.codegraph/
 .codex
