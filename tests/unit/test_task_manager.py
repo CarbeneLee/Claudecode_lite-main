@@ -107,6 +107,27 @@ def test_update_add_blocked_by(tmp_path: Path) -> None:
     assert 1 in mgr.get(2).blocked_by
 
 
+# 功能：验证 update 拒绝不存在的依赖且所有相关 task 文件完全不变
+# 设计：同时请求 completed 与缺失依赖，证明校验先于 status、updated_at、clear dependency 和 save
+def test_update_missing_blocked_by_is_atomic(tmp_path: Path) -> None:
+    mgr = TaskManager(tmp_path)
+    mgr.create("step 1")
+    mgr.create("step 2", blocked_by=[1])
+    task_1_path = tmp_path / "task_1.json"
+    task_2_path = tmp_path / "task_2.json"
+    task_1_before = task_1_path.read_text(encoding="utf-8")
+    task_2_before = task_2_path.read_text(encoding="utf-8")
+
+    with pytest.raises(TaskValidationError, match="blocked_by task 999 not found"):
+        mgr.update(1, status="completed", add_blocked_by=[999])
+
+    assert task_1_path.read_text(encoding="utf-8") == task_1_before
+    assert task_2_path.read_text(encoding="utf-8") == task_2_before
+    assert mgr.get(1).status == "pending"
+    assert mgr.get(1).blocked_by == []
+    assert mgr.get(2).blocked_by == [1]
+
+
 # 功能：验证 update remove_blocked_by 正确移除依赖
 # 设计：创建带依赖的任务，再移除依赖，断言 blocked_by 为空
 def test_update_remove_blocked_by(tmp_path: Path) -> None:

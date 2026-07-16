@@ -28,6 +28,35 @@ from kama_claude.core.workspace.resolver import WorkspacePathResolver
 _ONE_MIB = 1024 * 1024
 
 
+class _FakeProcess:
+    # 初始化可重复的 communicate 结果与资源清理计数
+    def __init__(
+        self,
+        errors: list[BaseException | None],
+        *,
+        returncode: int | None = None,
+    ) -> None:
+        self._errors = errors
+        self.kill_calls = 0
+        self.communicate_calls = 0
+        self.returncode = returncode
+
+    # 记录 kill 次数并模拟进程进入被信号终止状态
+    def kill(self) -> None:
+        self.kill_calls += 1
+
+    # 按配置依次抛出异常或返回空输出，成功 reap 后设置 returncode
+    async def communicate(self) -> tuple[bytes, None]:
+        self.communicate_calls += 1
+        index = self.communicate_calls - 1
+        error = self._errors[index] if index < len(self._errors) else None
+        if error is not None:
+            raise error
+        if self.returncode is None:
+            self.returncode = -9 if self.kill_calls else 0
+        return b"", None
+
+
 # 功能：构造绑定真实 workspace resolver 和 policy 的 write_file 工具
 # 设计：复用生产依赖而非模拟写文件逻辑，使边界测试覆盖真实副作用顺序
 def _write_tool(workspace: Path) -> WriteFileTool:
@@ -226,20 +255,153 @@ async def test_bash_unknown_error_is_safely_classified_once(
     assert secret in caplog.text
 
 
-# 功能：验证 Bash 收到 CancelledError 时原样传播而不是转换为 ToolResult
-# 设计：在 subprocess 创建 await 点注入取消信号，确保协作取消能越过 producer 边界
-async def test_bash_cancelled_error_propagates(
+# 功能：验证 Bash 在 subprocess 创建阶段取消时无进程需要清理
+# 设计：spawn 直接抛出固定 CancelledError，断言异常身份不变且未返回 fake process
+async def test_bash_spawn_cancelled_error_propagates_without_kill(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    process = _FakeProcess([])
+    cancellation = asyncio.CancelledError()
+
     # 模拟任务在子进程创建阶段被上层取消
     async def _cancel(*args: object, **kwargs: object) -> object:
-        raise asyncio.CancelledError
+        raise cancellation
 
     monkeypatch.setattr(bash_mod.asyncio, "create_subprocess_shell", _cancel)
 
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(asyncio.CancelledError) as exc_info:
         await BashTool(tmp_path).invoke({"command": "echo hi"})
+
+    assert exc_info.value is cancellation
+    assert process.kill_calls == 0
+    assert process.communicate_calls == 0
+
+
+# 功能：验证 communicate 阶段取消会 kill/reap 后原样传播且不发布失败事件
+# 设计：fake process 首次 communicate 取消、第二次完成 reap，并通过真实 invocation 检查事件
+async def test_bash_communicate_cancelled_error_cleans_up_and_propagates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancellation = asyncio.CancelledError()
+    process = _FakeProcess([cancellation, None])
+
+    # 将已成功创建的 fake process 交给 BashTool
+    async def _spawn(*args: object, **kwargs: object) -> object:
+        return process
+
+    monkeypatch.setattr(bash_mod.asyncio, "create_subprocess_shell", _spawn)
+    registry = ToolRegistry()
+    registry.register(BashTool(tmp_path))
+    bus = EventBus()
+    events: list[BaseModel] = []
+
+    # 收集 cancellation 路径发布的生命周期事件
+    async def _collect(event: BaseModel) -> None:
+        events.append(event)
+
+    bus.subscribe(_collect)
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await invoke_tool(
+            registry,
+            ToolCallBlock(id="tool-cancel", name="bash", input={"command": "echo hi"}),
+            bus,
+            run_id="run-1",
+        )
+
+    assert exc_info.value is cancellation
+    assert process.kill_calls == 1
+    assert process.communicate_calls == 2
+    assert process.returncode == -9
+    assert [type(event) for event in events] == [ToolCallStartedEvent]
+
+
+# 功能：验证 communicate 未知异常清理后 direct 仍抛原异常，中央边界安全分类一次
+# 设计：两个 fake process 分别覆盖 direct/invocation，并锁定 kill/reap、秘密净化与 attempt
+async def test_bash_communicate_runtime_error_cleans_up_and_is_safely_classified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "/private/workspace/.env token=communicate-secret"
+    direct_error = RuntimeError(secret)
+    invoked_error = RuntimeError(secret)
+    processes = [
+        _FakeProcess([direct_error, None]),
+        _FakeProcess([invoked_error, None]),
+    ]
+
+    # 每次 spawn 返回独立 fake，避免 direct 路径消费 invocation 的异常序列
+    async def _spawn(*args: object, **kwargs: object) -> object:
+        return processes.pop(0)
+
+    monkeypatch.setattr(bash_mod.asyncio, "create_subprocess_shell", _spawn)
+    direct_process = processes[0]
+    with pytest.raises(RuntimeError) as exc_info:
+        await BashTool(tmp_path).invoke({"command": "echo hi"})
+
+    assert exc_info.value is direct_error
+    assert direct_process.kill_calls == 1
+    assert direct_process.communicate_calls == 2
+    invoked_process = processes[0]
+    result, events = await _invoke(BashTool(tmp_path), {"command": "echo hi"})
+    failed = [event for event in events if isinstance(event, ToolCallFailedEvent)]
+    assert invoked_process.kill_calls == 1
+    assert invoked_process.communicate_calls == 2
+    assert result.error_type == "execution_error"
+    assert result.content == "tool execution failed"
+    assert secret not in result.content
+    assert [event.attempt for event in failed] == [1]
+    assert all(secret not in event.error_message for event in failed)
+
+
+# 功能：验证 deterministic timeout 会 kill/reap 并保持 timeout ToolResult
+# 设计：fake communicate 首次抛 TimeoutError、第二次成功，避免真实 sleep 参与资源测试
+async def test_bash_timeout_kills_and_reaps_fake_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _FakeProcess([TimeoutError(), None])
+
+    # 返回已成功 spawn 的 timeout fake process
+    async def _spawn(*args: object, **kwargs: object) -> object:
+        return process
+
+    monkeypatch.setattr(bash_mod.asyncio, "create_subprocess_shell", _spawn)
+
+    result = await BashTool(tmp_path).invoke({"command": "echo hi"})
+
+    assert result.error_type == "timeout"
+    assert process.kill_calls == 1
+    assert process.communicate_calls == 2
+    assert process.returncode == -9
+
+
+# 功能：验证 cleanup 自身失败不会覆盖 communicate 的原始异常
+# 设计：第二次 communicate 模拟 reap 故障，断言原始异常身份保留且清理故障被记录
+async def test_bash_cleanup_failure_logs_and_preserves_original_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    original = RuntimeError("original communicate failure")
+    cleanup = OSError("cleanup reap failure")
+    process = _FakeProcess([original, cleanup])
+
+    # 返回 cleanup 也会失败的 fake process
+    async def _spawn(*args: object, **kwargs: object) -> object:
+        return process
+
+    monkeypatch.setattr(bash_mod.asyncio, "create_subprocess_shell", _spawn)
+
+    with caplog.at_level(logging.ERROR, logger="kama_claude.core.tools.builtin.bash"):
+        with pytest.raises(RuntimeError) as exc_info:
+            await BashTool(tmp_path).invoke({"command": "echo hi"})
+
+    assert exc_info.value is original
+    assert process.kill_calls == 1
+    assert process.communicate_calls == 2
+    assert "cleanup reap failure" in caplog.text
 
 
 # 功能：验证 Bash command_failed 通过真实 invoke_tool 不会重复执行命令

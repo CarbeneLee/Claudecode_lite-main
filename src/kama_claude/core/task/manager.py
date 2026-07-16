@@ -81,6 +81,10 @@ class TaskManager:
         if status is not None:
             if status not in ("pending", "in_progress", "completed"):
                 raise TaskValidationError(f"invalid status: {status!r}")
+        for dep_id in (add_blocked_by or []):
+            if not (self._dir / f"task_{dep_id}.json").exists():
+                raise TaskValidationError(f"blocked_by task {dep_id} not found")
+        if status is not None:
             task.status = status
             if status == "completed":
                 self._clear_dependency(task_id)

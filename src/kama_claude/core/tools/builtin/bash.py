@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -10,6 +11,22 @@ from kama_claude.core.workspace.resolver import WorkspacePathResolver
 
 _MAX_OUTPUT_BYTES = 64 * 1024  # 64 KB
 _DEFAULT_TIMEOUT = 60
+_LOGGER = logging.getLogger(__name__)
+
+
+# 终止仍在运行的子进程并完成 reap；清理失败记日志但不覆盖调用方原始异常
+async def _kill_and_reap(proc: asyncio.subprocess.Process) -> None:
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        except (Exception, asyncio.CancelledError):
+            _LOGGER.exception("failed to terminate bash subprocess during cleanup")
+    try:
+        await proc.communicate()
+    except (Exception, asyncio.CancelledError):
+        _LOGGER.exception("failed to reap bash subprocess during cleanup")
 
 
 class BashParams(BaseModel):
@@ -62,13 +79,18 @@ class BashTool(BaseTool):
                 proc.communicate(), timeout=timeout
             )
         except TimeoutError:
-            proc.kill()
-            await proc.communicate()
+            await _kill_and_reap(proc)
             return ToolResult(
                 content=f"[timeout after {timeout}s]",
                 is_error=True,
                 error_type="timeout",
             )
+        except asyncio.CancelledError:
+            await _kill_and_reap(proc)
+            raise
+        except Exception:
+            await _kill_and_reap(proc)
+            raise
 
         output = stdout_bytes.decode("utf-8", errors="replace")
         truncated = len(stdout_bytes) > _MAX_OUTPUT_BYTES

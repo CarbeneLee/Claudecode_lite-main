@@ -7,7 +7,7 @@ from kama_claude.core.workspace.errors import WorkspaceEscapeError
 from kama_claude.core.workspace.policy import WorkspaceAccessPolicy
 from kama_claude.core.workspace.resolver import WorkspacePathResolver
 
-_MAX_BYTES = 1 * 1024 * 1024  # 1 MB
+_MAX_BYTES = 1 * 1024 * 1024  # 1 MiB
 
 
 class WriteFileParams(BaseModel):
@@ -23,7 +23,7 @@ class WriteFileTool(BaseTool):
         "Write text content to a file, creating it (and any parent directories) if it "
         "does not exist, or overwriting it if it does. "
         "Path must be relative to the session workspace. "
-        "Content size is limited to 1 MB."
+        "Content size is limited to 1 MiB."
     )
     input_schema: dict[str, object] = {
         "type": "object",
@@ -49,7 +49,7 @@ class WriteFileTool(BaseTool):
         self._resolver = resolver
         self._access_policy = access_policy
 
-    # 安全写入 workspace 内文件并保持 1MB 上限和自动建目录行为
+    # 安全写入 workspace 内文件并保持 1 MiB 上限和自动建目录行为
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = WriteFileParams.model_validate(params)
         path_str = p.path
@@ -60,7 +60,7 @@ class WriteFileTool(BaseTool):
         encoded = content.encode("utf-8")
         if len(encoded) > _MAX_BYTES:
             return ToolResult(
-                content=f"content too large: {len(encoded)} bytes (limit 1 MB)",
+                content=f"content too large: {len(encoded)} bytes (limit 1 MiB)",
                 is_error=True,
                 error_type="invalid_input",
             )
