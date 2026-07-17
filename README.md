@@ -1,351 +1,359 @@
 # KamaClaude
 
-我最近在公众号「卡码大模型」上，更新了很多关于 Agent、codex、Claude工作原理的文章。
+> **KamaClaude is a local coding-agent runtime focused on explicit workspace boundaries, safe tool execution, observable agent loops, and extensible Subagent/MCP workflows.**
 
-这些文章目前已经沉淀在卡码笔记上：[https://notes.kamacoder.com](https://notes.kamacoder.com)
+一个面向本地代码任务的可观测 Coding Agent Runtime，重点实现显式 workspace、安全工具边界、稳定错误语义、会话续航、Subagent 和 MCP 扩展。
 
-![](docs/images/2026-06-10_09-28-51.jpg)
+`Python 3.12` · `JSON-RPC 2.0 / NDJSON` · `CLI + TUI` · `Workspace-aware tools` · `Trace & replay`
 
-很多录友反馈：
+![KamaClaude architecture overview](docs/images/readme/architecture-overview.svg)
 
-卡哥，我看了很多文章，也知道 Agent Loop、ReAct、Tool Use、MCP 这些词，但总感觉隔了一层。
+KamaClaude 将交互客户端与常驻 Core daemon 分离：CLI/TUI 负责发起任务和展示事件，daemon 负责 session、AgentLoop、工具调用、权限、持久化和扩展生命周期。它不是 Claude Code 或 Codex 的替代品，也不把 Bash 包装描述成生产级沙箱；这个仓库更关注可读、可验证的 Agent runtime 边界。
 
-很多概念还停留在“知道名词”的阶段。
+## Why this fork
 
-现在大家找工作。无论你是哪个方向，现在都需要有一个Agent项目。
+本项目基于上游 [youngyangyang04/KamaClaude](https://github.com/youngyangyang04/KamaClaude)。当前 fork 保留上游的教学型 daemon/CLI/TUI 主线，并围绕以下工程边界做了独立加固：
 
-Agent 这个东西，光看文章还不够。
+- **Explicit workspace lifecycle**：workspace 由客户端显式传入，在 Session、Runner、builtin tools 和 Subagent 间持续传播。
+- **Filesystem boundary**：`read_file`、`list_dir`、`write_file` 使用 canonical path containment 和敏感路径策略。
+- **Stable tool errors**：工具异常收敛为稳定 taxonomy；未知异常只向模型返回安全摘要。
+- **Conservative retry**：仅 `transient_error` 与 `rate_limited` 自动重试，永久错误只执行一次。
+- **Mutation-tested invocation core**：对 `tools/errors.py` 与 `tools/invocation.py` 做局部 mutation testing，而非用局部分数代表整个项目。
+- **Lifecycle cleanup**：Bash 子进程、Subagent 后台任务和 MCP 连接在超时、取消或 daemon 退出路径上执行清理。
+- **Subagent and MCP hardening**：明确前台/后台 Subagent 结果语义，并把 MCP 错误视为不可信远端输入。
 
-你得自己实现一个最小版本，亲手把用户输入、拆解任务、loop、工具调用、事件流、权限审批、上下文管理这些链路串起来，才会真正理解：
+这些改造不否定上游工作，也不意味着所有代码均由当前 fork 从零原创。上游 attribution 与 MIT 许可见文末。
 
-**所谓 AI Agent，到底是怎么跑起来的。**
+## Current capabilities
 
-目前市面上，哪里那个Agent做的最好，当然是Claude。
+### Agent Runtime
 
-所以这次我在知识星球里更新一个新的 AI Agent 项目：
+- `AgentRunner` 组装 provider、工具注册表、权限管理器、compactor、事件写入器和运行上下文。
+- `AgentLoop` 执行 plan → act → observe 循环，接收结构化 `tool_use`，并把 `ToolResult` 作为 `tool_result` 回填给模型。
+- Anthropic provider 支持流式 token、thinking block 回填、prompt caching 标记和有限网络重试。
+- `kama-core` 是常驻 daemon；`kama` CLI 与 `kama-tui` 通过 loopback TCP 上的 JSON-RPC 2.0/NDJSON 与之通信。
+- CLI 提供 `ping`、`echo`、`run`、`chat`、`core`、`trace`；TUI 是主要交互界面。
 
-**KamaClaude：从零实现一个本地 Claude Code Agent 系统（mini 版）。**
+### Sessions and Context
 
-也可以理解为：我们自己动手实现一个 **minClaude**，不仅实现Agent内核，还是先一套 TUI。
+- Chat 与 one-shot Session 都绑定创建时的 canonical workspace。
+- `thread.jsonl` 保存多轮消息，`notes.md` 保存主动记忆，每个 run 独立保存事件与 task 状态。
+- 全局 `~/.kama/context.md`、项目 `.kama/context.md`、Session notes 分层进入 system prompt。
+- 支持 tool result 截断、上下文水位事件、自动 compact 配置和手动 `session.compact` 协议。
+- `EventBus` 将运行事件分发给 TUI/CLI、`events.jsonl` 和 trace；客户端可按 run 回放已落盘事件。
 
-大家可以看一下效果：（接入的是deepseek-v4-flash，当然大家也可以接入其他模型）。
+### Built-in Tools
 
-![](docs/images/2026-06-09_19-36-12.jpg)
+顶层 Agent 的 registry 根据运行上下文注册以下工具：
 
-可以接入命令，可以使用skill，可控制上下文，可压缩：
-
-![](docs/images/2026-06-10_09-38-25.jpg)
-
-可以下达一个稍稍负责的任务，KamaClaude自动完成规划 并执行：
-
-（KamaClaude会先申请一下本地编辑权限）
-
-![](docs/images/2026-06-10_09-41-25.jpg)
-
-然后规划并执行：
-
-![](docs/images/2026-06-10_09-42-43.jpg)
-
-当然，它不是要一比一复刻 Claude Code 的所有产品能力，而是把 Claude Code 这类 AI 编程 Agent 最核心的运行机制拆出来：
-
-* 用户输入一个目标，Agent 能自己规划下一步
-* 模型不是只回答文本，而是能主动发起工具调用
-* 工具调用不是直接裸跑，而是有参数校验和权限审批
-* 执行过程不是黑盒，而是通过事件流实时展示到 TUI
-* 每一次 run 都能留下 events、trace、session 记录，方便复盘和排查
-* 多轮会话不是简单拼接历史，而是有 thread、notes、context 分层记忆
-* 上下文快爆了，不是粗暴截断，而是有水位检测和 compact 压缩
-* 复杂任务可以交给子 Agent，外部工具可以通过 MCP 接进来
-
-我们要做的是一个真正能跑任务、能调工具、能看过程、能管权限、能续上下文、能扩展生态的本地 Agent 运行时。
-
-你学完之后，再看 Claude Code、Codex、Cursor 这些 AI 编程工具，就不会只停留在“它好像很智能”。
-
-你能看懂它背后那条工程主线：
-
-**用户目标 → Agent Loop → 模型思考 → 工具调用 → 结果回填 → 事件展示 → 会话续航。**
-
-### 项目演示
-
-![](docs/images/2026-06-10_10-58-04.jpg)
-
-本视频只在[知识星球](https://programmercarl.com/other/kstar.html)里，带大家演示如何从零运行 KamaClaude，并完成一次完整的 Agent 使用体验：
-
-* 克隆项目和切换阶段分支
-* 配置 `.env`
-* 让 Agent 写一个一个任务
-* 配置 Skill 和 MCP
-* 在 TUI 里看到工具调用、事件流、权限审批和上下文水位
-
-### KamaClaude 长什么样？
-
-KamaClaude 的最终形态是这样的：
-
-![](docs/images/2026-06-10_14-30-58.jpg)
-
-用户不是直接和一个脚本对话，而是通过 `kama` CLI 或 `kama-tui` 连接到常驻的 `kama-core` 守护进程。
-
-真正执行任务的是 Core daemon。
-
-CLI 和 TUI 只是客户端。
-
-这意味着：
-
-* TUI 崩了，Agent 任务不一定要跟着死
-* 后续可以同时接 CLI、TUI、Web 前端
-* 所有任务过程都能通过事件流订阅
-* 所有命令、响应、事件都要通过类型化协议通信
-* Agent 的工具调用、会话记忆、权限审批、上下文压缩，都在同一条运行链路里完成
-
-这就是它和普通 AI Demo 最大的区别：
-
-**普通 Demo 是“调用模型”。KamaClaude 是“搭一个本地 Agent 运行时”。**
-
-### 项目专栏目录
-
-![](docs/images/2026-06-10_11-55-26.jpg)
-
-从项目演示，运行到 项目实战：架构如何设计、环境怎么搭，Agent loop，上下文、可压缩、MCP、skill支持这些如恶化设计。
-
-最后再到求职相关：项目的简历写法、项目亮点、本项目常见面试题，都给大家准备好了。
-
-从**项目源码到答疑，一条龙服务，不用担心学不会，有什么问题都可以在专属微信群提问**：（[知识星球](https://programmercarl.com/other/kstar.html)里每个项目都有专属答疑群）
-
-![](docs/images/2026-06-10_14-34-29.jpg)
-
-扫如下十元代金券，只需要 196 元，加入[知识星球](https://programmercarl.com/other/kstar.html)，你将获得 **20+ 套项目教程专栏 + 源码 + 配套答疑**。
-
-每个项目平均不到十元钱，而且加入星球的服务远不止这些项目。
-
-<div align="center"><img src='docs/images/2026-06-10_16-32-35.jpg' width=400 alt=''> </img></div>
-
-加入知识星球后，记得加如下微信，发动付款截图，拉你到星球交流群：
-
-<div align="center"><img src='docs/images/202505141033981.png' width=400 alt=''> </img></div>
-
-如果你不知道知识星球对自己是否有帮助，可以先加入看看，感受一下星球里的学习氛围。
-
-**三天内（72h）可以全额退款。**
-
-### 项目特色
-
-这个项目，我采用全新的讲解方式，不是一下子直接给大家全部项目代码。
-
-而且分成了 8个阶段，一步一步，带大家实现完整的kamaClaude。
-
-每个阶段都不是堆功能，而是解决一个真实的 Agent 工程问题。
-
-![](docs/images/2026-06-10_11-01-32.jpg)
-
-| 阶段 | 主题 | 这一阶段真正解决的问题 |
+| 类别 | 工具 | 说明 |
 | --- | --- | --- |
-| S0 | 骨架与协议契约 | CLI 和 daemon 通过真实 IPC 完成一次 ping/pong |
-| S1 | Agent 最小闭环 | 一次 `kama run` 从 goal 到 LLM、工具、事件文件完整跑通 |
-| S2 | 事件流外化 | AgentRunner 搬进 daemon，CLI/TUI 通过 IPC 订阅同一份事件流 |
-| S3 | 自主规划与 TUI | Agent 能用任务工具拆解复杂目标，TUI 展示完整执行过程 |
-| Trace | 系统级时间线 | IPC / EventBus / LLM 三层数据流可追踪、可回放 |
-| S4 | 会话与记忆 | 多轮 run 进入同一个 session，thread 和 notes 接住上下文 |
-| S5 | 工具安全 | 工具调用前有参数校验、权限审批、失败分类和重试 |
-| S6 | 上下文治理 | 长会话下有 context 水位、tool_result 截断和 compact |
-| S7 | 扩展边界 | Skills、Subagents、MCP 让 Agent 可组织、可派生、可接外部工具 |
+| Filesystem | `read_file` | 读取 workspace-relative 文本，最多返回 512 KiB |
+| Filesystem | `list_dir` | 递归目录树，深度最多 4、条目最多 200 |
+| Filesystem | `write_file` | 在 workspace 内创建/覆盖文本，输入最多 1 MiB |
+| Process | `bash` | 从 workspace cwd 启动非交互 shell，输出最多 64 KiB |
+| Tasks | `task_create`, `task_update`, `task_list`, `task_get` | 管理当前 run 的结构化任务 |
+| Memory | `note_save` | 仅 Session run 注册，向 `notes.md` 追加持久化笔记 |
+| Delegation | `spawn_agent`, `agent_result` | 启动前台/后台 Subagent，并查询后台结果 |
+| MCP | `<server>__<tool>` | daemon 启动时发现并包装配置的 MCP tools |
 
-### Workspace 工具边界
+`search_code` **尚未实现**，不在当前 registry 中。
 
-内建 `read_file`、`list_dir` 和 `write_file` 只接受相对于当前 session workspace 的路径。绝对路径、canonicalize 后逃逸 workspace 的路径，以及选定的敏感路径（例如 `.git`、环境变量文件和常见私钥文件）会被拒绝。
+### Workspace and Permissions
 
-`bash` 子进程从 session workspace 启动，但这不是 OS 级 sandbox。Shell 仍可通过绝对路径、`cd ..`、子进程或网络访问 workspace 外部，也可以绕过 filesystem tools 的敏感路径策略。MCP 工具不受这一 builtin filesystem boundary 约束。针对路径校验与实际 I/O 之间 TOCTOU 的 `openat` / `O_NOFOLLOW` 加固仍属于后续工作。
+- `agent.run` 与 `session.create` 都要求绝对、存在且为目录的 `workspace_root`，Core 将其解析为 canonical path。
+- Builtin filesystem tools 只接受 workspace-relative 路径；绝对路径、symlink 逃逸和 canonical containment 失败会被拒绝。
+- `.git`、`.env*`（允许 `.env.example`/`.env.template`）、常见私钥与 credential 文件受到敏感路径规则保护。
+- `read_file`/`list_dir` 默认允许，`write_file`/`bash` 默认请求审批；`always_allow`/`always_deny` 可持久化到 `~/.kama/policy.toml`。
+- Bash 中出现绝对路径、`~`、`..`、`$HOME`、`$PWD` 或 `cd` 等 outside-cwd 特征时会强制进入审批路径。
 
-从第一章开始，项目就不是“先写一个脚本，后面再慢慢重构”。
+### Reliability and Error Semantics
 
-KamaClaude 在 S0 就先把 `kama` CLI 和 `kama-core` daemon 拆开，通过 TCP NDJSON + JSON-RPC 2.0 通信。
+- Pydantic 参数校验发生在权限审批与实际调用之前；校验反馈只保留静态 schema 字段路径和错误类型。
+- 工具失败统一为稳定 error type，并通过 `tool.call_failed` 事件与 `ToolResult` 返回 AgentLoop。
+- 只有 `transient_error`、`rate_limited` 可重试，最多 3 次总尝试，退避间隔为 2s/4s。
+- `not_found`、`invalid_input`、`permission_denied`、`command_failed`、`execution_error` 等永久失败只调用一次。
+- 未知异常的原始内容只写日志，模型侧只收到 `tool execution failed`；MCP 的远端错误文本也不会直接作为错误详情回填。
+- `asyncio.CancelledError` 保持控制流并向上游传播，不会被包装成普通 ToolResult。
 
-这一步看起来比普通脚手架更重，但它换来的是后面所有能力都不用推倒重来：
+### Extensibility
 
-* TUI 可以复用同一套 IPC
-* 事件订阅可以复用同一套通道
-* 权限审批可以通过事件推到前端
-* trace 可以记录完整请求和响应
-* 后续 Web 前端也可以接入同一个 Core
+- Skills 支持内建、用户级和 workspace 级三级覆盖，并可限制允许工具列表。
+- `spawn_agent` 使用冷启动子上下文，可前台等待或后台返回 `run_id`；最大嵌套深度为 2。
+- `agent_result` 返回 `still running`、成功结果或稳定失败类型。
+- MCP manager 支持 stdio/TCP transport、`tools/list` discovery、带 server 前缀的名称隔离和 daemon shutdown 清理。
 
-这就是工程项目里真正值钱的地方。
+### Quality snapshot
 
-不是“能不能跑”，而是系统边界一开始就立住。
+以下数据对应 baseline `58a96f1` 的本地 fresh verification：
 
-### 项目架构图
+| Gate | Result |
+| --- | --- |
+| Unit tests | 501 passed |
+| Integration tests | 25 passed |
+| Ruff | passed |
+| mypy strict | 92 source files, no issues |
+| Generated wire protocol | up to date |
+| Mutation testing | invocation/errors 两文件局部 fresh run：465 generated，446 killed，19 survived，0 timeout；raw score 95.91% |
 
-![](docs/images/20260610114820_KamaClaude架构图-分层版.png)
+Mutation score 只覆盖 `src/kama_claude/core/tools/errors.py` 与 `src/kama_claude/core/tools/invocation.py`，**不是整个仓库的 mutation coverage**。
 
-KamaClaude 的核心不是一个 prompt，而是一套完整的本地 Agent 运行链路：
+## Architecture
 
-```latex
-用户目标
-  → CLI / TUI
-  → JSON-RPC over NDJSON
+运行时的主要数据流是：
+
+```text
+CLI / TUI
+  → loopback TCP + JSON-RPC 2.0 / NDJSON
   → kama-core daemon
-  → AgentRunner
-  → AgentLoop
-  → LLM Provider
+  → SessionManager / AgentRunner
+  → AgentLoop ↔ LLM Provider
   → ToolRegistry
-  → PermissionManager
-  → EventBus
-  → Session Store
-  → TUI 实时渲染 / events.jsonl 持久化 / trace 回放
+  → validation / permission / invocation / workspace policy
+  → builtin tools / Subagent / MCP
+  → EventBus → CLI/TUI + events.jsonl + trace
 ```
 
-你学完以后，面试官再问 AI Agent 项目，你就不是说：
+关键边界：
 
-“我调用了大模型 API。”
+- **Protocol boundary**：command/response 使用 JSON-RPC 2.0；push event 使用 NDJSON event envelope。
+- **Session boundary**：workspace 在 Session 创建时固定，多轮消息不会切换到 daemon cwd。
+- **Invocation boundary**：所有 registry tool 都经过同一参数校验、权限、错误分类、重试与事件管线。
+- **Observation boundary**：事件文件按 run 持久化；daemon trace 可记录 IPC、event 和 LLM 层。
 
-而是能说：
+## Tool invocation pipeline
 
-* 我实现了 ReAct AgentLoop 和工具调用闭环
-* 我用 EventBus 把 Agent 执行过程外化成事件流
-* 我实现了 TUI 实时渲染、工具折叠块、权限审批卡片
-* 我实现了 Session、thread、notes 三层记忆体系
-* 我实现了上下文水位检测、tool_result 截断、自动 compact 和手动 compact
-* 我实现了 Skills、Subagents、MCP 外部工具接入
-* 我用 pytest、mypy strict、ruff 保证项目质量
-* 我实现了守护进程 + 多客户端架构
-* 我设计了 JSON-RPC 2.0 + NDJSON 的类型化 IPC 协议
+![Tool invocation pipeline](docs/images/readme/tool-invocation-pipeline.svg)
 
-这就不是“AI 套壳项目”了。
+每次工具调用先发布 `tool.call_started`，再按 registry lookup、schema validation、permission、invoke 的顺序执行。成功发布 `tool.call_finished`；失败先分类并判断是否属于有限 retry allowlist，最终发布 `tool.call_failed`。无论成功或失败，最终结果都会回到 AgentLoop context，供模型下一步判断。
 
-这是一个能拿去讲系统设计、异步并发、协议建模、工具安全、上下文工程、多 Agent 编排的高质量项目。
+### Error semantics
 
-### 项目亮点
+| Error type | Meaning | Automatic retry |
+| --- | --- | --- |
+| `schema_error` | 参数不符合工具的 Pydantic schema | No |
+| `not_found` | 请求的 workspace 路径或资源不存在 | No |
+| `invalid_input` | 工具理解了请求，但业务输入无效 | No |
+| `permission_denied` | 策略或用户拒绝执行 | No |
+| `command_failed` | 工具已执行，但命令/远端工具报告失败 | No |
+| `execution_error` | 未知或不安全公开细节的执行失败 | No |
+| `transient_error` | 工具明确报告临时故障 | Yes, up to 3 attempts total |
+| `rate_limited` | 工具明确报告限流 | Yes, up to 3 attempts total |
 
-![](docs/images/2026-06-10_11-48-11.jpg)
+稳定 taxonomy 还包含 `unknown_tool`、`timeout`、`invalid_path`、`sensitive_path`、`permission_error`、`is_directory`、`not_directory`。
 
-KamaClaude 最大的亮点，是把 Claude Code 这类 AI 编程 Agent 背后的核心机制，用一个 mini 版工程完整跑通：它不是单进程脚本，而是 `kama-core` daemon + CLI/TUI 多客户端架构；
+## Security model
 
-不是一次性调大模型，而是 ReAct AgentLoop，支持模型思考、工具调用、结果回填和多步执行；
+![Workspace security boundary](docs/images/readme/workspace-security-boundary.svg)
 
-不是让模型说执行就执行，而是把工具调用放进 `ToolRegistry` 和 `PermissionManager`，先做参数校验、权限审批、失败分类，再把 tool result 返回给模型；
+### 当前保证
 
-不是只展示最终答案，而是通过 `EventBus`、events、trace 和 TUI，把 token 流、工具调用、审批、上下文水位都实时展示并可回放；
+- `read_file`、`list_dir`、`write_file` 对 logical path 与 canonical path 同时应用 workspace containment 和 sensitive-path policy。
+- Session、Runner、builtin tools 与 Subagent 使用同一个 canonical workspace root。
+- 参数校验失败、权限拒绝和其他永久失败不会被自动重放。
+- 未知 Python exception 的内容被净化；validation feedback 不回显用户输入值。
+- cancellation 保持异步控制流；Bash 在超时/取消/异常路径尝试 kill 并 reap 子进程。
+- MCP unavailable/tool error 被映射为稳定、安全的本地错误摘要。
 
-不是简单拼接聊天历史，而是用 session、thread、notes、context 和 compact 做上下文治理；
+### 当前不保证
 
-最后还支持 Skills、Subagents、MCP，把工作流、子 Agent 和外部工具统一接进同一套运行链路。
+- Core 默认监听 loopback，但这是**受信本地客户端模型**，不是多用户认证或授权系统。
+- Bash 的 workspace 只是启动 cwd，**不是 OS sandbox**；shell 可以通过绝对路径、父目录、子进程或网络越过 workspace。
+- MCP tools 不经过 builtin filesystem resolver/policy；其权限与隔离取决于远端 server 和启动环境。
+- 路径校验与实际 I/O 间仍可能存在 TOCTOU；当前未使用 `openat`/`O_NOFOLLOW`/原子替换实现完整加固。
+- MCP 成功内容仍是不可信数据；当前没有统一的成功输出大小、schema 或 prompt-injection 边界。
 
-也就是说，这个项目真正能讲的不是“我接了一个大模型接口”，而是“我实现了一个本地 Agent 运行时”。
+## Subagent lifecycle
 
+![Subagent lifecycle](docs/images/readme/subagent-lifecycle.svg)
 
-### 这个项目适合谁？
+- Parent Agent 调用 `spawn_agent` 后，系统创建独立 `ExecutionContext`、EventBus、registry 与 run directory。
+- Child 不继承 parent 对话历史，但会加载全局/project context，并可应用 planner/executor/reviewer profile。
+- 前台模式等待 child 完成并直接返回 ToolResult；后台模式返回 `run_id`，parent 用 `agent_result` 轮询。
+- Child 事件桥接到 parent EventBus，同时写入 child `events.jsonl`。
+- 取消进入 child lifecycle 后会标记失败、尝试发出一次 terminal event，并恢复原始 cancellation 控制流。
 
-如果你正在准备秋招、春招、实习、社招，想做一个 AI 项目，想了解Agent工作原理，这个项目很适合你。
+## Quick start
 
-如果你已经做过 RAG、聊天机器人、AI 助手，想把项目深度往 Agent 工程方向拔高，这个项目也很适合。
+### Prerequisites
 
-如果你想理解 Claude Code、Codex、Cursor 这类 AI 编程工具背后的运行时设计，这个项目同样值得系统学一遍。
+- Python `>=3.12,<3.13`
+- [uv](https://docs.astral.sh/uv/)
+- Anthropic API key；当前生产 provider 是 Anthropic，model 由 `KAMA_LLM_DEFAULT_MODEL` 配置
 
-它不是教你背概念。
+### Install and configure
 
-**它是带你从 S0 到 S7，八个阶段，把一个本地 Agent 工具从零搭出来**。
+```bash
+git clone https://github.com/CarbeneLee/Claudecode_lite-main.git
+cd Claudecode_lite-main
+uv sync
+cp .env.example .env
+```
 
-每一章都有明确的执行路径，每一阶段都能运行、能验证、能留下文件证据。
+在本地 `.env` 中设置自己的凭据；不要提交该文件：
 
-你不是最后拿到一个黑盒项目。
+```dotenv
+ANTHROPIC_API_KEY=your-api-key
+KAMA_LLM_DEFAULT_MODEL=claude-sonnet-4-6
+```
 
-你会知道它每一层为什么存在。
+配置优先级为：内建默认值 → `~/.kama/config.toml` → `.kama/config.toml` → `.env` → 环境变量。若设置 `KAMA_CONFIG`，则只加载指定 TOML，再应用 `.env`/环境变量覆盖。
 
-### 项目专栏
+### Start and inspect the daemon
 
-**本项目为文字专栏讲解方式，不过在项目环境配置，启动，使用上 给大家录制了视频**。
+```bash
+uv run kama core start
+uv run kama core status
+uv run kama ping
+```
 
-项目专栏把 简历写法、项目亮点、常见面试题 都准备好了，大家做完这个项目可以直接用。
+前台调试 daemon 时也可以使用：
 
-![](docs/images/2026-06-10_12-11-45.jpg)
+```bash
+uv run kama-core
+```
 
-本项目分成8个阶段完成，每一阶段都有详细讲解：
+### Run a task
 
-S0、项目基础架构：
+在希望作为 workspace 的目录中运行客户端：
 
-![](docs/images/2026-06-10_12-04-20.jpg)
+```bash
+KAMACLAUDE_DIR="$(pwd)"  # 在 KamaClaude 仓库根目录执行这一行
+cd /path/to/your/project
+uv run --project "$KAMACLAUDE_DIR" kama run --goal "Summarize the repository structure"
+```
 
-S1、Agent 第一次运行
+多轮 CLI chat：
 
-![](docs/images/2026-06-10_12-04-40.jpg)
+```bash
+uv run --project "$KAMACLAUDE_DIR" kama chat
+```
 
-S2、把事件流外化为 IPC
+主要 TUI：
 
-![](docs/images/2026-06-10_12-04-59.jpg)
+```bash
+uv run --project "$KAMACLAUDE_DIR" kama-tui
+```
 
-S3、trace
+查看 trace（可按 run、layer、direction 过滤）：
 
-![](docs/images/2026-06-10_12-05-39.jpg)
+```bash
+uv run kama trace
+uv run kama trace <run_id> --layer event
+uv run kama trace <run_id> --raw
+```
 
-S3、Agent 的自主规划
+停止 daemon：
 
-![](docs/images/2026-06-10_12-05-39.jpg)
+```bash
+uv run kama core stop
+```
 
-S4、把 Agent 变成会话伙伴
+## Example workflow
 
-![](docs/images/2026-06-10_12-05-56.jpg)
+下面的示例使用临时 workspace，避免把练习写入私人项目：
 
-S5、给工具加上安全锁
+```bash
+KAMACLAUDE_DIR="$(pwd)"  # 当前目录应为 KamaClaude 仓库根目录
+mkdir -p /tmp/kama-demo
+cd /tmp/kama-demo
+printf '# Demo workspace\n' > README.md
 
-![](docs/images/2026-06-10_12-06-13.jpg)
+uv run --project "$KAMACLAUDE_DIR" kama chat
+```
 
+进入 chat 后，可以依次输入：
 
-S6、让上下文可控、可压缩、可续航
+```text
+List this workspace and read README.md.
+Create notes.txt containing a one-line summary of this workspace.
+```
 
-![](docs/images/2026-06-10_12-06-32.jpg)
+`read_file`/`list_dir` 默认允许；`write_file` 会显示 permission request。CLI chat 使用 `y`（allow once）、`a`（always allow）、`n`（deny once）或 `d`（always deny）响应。任务结束后另开终端查看 trace：
 
-S7、Skills、Subagents 与 MCP
+```bash
+uv run --project "$KAMACLAUDE_DIR" kama trace --layer event
+```
 
-![](docs/images/2026-06-10_12-06-51.jpg)
+该流程不依赖尚未实现的 `search_code`。
 
+## Testing
 
-### 加入知识星球获取本项目
+```bash
+uv run pytest tests/unit -q
+uv run pytest tests/integration -q
+uv run ruff check src tests scripts
+uv run mypy src
+uv run python scripts/gen_protocol_doc.py --check
+```
 
-扫如下十元代金券，只需要 196 元，加入[知识星球](https://programmercarl.com/other/kstar.html)，你将获得 **20+ 套项目教程专栏 + 源码 + 配套答疑**。
+Mutation testing 是 invocation/error 核心的专项 gate，配置与范围位于 `pyproject.toml`：
 
-每个项目平均不到十元钱，而且加入星球的服务远不止这些项目。
+```bash
+uv run mutmut run --max-children 4
+uv run mutmut results
+```
 
-<div align="center"><img src='docs/images/2026-06-10_16-32-35.jpg' width=400 alt=''> </img></div>
+执行 mutation testing 前应使用全新 `mutants/` workspace；不要把增量结果当作 fresh score，也不要把两文件分数外推为仓库整体覆盖率。
 
-加入知识星球后，记得加如下微信，发动付款截图，拉你到星球交流群：
+## Project status
 
-<div align="center"><img src='docs/images/202505141033981.png' width=400 alt=''> </img></div>
+| Status | Milestone | Evidence boundary |
+| --- | --- | --- |
+| Completed | Explicit workspace lifecycle and runtime propagation | Session/Runner/tool/Subagent workspace tests |
+| Completed | Filesystem containment and sensitive-path policy | Resolver/policy + unit/integration tests |
+| Completed | Stable tool errors and conservative retry | Invocation/error tests + focused mutation testing |
+| Completed | Builtin/task producer cleanup | Bash/task error and cancellation tests |
+| Completed | Subagent/MCP lifecycle cleanup | Focused error/cancellation tests |
+| Next | `search_code` | Not registered or implemented yet |
 
+## Roadmap
 
-如果你不知道知识星球对自己是否有帮助，可以先加入看看，感受一下星球里的学习氛围。
+### Near term
 
-**三天内（72h）可以全额退款。**
+- `search_code`
+- Structured search result limits
+- Workspace summary
+- Trace enrichment
 
-知识星球 APP 右上角自己申请退款，一个小时到账，全程无套路。
+### Reliability
 
-记得是三天内（72h）才能退款。
+- Background registry TTL/eviction
+- Explicit `cancel_subagent`
+- EventBus subscriber isolation/outbox
+- Subprocess process-group cleanup
 
-### QA
+### Security
 
-**1、这个项目有视频吗**？
+- Allowed workspace roots and client authentication
+- `openat`/`O_NOFOLLOW`/atomic-write hardening
+- OS-level Bash sandbox
+- MCP capability policy and sandbox
+- MCP idempotency keys
+- MCP success-output size/schema/prompt-injection boundary
 
-项目如何配置环境，启动，部署，运行，已经功能介绍，是有视频的。
+Roadmap 条目是计划，不代表当前可用能力。
 
-主要项目讲解为文字专栏的方式。
+## Repository structure
 
-项目有专属答疑微信群，不懂得的地方可以在群里提问，我们都会答疑。
+```text
+.
+├── src/kama_claude/
+│   ├── cli/               # kama command client
+│   ├── core/              # daemon, loop, session, tools, permissions, extensions
+│   └── tui/               # Textual terminal UI
+├── tests/
+│   ├── unit/
+│   └── integration/
+├── scripts/               # protocol generation and maintenance helpers
+├── docs/images/readme/    # fork-specific README diagrams
+├── WIRE_PROTOCOL.md       # generated typed IPC contract
+├── pyproject.toml
+└── LICENSE
+```
 
-**2、这个项目用什么语言开发**？
+## Attribution and license
 
-Python
+KamaClaude 最初由 [程序员Carl / youngyangyang04](https://github.com/youngyangyang04/KamaClaude) 发布。当前仓库的 Git 历史以 `chore: import KamaClaude baseline` 导入上游基线，之后由当前 fork 继续实现 workspace、工具错误语义、mutation hardening、Subagent 与 MCP lifecycle 等改造。
 
-**3、KamaClaude项目用Python实现，有其他语言版本吗**？
-
-实现一个Agent 关键在于Agent的原理，面试官不会问你 你用什么语言实现的Agent。
-
-就像大家目前看到 Claude原理的文章，没有人会重点强调这是用什么语言实现的，而是强调Claude 这个agent的原理。
-
-所以 在开发 KamaClaude，我们考虑使用python，就是因为python最容易上手。
-
-**4、我是C++、Java、Go或者其他语言选手，能做这个项目吗**？
-
-如果是 C++、Java、Go或者其他语言选手，做个项目没问题，这个项目写简历上，面试官也不会问你语言问题，而是聚焦Agent的设计与实现。
-
-我们项目专栏上，简历写法，项目亮点，都不强调编程语言，都聚焦Agent原理。
-
-
-
-
+项目继续遵循 [MIT License](LICENSE)。版权声明与许可条件以仓库中的 `LICENSE` 为准；分发本软件或其 substantial portions 时应保留原版权与许可声明。

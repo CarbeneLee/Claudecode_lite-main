@@ -67,6 +67,24 @@ def _collect(bus: EventBus) -> list[BaseModel]:
     return events
 
 
+# 为 finished 事件先收集再抛固定异常，返回可观察事件与投递尝试
+def _collect_then_fail_finished(
+    bus: EventBus,
+    error: Exception,
+) -> tuple[list[BaseModel], list[SubagentFinishedEvent]]:
+    events = _collect(bus)
+    attempts: list[SubagentFinishedEvent] = []
+
+    # 仅让 terminal 子事件投递失败，其他事件继续通过真实 EventBus
+    async def _fail_finished(event: BaseModel) -> None:
+        if isinstance(event, SubagentFinishedEvent):
+            attempts.append(event)
+            raise error
+
+    bus.subscribe(_fail_finished)
+    return events, attempts
+
+
 # 通过真实 ToolRegistry 和 invoke_tool 执行 producer 并返回结果与事件
 async def _invoke(
     tool: BaseTool,
@@ -314,6 +332,290 @@ async def test_foreground_cancellation_pairs_and_propagates(
     assert not any(isinstance(event, ToolCallFinishedEvent) for event in events)
     finished = [event for event in events if isinstance(event, SubagentFinishedEvent)]
     assert [event.status for event in finished] == ["failed"]
+
+
+# 功能：验证 foreground cancellation 在 finished subscriber 失败时仍保持 primary 身份
+# 设计：collector 先观察 terminal event，随后 subscriber 抛 secondary，并经真实 invoke_tool 审计无伪造失败事件
+async def test_foreground_cancellation_wins_over_finished_delivery_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    cancellation = asyncio.CancelledError()
+    delivery_error = RuntimeError("delivery-secret-cancel")
+
+    # 从 child loop 抛出固定 cancellation，允许用 is 验证根因身份
+    async def _cancel(
+        self: AgentLoop,
+        context: ExecutionContext,
+    ) -> None:
+        raise cancellation
+
+    monkeypatch.setattr(AgentLoop, "run", _cancel)
+    tool, _, bus, _ = _make_tool(tmp_path)
+    events, delivery_attempts = _collect_then_fail_finished(bus, delivery_error)
+    registry = ToolRegistry()
+    registry.register(tool)
+
+    with caplog.at_level(logging.ERROR, logger="kama_claude.core.subagent.tool"):
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await invoke_tool(
+                registry,
+                ToolCallBlock(
+                    id="cancel-delivery",
+                    name="spawn_agent",
+                    input={"description": "child", "prompt": "prompt-secret-must-not-log"},
+                ),
+                bus,
+                run_id="parent-run",
+            )
+
+    assert exc_info.value is cancellation
+    assert len(delivery_attempts) == 1
+    assert delivery_attempts[0].status == "failed"
+    assert "secondary" in caplog.text
+    assert "delivery-secret-cancel" in caplog.text
+    assert "prompt-secret-must-not-log" not in caplog.text
+    assert not any(isinstance(event, ToolCallFailedEvent) for event in events)
+    assert not any(isinstance(event, ToolCallFinishedEvent) for event in events)
+
+
+# 功能：验证 foreground unknown exception 与 delivery failure 并存时 primary 仍优先且中央输出安全
+# 设计：direct 与 invoke_tool 各使用固定异常对象，联合证明身份、单次投递、attempt=1 和双重 secret 净化
+async def test_foreground_unknown_exception_wins_over_finished_delivery_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    direct_primary = RuntimeError("primary-secret-direct")
+    invoked_primary = RuntimeError("primary-secret-invoked")
+    errors = iter([direct_primary, invoked_primary])
+
+    # 每次 child loop 抛出对应固定 primary，避免 mock side effect 隐藏真实 lifecycle
+    async def _raise_primary(
+        self: AgentLoop,
+        context: ExecutionContext,
+    ) -> None:
+        raise next(errors)
+
+    monkeypatch.setattr(AgentLoop, "run", _raise_primary)
+    direct_delivery = RuntimeError("delivery-secret-direct")
+    direct_tool, _, direct_bus, _ = _make_tool(tmp_path / "direct")
+    _, direct_attempts = _collect_then_fail_finished(direct_bus, direct_delivery)
+
+    with caplog.at_level(logging.ERROR, logger="kama_claude.core.subagent.tool"):
+        with pytest.raises(RuntimeError) as exc_info:
+            await direct_tool.invoke({"description": "child", "prompt": "work"})
+
+    assert exc_info.value is direct_primary
+    assert len(direct_attempts) == 1
+
+    invoked_delivery = RuntimeError("delivery-secret-invoked")
+    invoked_tool, _, invoked_bus, _ = _make_tool(tmp_path / "invoked")
+    _, invoked_attempts = _collect_then_fail_finished(invoked_bus, invoked_delivery)
+    result, events = await _invoke(
+        invoked_tool,
+        {"description": "child", "prompt": "work"},
+        invoked_bus,
+        tool_use_id="unknown-delivery",
+    )
+
+    assert result == ToolResult(
+        content="tool execution failed",
+        is_error=True,
+        error_type="execution_error",
+    )
+    assert len(invoked_attempts) == 1
+    failed = [event for event in events if isinstance(event, ToolCallFailedEvent)]
+    assert [event.attempt for event in failed] == [1]
+    exposed = result.content + " ".join(event.error_message for event in failed)
+    for secret in (
+        "primary-secret-invoked",
+        "delivery-secret-invoked",
+    ):
+        assert secret not in exposed
+
+
+# 功能：验证 background cancellation 在 finished delivery 失败时仍以 cancelled task 终止
+# 设计：Event 确认真实 task 已运行后取消，检查 primary 身份效果、单一 finished 和稳定 AgentResult
+async def test_background_cancellation_wins_over_finished_delivery_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    entered = asyncio.Event()
+    never_release = asyncio.Event()
+    delivery_error = RuntimeError("delivery-secret-background-cancel")
+
+    # 保持 child loop 挂起，让测试从 registry 取消真实 background task
+    async def _wait_forever(
+        self: AgentLoop,
+        context: ExecutionContext,
+    ) -> None:
+        entered.set()
+        await never_release.wait()
+
+    monkeypatch.setattr(AgentLoop, "run", _wait_forever)
+    tool, registry, bus, _ = _make_tool(tmp_path)
+    _, delivery_attempts = _collect_then_fail_finished(bus, delivery_error)
+    spawn_result = await tool.invoke(
+        {"description": "child", "prompt": "work", "run_in_background": True}
+    )
+    run_id = _run_id(spawn_result)
+    entry = registry.get(run_id)
+    assert entry is not None
+    task, context = entry
+    await entered.wait()
+
+    with caplog.at_level(logging.ERROR, logger="kama_claude.core.subagent.tool"):
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert task.cancelled()
+    assert context.status == "failed"
+    assert context.reason == "cancelled"
+    assert len(delivery_attempts) == 1
+    assert await AgentResultTool(registry).invoke({"run_id": run_id}) == ToolResult(
+        content="Subagent was cancelled.",
+        is_error=True,
+        error_type="command_failed",
+    )
+
+
+# 功能：验证无 child primary 时 foreground finished delivery failure 保持技术异常语义
+# 设计：success direct 与 invoke_tool 共用真实 lifecycle，检查异常身份、安全 execution_error 和单次 attempt
+async def test_foreground_success_exposes_finished_delivery_failure_safely(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 让 child 正常成功，确保唯一 Python 异常来自 finished subscriber
+    async def _success(
+        self: AgentLoop,
+        context: ExecutionContext,
+    ) -> None:
+        context.result = "child answer"
+        context.mark_success()
+
+    monkeypatch.setattr(AgentLoop, "run", _success)
+    direct_error = RuntimeError("delivery-secret-success-direct")
+    direct_tool, _, direct_bus, _ = _make_tool(tmp_path / "direct")
+    _, direct_attempts = _collect_then_fail_finished(direct_bus, direct_error)
+    with pytest.raises(RuntimeError) as exc_info:
+        await direct_tool.invoke({"description": "child", "prompt": "work"})
+    assert exc_info.value is direct_error
+    assert len(direct_attempts) == 1
+
+    invoked_error = RuntimeError("delivery-secret-success-invoked")
+    invoked_tool, _, invoked_bus, _ = _make_tool(tmp_path / "invoked")
+    _, invoked_attempts = _collect_then_fail_finished(invoked_bus, invoked_error)
+    result, events = await _invoke(
+        invoked_tool,
+        {"description": "child", "prompt": "work"},
+        invoked_bus,
+        tool_use_id="success-delivery",
+    )
+    assert result == ToolResult(
+        content="tool execution failed",
+        is_error=True,
+        error_type="execution_error",
+    )
+    assert "delivery-secret-success-invoked" not in result.content
+    assert len(invoked_attempts) == 1
+    failed = [event for event in events if isinstance(event, ToolCallFailedEvent)]
+    assert [event.attempt for event in failed] == [1]
+    assert all(
+        "delivery-secret-success-invoked" not in event.error_message
+        for event in failed
+    )
+
+
+# 功能：验证 normal failed context 遇到 finished delivery failure 时按 execution_error 分类
+# 设计：child 仅改变 domain 状态而不抛异常，真实 invoke_tool 证明 delivery 技术失败优先于 command_failed
+async def test_foreground_normal_failure_with_delivery_failure_is_execution_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reason_secret = "reason-secret-normal-failed"
+
+    # 正常返回 failed context，隔离 delivery failure 的技术异常角色
+    async def _normal_failure(
+        self: AgentLoop,
+        context: ExecutionContext,
+    ) -> None:
+        context.mark_failed(reason_secret)
+
+    monkeypatch.setattr(AgentLoop, "run", _normal_failure)
+    delivery_error = RuntimeError("delivery-secret-normal-failed")
+    tool, _, bus, _ = _make_tool(tmp_path)
+    _, delivery_attempts = _collect_then_fail_finished(bus, delivery_error)
+    result, events = await _invoke(
+        tool,
+        {"description": "child", "prompt": "work"},
+        bus,
+        tool_use_id="normal-failed-delivery",
+    )
+
+    assert result == ToolResult(
+        content="tool execution failed",
+        is_error=True,
+        error_type="execution_error",
+    )
+    assert reason_secret not in result.content
+    assert "delivery-secret-normal-failed" not in result.content
+    assert len(delivery_attempts) == 1
+    failed = [event for event in events if isinstance(event, ToolCallFailedEvent)]
+    assert [event.attempt for event in failed] == [1]
+
+
+# 功能：验证 background success 的 finished delivery failure 进入 task.exception 并稳定查询
+# 设计：Event 驱动真实 task 成功后投递失败，重复 AgentResult 查询证明无状态改写和无重复 finished
+async def test_background_success_with_delivery_failure_is_stable_execution_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    delivery_error = RuntimeError("delivery-secret-background-success")
+
+    # 等待测试释放后正常标记成功，使 task 唯一异常来自 finished delivery
+    async def _success(
+        self: AgentLoop,
+        context: ExecutionContext,
+    ) -> None:
+        entered.set()
+        await release.wait()
+        context.result = "background answer"
+        context.mark_success()
+
+    monkeypatch.setattr(AgentLoop, "run", _success)
+    tool, registry, bus, _ = _make_tool(tmp_path)
+    _, delivery_attempts = _collect_then_fail_finished(bus, delivery_error)
+    spawn_result = await tool.invoke(
+        {"description": "child", "prompt": "work", "run_in_background": True}
+    )
+    run_id = _run_id(spawn_result)
+    entry = registry.get(run_id)
+    assert entry is not None
+    task, context = entry
+    await entered.wait()
+    release.set()
+    with pytest.raises(RuntimeError) as exc_info:
+        await task
+
+    assert exc_info.value is delivery_error
+    assert task.exception() is delivery_error
+    assert context.status == "success"
+    result_tool = AgentResultTool(registry)
+    first = await result_tool.invoke({"run_id": run_id})
+    second = await result_tool.invoke({"run_id": run_id})
+    assert first == second == ToolResult(
+        content="Subagent execution failed.",
+        is_error=True,
+        error_type="execution_error",
+    )
+    assert "delivery-secret-background-success" not in first.content
+    assert len(delivery_attempts) == 1
 
 
 # 功能：验证 background 从 pending 到 success，并且重复查询不重复 finished

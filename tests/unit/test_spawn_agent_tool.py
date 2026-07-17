@@ -7,15 +7,27 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from kama_claude.core.bus.events import (
+    SubagentFinishedEvent,
+    SubagentStartedEvent,
+    ToolCallFailedEvent,
+    ToolCallFinishedEvent,
+    ToolCallStartedEvent,
+)
+from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
-from kama_claude.core.llm.types import LlmResponse, UsageStats
+from kama_claude.core.llm.types import LlmResponse, ToolCallBlock, UsageStats
+from kama_claude.core.loop import AgentLoop
 from kama_claude.core.subagent import tool as subagent_tool_module
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.subagent.tool import AgentResultTool, SpawnAgentTool
+from kama_claude.core.tools.base import ToolResult
 from kama_claude.core.tools.builtin.bash import BashTool
 from kama_claude.core.tools.builtin.list_dir import ListDirTool
 from kama_claude.core.tools.builtin.read_file import ReadFileTool
 from kama_claude.core.tools.builtin.write_file import WriteFileTool
+from kama_claude.core.tools.invocation import invoke_tool
+from kama_claude.core.tools.registry import ToolRegistry
 
 
 def _make_provider(result_text: str = "child done") -> Any:
@@ -234,6 +246,139 @@ async def test_background_returns_run_id(tmp_path: Path) -> None:
     # extract run_id from message
     run_id = result.content.split("run_id=")[1].split(".")[0]
     assert registry.get(run_id) is not None
+
+
+# 功能：验证后台 run_id 返回后立即取消仍进入生命周期边界并配对 finished
+# 设计：不等待 child entered 信号而直接取消真实 registry task，稳定复现旧实现的首次调度竞态
+async def test_background_immediate_cancellation_after_run_id_is_paired(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    never_release = asyncio.Event()
+
+    # 保持 child loop 挂起，确保立即取消由 lifecycle owner 处理
+    async def _wait_forever(
+        self: AgentLoop,
+        context: ExecutionContext,
+    ) -> None:
+        await never_release.wait()
+
+    monkeypatch.setattr(AgentLoop, "run", _wait_forever)
+    tool, registry, bus = _make_tool(tmp_path)
+    events: list[Any] = []
+
+    # 收集真实父 bus 上的公开 lifecycle 事件
+    async def _collect(event: Any) -> None:
+        events.append(event)
+
+    bus.subscribe(_collect)
+    spawn_result = await tool.invoke(
+        {"description": "child", "prompt": "work", "run_in_background": True}
+    )
+    run_id = spawn_result.content.split("run_id=")[1].split(".")[0]
+    entry = registry.get(run_id)
+    assert entry is not None
+    task, context = entry
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert task.cancelled()
+    assert context.status == "failed"
+    assert context.reason == "cancelled"
+    lifecycle_events = [
+        event
+        for event in events
+        if isinstance(event, (SubagentStartedEvent, SubagentFinishedEvent))
+    ]
+    assert [type(event) for event in lifecycle_events] == [
+        SubagentStartedEvent,
+        SubagentFinishedEvent,
+    ]
+    assert lifecycle_events[1].status == "failed"
+    assert await AgentResultTool(registry).invoke({"run_id": run_id}) == ToolResult(
+        content="Subagent was cancelled.",
+        is_error=True,
+        error_type="command_failed",
+    )
+
+
+# 功能：验证 spawn 在等待后台生命周期握手时取消会清理已注册 task 并保持取消身份
+# 设计：受控 Event.wait 在真实 invoke_tool 任务内触发取消，检查公开 registry 与事件而非 task 私有字段
+async def test_background_handshake_wait_cancellation_cleans_registered_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child_blocker = asyncio.Event()
+    handshake_blocker = asyncio.Event()
+    observed_cancellations: list[asyncio.CancelledError] = []
+
+    class _CancellingHandshake:
+        # 保持受控握手未完成，使 invoke 停留在 wait 边界
+        def set(self) -> None:
+            return None
+
+        # 在当前 invoke task 内注入取消并记录接收到的异常对象
+        async def wait(self) -> None:
+            current = asyncio.current_task()
+            assert current is not None
+            asyncio.get_running_loop().call_soon(current.cancel)
+            try:
+                await handshake_blocker.wait()
+            except asyncio.CancelledError as exc:
+                observed_cancellations.append(exc)
+                raise
+
+    # 保持 background task 活跃，供 invoke cancellation 路径负责清理
+    async def _wait_forever(
+        self: AgentLoop,
+        context: ExecutionContext,
+    ) -> None:
+        await child_blocker.wait()
+
+    monkeypatch.setattr(AgentLoop, "run", _wait_forever)
+    monkeypatch.setattr(subagent_tool_module.asyncio, "Event", _CancellingHandshake)
+    tool, registry, bus = _make_tool(tmp_path)
+    tool_registry = ToolRegistry()
+    tool_registry.register(tool)
+    events: list[Any] = []
+
+    # 收集 tool 与 subagent 公开事件以排除伪造失败结果
+    async def _collect(event: Any) -> None:
+        events.append(event)
+
+    bus.subscribe(_collect)
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await invoke_tool(
+            tool_registry,
+            ToolCallBlock(
+                id="handshake-cancel",
+                name="spawn_agent",
+                input={
+                    "description": "child",
+                    "prompt": "work",
+                    "run_in_background": True,
+                },
+            ),
+            bus,
+            run_id="parent-run-01",
+        )
+
+    assert observed_cancellations == [exc_info.value]
+    entries = registry.all()
+    assert len(entries) == 1
+    task, context = entries[0]
+    assert task.cancelled()
+    assert context.status == "failed"
+    assert context.reason == "cancelled"
+    assert [type(event) for event in events] == [
+        ToolCallStartedEvent,
+        SubagentStartedEvent,
+        SubagentFinishedEvent,
+    ]
+    assert not any(isinstance(event, ToolCallFailedEvent) for event in events)
+    assert not any(isinstance(event, ToolCallFinishedEvent) for event in events)
 
 
 # 功能：后台任务未完成时 agent_result 应返回 "still running"
