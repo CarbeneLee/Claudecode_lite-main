@@ -1,0 +1,75 @@
+services:
+  daemon:
+    image: ${KAMA_IMAGE:-kamaclaude:phase6}
+    build:
+      context: .
+      target: runtime
+      args:
+        KAMA_UID: ${KAMA_UID:-10001}
+        KAMA_GID: ${KAMA_GID:-10001}
+    command: ["kama-core"]
+    working_dir: /workspace
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY}
+      KAMA_HOST: 0.0.0.0
+      KAMA_PORT: "7437"
+      TERM: ${TERM:-xterm-256color}
+    volumes:
+      - type: bind
+        source: ${KAMA_WORKSPACE:?set KAMA_WORKSPACE}
+        target: /workspace
+        bind:
+          create_host_path: false
+      - type: volume
+        source: kama-state
+        target: /home/kama/.kama
+    healthcheck:
+      test: ["CMD-SHELL", "KAMA_HOST=127.0.0.1 KAMA_PORT=7437 kama ping >/dev/null 2>&1"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+    read_only: true
+    tmpfs:
+      - "/tmp:rw,nosuid,nodev,size=128m"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    stop_grace_period: 30s
+
+  client:
+    image: ${KAMA_IMAGE:-kamaclaude:phase6}
+    command: ["kama", "ping"]
+    working_dir: /workspace
+    environment:
+      KAMA_HOST: daemon
+      KAMA_PORT: "7437"
+      TERM: ${TERM:-xterm-256color}
+    volumes:
+      - type: bind
+        source: ${KAMA_WORKSPACE:?set KAMA_WORKSPACE}
+        target: /workspace
+        bind:
+          create_host_path: false
+      - type: volume
+        source: kama-state
+        target: /home/kama/.kama
+    depends_on:
+      daemon:
+        condition: service_healthy
+    profiles: ["tools"]
+    stdin_open: true
+    tty: true
+    read_only: true
+    tmpfs:
+      - "/tmp:rw,nosuid,nodev,size=128m"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+
+volumes:
+  kama-state:

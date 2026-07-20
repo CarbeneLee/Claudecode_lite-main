@@ -1,0 +1,14 @@
+# Default-deny every build-context path, then reopen only Dockerfile inputs.
+**
+!Dockerfile
+!.dockerignore
+!pyproject.toml
+!uv.lock
+!README.md
+!WIRE_PROTOCOL.md
+!src/
+!src/**
+!tests/
+!tests/**
+!scripts/
+!scripts/**

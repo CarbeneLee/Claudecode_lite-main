@@ -4,7 +4,7 @@
 
 一个面向本地代码任务的可观测 Coding Agent Runtime，重点实现显式 workspace、安全工具边界、稳定错误语义、会话续航、Subagent 和 MCP 扩展。
 
-`Python 3.12` · `JSON-RPC 2.0 / NDJSON` · `CLI + TUI` · `Workspace-aware tools` · `Trace & replay`
+`Python 3.12` · `JSON-RPC 2.0 / NDJSON` · `CLI + TUI` · `Workspace-aware tools` · `Docker Compose` · `Trace & replay`
 
 ![KamaClaude architecture overview](docs/images/readme/architecture-overview.svg)
 
@@ -21,6 +21,7 @@ KamaClaude 将交互客户端与常驻 Core daemon 分离：CLI/TUI 负责发起
 - **Mutation-tested invocation core**：对 `tools/errors.py` 与 `tools/invocation.py` 做局部 mutation testing，而非用局部分数代表整个项目。
 - **Lifecycle cleanup**：Bash 子进程、Subagent 后台任务和 MCP 连接在超时、取消或 daemon 退出路径上执行清理。
 - **Subagent and MCP hardening**：明确前台/后台 Subagent 结果语义，并把 MCP 错误视为不可信远端输入。
+- **Reproducible container runtime**：使用 digest-pinned Python/uv 输入、frozen lock、独立 test stage 和非 root Compose daemon/client 拓扑。
 
 这些改造不否定上游工作，也不意味着所有代码均由当前 fork 从零原创。上游 attribution 与 MIT 许可见文末。
 
@@ -92,24 +93,40 @@ KamaClaude 将交互客户端与常驻 Core daemon 分离：CLI/TUI 负责发起
 - `agent_result` 返回 `still running`、成功结果或稳定失败类型。
 - MCP manager 支持 stdio/TCP transport、`tools/list` discovery、带 server 前缀的名称隔离和 daemon shutdown 清理。
 
+### Docker Runtime
+
+- 状态：**Implemented；locally tested on linux/arm64；linux/amd64 workflow defined but not yet executed；TUI manual pending**。
+- Dockerfile 采用 `uv sync --frozen` 的两阶段 production builder：先安装 lock 中的运行时依赖，再复制并安装项目源码。
+- 独立 `test` stage 安装开发依赖并执行 unit、integration、Ruff、mypy 和 protocol-doc check；最终 runtime 只复制 production venv，不包含 `pytest` 或 `uv`。
+- `.dockerignore` 使用 default-deny allowlist，只把 Dockerfile 实际需要的源码、测试、脚本和构建元数据送入 build context；Dockerfile 的显式 `COPY` 再限制哪些输入进入 image layer。
+- Compose 使用同一 image 启动常驻 `daemon` 和临时 `client`；两者都把宿主 workspace 映射为真实 `/workspace`，并共享 `/home/kama/.kama` named volume。
+- workspace bind 使用 `create_host_path: false`；不存在或拼错的宿主路径会 fail closed，不会被 Docker 自动创建成空目录。
+- daemon 只在 Compose bridge 内绑定 `0.0.0.0:7437`，默认不发布 host port；client 通过服务名 `daemon` 连接。
+- 基础 Compose 不声明 restart policy，daemon crash 保持可观察的 exited 状态；需要自动重启的高级用户可在自己的本地 override 中显式选择策略。
+- runtime 使用非 root 用户、只读根文件系统、`/tmp` tmpfs、`cap_drop: ALL`、`no-new-privileges` 和 PID 上限。
+- 这些控制减少部署漂移和容器权限面，但不会把 Bash 或可写 workspace 变成不可信代码沙箱。
+
 ### Quality snapshot
 
-以下数据对应以 `706861b` 为基线的当前未提交 Phase 5 工作树，并来自 2026-07-18 的本地 fresh verification：
+以下数据对应以 `4e359dd` 为基线的 Phase 6 Closeout verification，并来自 2026-07-20 的 fresh verification：
 
 | Gate | Result |
 | --- | --- |
 | Phase 5 search focused | 65 passed |
-| Phase 5 wiring | 146 passed |
-| Central invocation/loop regression | 104 passed |
-| Unit tests | 602 passed |
-| Integration tests | 26 passed |
+| Phase 6 daemon-free Docker contracts | 17 passed |
+| Docker test stage unit | 602 passed |
+| Docker test stage integration | 25 passed, 1 skipped |
+| Host unit tests | 602 passed |
+| Host integration tests | 26 passed |
 | Ruff | passed |
 | mypy strict | 93 source files, no issues |
 | Generated wire protocol | up to date |
+| Local runtime smoke | linux/arm64, UID 10001, 57,412,069 bytes, SIGTERM 0s（秒级计时）/ exit 0 |
+| Phase 6 manual mutation probes | 6 类（registration 类含 top-level/Subagent 两个变体）均在隔离副本中 killed |
 | Phase 5 manual mutation probes | 11 类已在隔离副本中 killed；不是全仓库 mutation score |
 | Earlier scoped mutation run | invocation/errors 两文件：465 generated，446 killed，19 survived，0 timeout；raw score 95.91%（本轮未重跑） |
 
-Earlier mutation score 只覆盖 `src/kama_claude/core/tools/errors.py` 与 `src/kama_claude/core/tools/invocation.py`，**不是整个仓库的 mutation coverage**。Phase 5 的 11 类 manual probes 也只证明相应测试能杀死指定 mutation。
+Earlier mutation score 只覆盖 `src/kama_claude/core/tools/errors.py` 与 `src/kama_claude/core/tools/invocation.py`，**不是整个仓库的 mutation coverage**。Phase 5/6 的 manual probes 也只证明相应测试能杀死指定 mutation。
 
 ## Architecture
 
@@ -168,6 +185,7 @@ CLI / TUI
 - cancellation 保持异步控制流；Bash 在超时/取消/异常路径尝试 kill 并 reap 子进程。
 - `search_code` 将 canonical containment/policy 与逐组件 no-follow fd open 结合，stat/read 绑定同一描述符。
 - MCP unavailable/tool error 被映射为稳定、安全的本地错误摘要。
+- Docker runtime 默认不发布无认证 daemon 端口；build context 同时受严格 `.dockerignore` 和显式 `COPY` 约束。
 
 ### 当前不保证
 
@@ -176,6 +194,8 @@ CLI / TUI
 - MCP tools 不经过 builtin filesystem resolver/policy；其权限与隔离取决于远端 server 和启动环境。
 - 除 `search_code` 读取路径外，其他 filesystem tools 的校验与实际 I/O 间仍可能存在 TOCTOU；写入路径也未实现原子替换。
 - MCP 成功内容仍是不可信数据；当前没有统一的成功输出大小、schema 或 prompt-injection 边界。
+- 容器管理员仍可读取 runtime environment；`ANTHROPIC_API_KEY` 因而只应在启动 daemon 时注入，不能视为对本机 Docker 管理员保密。
+- 非 root、cap drop 和只读 root 不是 OS-level Bash sandbox；容器仍可修改显式挂载为可写的 workspace。
 
 ## Subagent lifecycle
 
@@ -263,6 +283,62 @@ uv run kama trace <run_id> --raw
 uv run kama core stop
 ```
 
+### Run with Docker Compose
+
+Docker 路径不要求宿主安装项目 Python 依赖，但要求 Docker Desktop/Engine 与 Compose。先选择一个绝对 workspace，并只在 daemon runtime 注入 key：
+
+```bash
+export KAMA_WORKSPACE="/absolute/path/to/your/project"
+export ANTHROPIC_API_KEY="your-api-key"
+
+docker compose build daemon
+docker compose up -d daemon
+docker compose run --rm client kama ping
+```
+
+一次性任务和交互客户端使用同一个 image、network、workspace 与 state volume：
+
+```bash
+docker compose run --rm client kama run --goal "Summarize this workspace"
+docker compose run --rm -it client kama chat
+docker compose run --rm -it client kama-tui
+docker compose run --rm client kama trace --layer event
+```
+
+本地自动化验收使用唯一 Compose project name，并在所有退出路径清理 container、network、volume 和 project-scoped image：
+
+```bash
+scripts/docker_smoke.sh
+```
+
+停止服务：
+
+```bash
+docker compose stop daemon
+docker compose down
+```
+
+当前自动化证据覆盖本地 `linux/arm64` runtime；GitHub workflow 定义了 `linux/amd64` build/smoke，但在该 workflow 真正运行通过前不得把 amd64 标记为 Tested。smoke 使用 `SessionStore` 在 daemon recreate 前后写入并读回同一应用 artifact，只证明 package API 和 named volume persistence；它不证明 `SessionManager` 会自动 rehydrate，也不证明 daemon-level session resume。
+
+TUI 的交互式容器路径仍需用户在真实终端人工验收。在确认前，证据状态保持 **TUI manual pending**：
+
+```bash
+export KAMA_WORKSPACE="<existing absolute workspace>"
+export ANTHROPIC_API_KEY="<runtime key>"
+docker compose up -d daemon
+docker compose run --rm -it client kama-tui
+```
+
+人工确认清单：
+
+1. TUI 正常渲染；
+2. 能连接 daemon；
+3. 终端 resize 后布局仍可使用；
+4. Ctrl+C 或正常退出后 client container 被删除；
+5. daemon 保持 healthy；
+6. state/log 没有 permission error；
+7. 执行 `docker compose down --volumes` 后 container、network、volume 无残留。
+
 ## Example workflow
 
 下面的示例使用临时 workspace，避免把练习写入私人项目：
@@ -319,6 +395,7 @@ uv run mutmut results
 | Completed | Builtin/task producer cleanup | Bash/task error and cancellation tests |
 | Completed | Subagent/MCP lifecycle cleanup | Focused error/cancellation tests |
 | Completed | Bounded workspace `search_code` | Resource/security/cancellation unit and integration tests |
+| Completed (local arm64) | Reproducible Docker runtime | Pinned/frozen build、independent test stage、image inspect/history 和 runtime smoke |
 
 ## Roadmap
 
@@ -355,9 +432,12 @@ Roadmap 条目是计划，不代表当前可用能力。
 │   └── tui/               # Textual terminal UI
 ├── tests/
 │   ├── unit/
-│   └── integration/
-├── scripts/               # protocol generation and maintenance helpers
+│   ├── integration/
+│   └── docker/            # daemon-free Docker contract tests
+├── scripts/               # protocol generation, maintenance, and Docker smoke
 ├── docs/images/readme/    # fork-specific README diagrams
+├── Dockerfile             # builder/test/runtime stages
+├── compose.yaml           # daemon/client container topology
 ├── WIRE_PROTOCOL.md       # generated typed IPC contract
 ├── pyproject.toml
 └── LICENSE
