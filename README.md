@@ -95,21 +95,25 @@ KamaClaude 将交互客户端与常驻 Core daemon 分离：CLI/TUI 负责发起
 
 ### Docker Runtime
 
+- 状态：**Implemented；locally tested on linux/arm64；linux/amd64 workflow defined but not yet executed；TUI manual pending**。
 - Dockerfile 采用 `uv sync --frozen` 的两阶段 production builder：先安装 lock 中的运行时依赖，再复制并安装项目源码。
 - 独立 `test` stage 安装开发依赖并执行 unit、integration、Ruff、mypy 和 protocol-doc check；最终 runtime 只复制 production venv，不包含 `pytest` 或 `uv`。
+- `.dockerignore` 使用 default-deny allowlist，只把 Dockerfile 实际需要的源码、测试、脚本和构建元数据送入 build context；Dockerfile 的显式 `COPY` 再限制哪些输入进入 image layer。
 - Compose 使用同一 image 启动常驻 `daemon` 和临时 `client`；两者都把宿主 workspace 映射为真实 `/workspace`，并共享 `/home/kama/.kama` named volume。
+- workspace bind 使用 `create_host_path: false`；不存在或拼错的宿主路径会 fail closed，不会被 Docker 自动创建成空目录。
 - daemon 只在 Compose bridge 内绑定 `0.0.0.0:7437`，默认不发布 host port；client 通过服务名 `daemon` 连接。
+- 基础 Compose 不声明 restart policy，daemon crash 保持可观察的 exited 状态；需要自动重启的高级用户可在自己的本地 override 中显式选择策略。
 - runtime 使用非 root 用户、只读根文件系统、`/tmp` tmpfs、`cap_drop: ALL`、`no-new-privileges` 和 PID 上限。
 - 这些控制减少部署漂移和容器权限面，但不会把 Bash 或可写 workspace 变成不可信代码沙箱。
 
 ### Quality snapshot
 
-以下数据对应以 `4e359dd` 为基线的当前未提交 Phase 6 工作树，并来自 2026-07-20 的 fresh verification：
+以下数据对应以 `4e359dd` 为基线的 Phase 6 Closeout verification，并来自 2026-07-20 的 fresh verification：
 
 | Gate | Result |
 | --- | --- |
 | Phase 5 search focused | 65 passed |
-| Phase 6 daemon-free Docker contracts | 13 passed |
+| Phase 6 daemon-free Docker contracts | 17 passed |
 | Docker test stage unit | 602 passed |
 | Docker test stage integration | 25 passed, 1 skipped |
 | Host unit tests | 602 passed |
@@ -314,7 +318,26 @@ docker compose stop daemon
 docker compose down
 ```
 
-当前自动化证据覆盖本地 `linux/arm64` runtime；GitHub workflow 定义了 `linux/amd64` build/smoke，但在该 workflow 真正运行通过前不得把 amd64 标记为 Tested。TUI 的交互式 `-it` 路径仍需要人工终端检查，CI 不声称验证视觉布局或 resize。
+当前自动化证据覆盖本地 `linux/arm64` runtime；GitHub workflow 定义了 `linux/amd64` build/smoke，但在该 workflow 真正运行通过前不得把 amd64 标记为 Tested。smoke 使用 `SessionStore` 在 daemon recreate 前后写入并读回同一应用 artifact，只证明 package API 和 named volume persistence；它不证明 `SessionManager` 会自动 rehydrate，也不证明 daemon-level session resume。
+
+TUI 的交互式容器路径仍需用户在真实终端人工验收。在确认前，证据状态保持 **TUI manual pending**：
+
+```bash
+export KAMA_WORKSPACE="<existing absolute workspace>"
+export ANTHROPIC_API_KEY="<runtime key>"
+docker compose up -d daemon
+docker compose run --rm -it client kama-tui
+```
+
+人工确认清单：
+
+1. TUI 正常渲染；
+2. 能连接 daemon；
+3. 终端 resize 后布局仍可使用；
+4. Ctrl+C 或正常退出后 client container 被删除；
+5. daemon 保持 healthy；
+6. state/log 没有 permission error；
+7. 执行 `docker compose down --volumes` 后 container、network、volume 无残留。
 
 ## Example workflow
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -16,6 +17,15 @@ WORKFLOW = ROOT / ".github" / "workflows" / "docker.yml"
 # 读取仓库根目录下的 UTF-8 文本合同文件
 def _read(relative_path: str) -> str:
     return (ROOT / relative_path).read_text(encoding="utf-8")
+
+
+# 返回 .dockerignore 中忽略注释和空行后的有序规则
+def _dockerignore_rules() -> list[str]:
+    return [
+        line.strip()
+        for line in DOCKERIGNORE.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
 
 
 # 提取 Dockerfile 中从指定 stage 开始到下一 stage 之前的文本
@@ -125,41 +135,50 @@ def test_dockerfile_avoids_text_auditable_secret_and_context_hazards() -> None:
     assert "CMD kama-core" not in dockerfile
 
 
-# 功能：验证 .dockerignore 排除凭证、私有学习资料、本地状态、缓存和构建输出
-# 设计：按规范化非空行集合断言冻结类别，避免把注释或相似子串误判为保护规则
-def test_dockerignore_covers_private_and_local_state() -> None:
-    patterns = {
-        line.strip()
-        for line in DOCKERIGNORE.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
+# 功能：验证 .dockerignore 默认拒绝未知文件且只放行 Dockerfile 实际构建输入
+# 设计：从 COPY 指令提取 build-context source 并与冻结例外集合比对，同时用未知根 canary 杀死 broad allowlist
+def test_dockerignore_is_default_deny_and_allows_only_build_inputs() -> None:
+    rules = _dockerignore_rules()
+    allowed_rules = {
+        "!Dockerfile",
+        "!.dockerignore",
+        "!pyproject.toml",
+        "!uv.lock",
+        "!README.md",
+        "!WIRE_PROTOCOL.md",
+        "!src/",
+        "!src/**",
+        "!tests/",
+        "!tests/**",
+        "!scripts/",
+        "!scripts/**",
     }
-    required = {
-        ".git",
-        ".env*",
-        ".kama",
-        ".venv",
-        "docs",
-        "doc",
-        "phase-reports",
-        ".codegraph",
-        ".codex",
-        "workspace",
-        "runs",
-        "mutants",
-        "__pycache__",
-        ".pytest_cache",
-        ".mypy_cache",
-        ".ruff_cache",
-        "build",
-        "dist",
-        "*.log",
-    }
+    context_sources: set[str] = set()
 
-    assert required <= patterns
+    for line in DOCKERFILE.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("COPY ") or "--from=" in line:
+            continue
+        tokens = shlex.split(line)
+        context_sources.update(tokens[1:-1])
+
+    assert rules[0] == "**"
+    assert set(rules[1:]) == allowed_rules
+    assert "!**" not in rules
+    assert context_sources == {"pyproject.toml", "uv.lock", "src", "tests", "scripts", "WIRE_PROTOCOL.md", "README.md"}
+    for source in context_sources:
+        if source in {"src", "tests", "scripts"}:
+            assert f"!{source}/" in allowed_rules
+            assert f"!{source}/**" in allowed_rules
+        else:
+            assert f"!{source}" in allowed_rules
+    assert "!docs/**" not in rules
+    assert "!.env*" not in rules
+    assert "!.kama/**" not in rules
+    assert "!phase6-unlisted-private-canary.txt" not in rules
 
 
-# 功能：验证 Compose 让 daemon/client 共享真实 /workspace 与持久状态但只给 daemon 注入密钥
-# 设计：分别截取 service 文本，避免全文件包含关系掩盖 client 意外获得 secret 的错误
+# 功能：验证 Compose 让 daemon/client 共享 fail-closed /workspace 与持久状态但只给 daemon 注入密钥
+# 设计：分别截取 service 并断言相同 long-syntax mount 结构，避免短语命中掩盖 create_host_path 默认行为
 def test_compose_declares_shared_path_identity_and_secret_boundary() -> None:
     compose = COMPOSE.read_text(encoding="utf-8")
     daemon = _compose_service(compose, "daemon")
@@ -168,14 +187,49 @@ def test_compose_declares_shared_path_identity_and_secret_boundary() -> None:
     for service in (daemon, client):
         assert "image: ${KAMA_IMAGE:-kamaclaude:phase6}" in service
         assert "working_dir: /workspace" in service
-        assert "${KAMA_WORKSPACE:?set KAMA_WORKSPACE}:/workspace" in service
-        assert "kama-state:/home/kama/.kama" in service
+        assert """    volumes:
+      - type: bind
+        source: ${KAMA_WORKSPACE:?set KAMA_WORKSPACE}
+        target: /workspace
+        bind:
+          create_host_path: false
+      - type: volume
+        source: kama-state
+        target: /home/kama/.kama
+""" in service
+        assert service.count("create_host_path: false") == 1
     assert "build:" not in client
     assert "KAMA_HOST: 0.0.0.0" in daemon
     assert "ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY}" in daemon
     assert "KAMA_HOST: daemon" in client
     assert "ANTHROPIC_API_KEY" not in client
     assert "kama ping" in daemon
+
+
+# 功能：验证基础 Compose 不自动重启 daemon 且 smoke 会检查运行时 restart policy 为 no
+# 设计：静态合同排除任何 restart 声明并锁定 inspect 证据，真实 policy 值由完整 runtime smoke 决定
+def test_compose_has_no_restart_policy_and_smoke_inspects_default() -> None:
+    compose = COMPOSE.read_text(encoding="utf-8")
+    smoke = SMOKE.read_text(encoding="utf-8")
+
+    assert not re.search(r"^\s*restart:", compose, flags=re.MULTILINE)
+    assert "RestartPolicy.Name" in smoke
+    assert "restart policy must default to no" in smoke
+
+
+# 功能：验证 smoke 包含不存在 workspace 的 fail-closed bind 负向验收与独立资源清理
+# 设计：锁定独立 project、启动失败、路径不创建及 down 清理四个步骤，真实 Docker 行为留给完整 smoke
+def test_smoke_probes_missing_workspace_without_creating_host_path() -> None:
+    smoke = SMOKE.read_text(encoding="utf-8")
+
+    assert "MISSING_WORKSPACE_PROJECT=" in smoke
+    assert "MISSING_WORKSPACE_DIR=" in smoke
+    assert 'test ! -e "$MISSING_WORKSPACE_DIR"' in smoke
+    assert 'KAMA_WORKSPACE="$MISSING_WORKSPACE_DIR"' in smoke
+    assert 'docker compose -p "$MISSING_WORKSPACE_PROJECT"' in smoke
+    assert "missing workspace unexpectedly started daemon" in smoke
+    assert "missing workspace path was created" in smoke
+    assert "down --volumes --remove-orphans" in smoke
 
 
 # 功能：验证 Compose 声明最小权限边界且不把无认证 daemon 发布到主机网络
@@ -216,7 +270,8 @@ def test_smoke_script_uses_unique_project_and_trap_cleanup() -> None:
 # 功能：验证 smoke 收到 INT 或 TERM 时保留标准非零退出码并清理早期临时资源
 # 设计：使用脚本内受控信号探针在接触 Docker 前自发信号，直接覆盖真实 Bash trap 而不依赖 daemon
 def test_smoke_script_preserves_signal_status_and_cleans_early_resources(tmp_path: Path) -> None:
-    before_canaries = set(ROOT.glob(".env.phase6-smoke-*"))
+    canary_path = ROOT / "phase6-unlisted-private-canary.txt"
+    assert not canary_path.exists()
 
     for signal_name, expected_status in (("INT", 130), ("TERM", 143)):
         signal_tmp = tmp_path / signal_name.lower()
@@ -236,9 +291,7 @@ def test_smoke_script_preserves_signal_status_and_cleans_early_resources(tmp_pat
 
         assert completed.returncode == expected_status, completed.stderr
         assert list(signal_tmp.iterdir()) == []
-
-    assert set(ROOT.glob(".env.phase6-smoke-*")) == before_canaries
-
+        assert not canary_path.exists()
 
 # 功能：验证打包后 runtime smoke 同时拒绝 workspace 中指向外部文件和目录的 symlink
 # 设计：静态确认脚本会创建两类真实 symlink 并把两条路径送入 packaged SearchCodeTool 拒绝循环
@@ -248,6 +301,39 @@ def test_smoke_script_probes_external_file_and_directory_symlinks() -> None:
     assert 'ln -s /etc/passwd "$WORKSPACE_DIR/outside-link"' in smoke
     assert 'ln -s /etc "$WORKSPACE_DIR/outside-dir"' in smoke
     assert '("../etc/passwd", "outside-link", "outside-dir", "outside-dir/passwd")' in smoke
+
+
+# 功能：验证 runtime smoke 通过公开 loader 从已安装 distribution 加载全部 builtin profile 与一个 skill
+# 设计：锁定 RECORD、installed module path、无 /build sys.path 和真实 loader 调用，最终资源可用性由镜像内执行证明
+def test_smoke_probes_installed_builtin_package_data() -> None:
+    smoke = SMOKE.read_text(encoding="utf-8")
+
+    assert 'distribution("KamaClaude")' in smoke
+    assert "kama_claude/core/agents/builtin/planner.toml" in smoke
+    assert "kama_claude/core/agents/builtin/executor.toml" in smoke
+    assert "kama_claude/core/agents/builtin/reviewer.toml" in smoke
+    assert "kama_claude/core/skills/builtin/review.md" in smoke
+    assert "AgentProfileLoader(Path(\"/workspace\"))" in smoke
+    assert 'for name in ("planner", "executor", "reviewer")' in smoke
+    assert "SkillLoader(Path(\"/workspace\")).resolve(\"review\")" in smoke
+    assert "is_relative_to(site_root)" in smoke
+    assert 'path.startswith("/build/")' in smoke
+
+
+# 功能：验证 smoke 在 daemon recreate 前后用同一 SessionStore API 写入并读回应用 artifact
+# 设计：比较 writer/recreate/reader 的文本位置，证明测试覆盖 named volume 持久化但不冒充 SessionManager rehydrate
+def test_smoke_probes_session_store_persistence_across_recreate() -> None:
+    smoke = SMOKE.read_text(encoding="utf-8")
+
+    writer = smoke.index("store.write_meta(Session(")
+    recreate = smoke.index("compose rm -f daemon")
+    reader = smoke.rindex('store.read_meta("sess-phase6-persistence")')
+
+    assert writer < recreate < reader
+    assert "from kama_claude.core.session import Session, SessionStore" in smoke
+    assert 'SessionStore(Path("/home/kama/.kama/sessions"))' in smoke
+    assert 'store.append_note(sid, marker, "phase6-smoke")' in smoke
+    assert 'marker in store.read_notes("sess-phase6-persistence")' in smoke
 
 
 # 功能：验证 CI 构建独立 test stage、执行 runtime smoke 且从不发布镜像

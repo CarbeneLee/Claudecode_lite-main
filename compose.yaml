@@ -15,8 +15,14 @@ services:
       KAMA_PORT: "7437"
       TERM: ${TERM:-xterm-256color}
     volumes:
-      - "${KAMA_WORKSPACE:?set KAMA_WORKSPACE}:/workspace"
-      - "kama-state:/home/kama/.kama"
+      - type: bind
+        source: ${KAMA_WORKSPACE:?set KAMA_WORKSPACE}
+        target: /workspace
+        bind:
+          create_host_path: false
+      - type: volume
+        source: kama-state
+        target: /home/kama/.kama
     healthcheck:
       test: ["CMD-SHELL", "KAMA_HOST=127.0.0.1 KAMA_PORT=7437 kama ping >/dev/null 2>&1"]
       interval: 2s
@@ -32,7 +38,6 @@ services:
       - no-new-privileges:true
     pids_limit: 256
     stop_grace_period: 30s
-    restart: unless-stopped
 
   client:
     image: ${KAMA_IMAGE:-kamaclaude:phase6}
@@ -43,8 +48,14 @@ services:
       KAMA_PORT: "7437"
       TERM: ${TERM:-xterm-256color}
     volumes:
-      - "${KAMA_WORKSPACE:?set KAMA_WORKSPACE}:/workspace"
-      - "kama-state:/home/kama/.kama"
+      - type: bind
+        source: ${KAMA_WORKSPACE:?set KAMA_WORKSPACE}
+        target: /workspace
+        bind:
+          create_host_path: false
+      - type: volume
+        source: kama-state
+        target: /home/kama/.kama
     depends_on:
       daemon:
         condition: service_healthy
