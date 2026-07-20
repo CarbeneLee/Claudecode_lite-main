@@ -232,6 +232,17 @@ def test_smoke_probes_missing_workspace_without_creating_host_path() -> None:
     assert "down --volumes --remove-orphans" in smoke
 
 
+# 功能：验证 smoke 在 bind mount 前让固定 UID 10001 能写入临时 workspace
+# 设计：锁定私有临时父目录内子目录的显式授权顺序，复现 Linux runner 与容器 UID 不一致的边界
+def test_smoke_prepares_ephemeral_workspace_for_fixed_runtime_uid() -> None:
+    smoke = SMOKE.read_text(encoding="utf-8")
+    permission_command = 'chmod 0777 "$WORKSPACE_DIR"'
+
+    assert permission_command in smoke
+    assert smoke.index('mkdir -p "$WORKSPACE_DIR"') < smoke.index(permission_command)
+    assert smoke.index(permission_command) < smoke.index("compose up -d daemon")
+
+
 # 功能：验证 Compose 声明最小权限边界且不把无认证 daemon 发布到主机网络
 # 设计：只检查可文本证明的配置，实际 capability、UID 和只读写入面由 runtime smoke 验证
 def test_compose_declares_runtime_hardening_without_host_exposure() -> None:

@@ -124,6 +124,8 @@ WORKSPACE_DIR="$TEMP_ROOT/workspace"
 export KAMA_WORKSPACE="$WORKSPACE_DIR"
 
 mkdir -p "$WORKSPACE_DIR"
+# 让固定 UID 的非 root 容器可写私有临时父目录中的 bind workspace
+chmod 0777 "$WORKSPACE_DIR"
 printf '%s\n' 'phase6-docker-marker' >"$WORKSPACE_DIR/marker.txt"
 ln -s /etc/passwd "$WORKSPACE_DIR/outside-link"
 ln -s /etc "$WORKSPACE_DIR/outside-dir"
