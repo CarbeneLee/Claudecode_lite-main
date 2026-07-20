@@ -1,0 +1,46 @@
+# Version-control and local agent metadata
+.git
+.gitignore
+.gitattributes
+.github
+.codegraph
+.codex
+.agents
+
+# Credentials, runtime state, and private learning material
+.env*
+.kama
+docs
+doc
+phase-reports
+outputs
+workspace
+runs
+mutants
+
+# Python environments and caches
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.tox
+.nox
+.coverage
+htmlcov
+
+# Build products, logs, and editor state
+build
+dist
+*.egg-info
+*.log
+.DS_Store
+.idea
+.vscode
+
+# Docker-local output files
+compose.override.yaml
+docker-compose.override.yml
+*.docker.log

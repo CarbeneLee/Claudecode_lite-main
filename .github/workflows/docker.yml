@@ -1,0 +1,37 @@
+name: Docker runtime
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "feat/**"
+
+permissions:
+  contents: read
+
+jobs:
+  docker-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.19"
+          enable-cache: true
+
+      - name: Verify frozen lock
+        run: uv lock --check
+
+      - name: Run daemon-free Docker contracts
+        run: uv run pytest tests/docker/test_docker_contract.py -q
+
+      - name: Build and execute the independent test stage
+        run: docker build --target test --tag kamaclaude-phase6-test .
+
+      - name: Build, inspect, and smoke the runtime
+        env:
+          PHASE6_SKIP_TEST_BUILD: "1"
+        run: scripts/docker_smoke.sh
