@@ -21,6 +21,7 @@ from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.tools.builtin.bash import BashTool
 from kama_claude.core.tools.builtin.list_dir import ListDirTool
 from kama_claude.core.tools.builtin.read_file import ReadFileTool
+from kama_claude.core.tools.builtin.search_code import SearchCodeTool
 from kama_claude.core.tools.builtin.task_create import TaskCreateTool
 from kama_claude.core.tools.builtin.task_get import TaskGetTool
 from kama_claude.core.tools.builtin.task_list import TaskListTool
@@ -326,6 +327,7 @@ class SpawnAgentTool(BaseTool):
             BashTool(self._workspace_root),
             WriteFileTool(self._path_resolver, self._access_policy),
             ListDirTool(self._path_resolver, self._access_policy),
+            SearchCodeTool(self._path_resolver, self._access_policy),
         ]
         for t in _all_tools:
             if _allowed(t.name):

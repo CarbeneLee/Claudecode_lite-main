@@ -32,6 +32,7 @@ async def _collect_emitted() -> tuple[list[dict[str, Any]], Any]:
 def test_evaluate_delegates_to_policy() -> None:
     mgr = _make_manager()
     assert mgr.evaluate("read_file", {"path": "x"}) == PermissionDecision.ALLOW
+    assert mgr.evaluate("search_code", {"query": "needle"}) == PermissionDecision.ALLOW
     assert mgr.evaluate("bash", {"command": "echo hi"}) == PermissionDecision.ASK
     assert mgr.evaluate("write_file", {"path": "x", "content": ""}) == PermissionDecision.ASK
 
@@ -52,6 +53,24 @@ async def test_check_and_wait_allow_no_event() -> None:
 
     assert allowed is True
     assert decision == "auto_allow"
+    assert emitted == []
+
+
+# 功能：验证 search_code 默认自动放行且不发布权限请求
+# 设计：经真实 PermissionManager.check_and_wait 走 query 参数路径并检查零事件
+async def test_search_code_check_and_wait_auto_allows_without_event() -> None:
+    mgr = _make_manager()
+    emitted, emitter = await _collect_emitted()
+
+    allowed, decision = await mgr.check_and_wait(
+        tool_use_id="search-1",
+        tool_name="search_code",
+        params={"query": "needle", "path": "."},
+        session_id="s1",
+        event_emitter=emitter,
+    )
+
+    assert (allowed, decision) == (True, "auto_allow")
     assert emitted == []
 
 

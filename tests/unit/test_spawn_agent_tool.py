@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from kama_claude.core.agents.loader import AgentProfile
 from kama_claude.core.bus.events import (
     SubagentFinishedEvent,
     SubagentStartedEvent,
@@ -25,6 +26,7 @@ from kama_claude.core.tools.base import ToolResult
 from kama_claude.core.tools.builtin.bash import BashTool
 from kama_claude.core.tools.builtin.list_dir import ListDirTool
 from kama_claude.core.tools.builtin.read_file import ReadFileTool
+from kama_claude.core.tools.builtin.search_code import SearchCodeTool
 from kama_claude.core.tools.builtin.write_file import WriteFileTool
 from kama_claude.core.tools.invocation import invoke_tool
 from kama_claude.core.tools.registry import ToolRegistry
@@ -127,6 +129,46 @@ def test_child_registry_injects_workspace_into_read_and_list_tools(
     assert isinstance(list_tool, ListDirTool)
     assert read_tool._resolver.root == tmp_path.resolve(strict=True)
     assert list_tool._resolver.root == tmp_path.resolve(strict=True)
+
+
+# 功能：验证 Subagent child registry 注册绑定 parent workspace 的 search_code
+# 设计：不运行 child loop，直接检查真实工具类型和 resolver canonical root
+def test_child_registry_injects_workspace_into_search_code(tmp_path: Path) -> None:
+    tool, _, _ = _make_tool(tmp_path)
+
+    registry = tool._build_child_registry(EventBus(), "child-run", None)
+    search_tool = registry.get("search_code")
+
+    assert isinstance(search_tool, SearchCodeTool)
+    assert search_tool._resolver.root == tmp_path.resolve(strict=True)
+
+
+# 功能：验证 Subagent profile allowlist 可单独允许或排除 search_code
+# 设计：用两个最小 AgentProfile 构建 registry，交叉断言 search/read 工具存在性
+def test_child_registry_filters_search_code_by_profile_allowlist(
+    tmp_path: Path,
+) -> None:
+    tool, _, _ = _make_tool(tmp_path)
+    search_only = AgentProfile(
+        name="searcher",
+        description="",
+        system_prompt="",
+        allowed_tools=["search_code"],
+    )
+    read_only = AgentProfile(
+        name="reader",
+        description="",
+        system_prompt="",
+        allowed_tools=["read_file"],
+    )
+
+    search_registry = tool._build_child_registry(EventBus(), "search-run", search_only)
+    read_registry = tool._build_child_registry(EventBus(), "read-run", read_only)
+
+    assert isinstance(search_registry.get("search_code"), SearchCodeTool)
+    assert search_registry.get("read_file") is None
+    assert read_registry.get("search_code") is None
+    assert isinstance(read_registry.get("read_file"), ReadFileTool)
 
 
 # 功能：验证 child registry 的 write 工具与 Bash 继承 parent workspace

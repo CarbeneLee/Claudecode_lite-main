@@ -27,6 +27,16 @@ def test_all_builtin_skills_found(name: str, tmp_path: Path) -> None:
     assert skill is not None, f"builtin skill '{name}' not found"
 
 
+# 功能：验证需要代码探索的 init/review skill 声明 search_code
+# 设计：只检查两个相关内建 skill 的解析结果，避免重复 getter 或文本快照测试
+@pytest.mark.parametrize("name", ["init", "review"])
+def test_code_exploration_skills_allow_search_code(name: str, tmp_path: Path) -> None:
+    skill = SkillLoader(tmp_path.resolve()).resolve(name)
+
+    assert skill is not None
+    assert "search_code" in skill.allowed_tools
+
+
 # 功能：不存在的 skill 名应返回 None
 # 设计：查找一个不存在的名称，断言 resolve 返回 None 而非抛异常
 def test_unknown_skill_returns_none(tmp_path: Path) -> None:

@@ -14,6 +14,7 @@ from kama_claude.core.task.manager import TaskManager
 from kama_claude.core.tools.builtin.bash import BashTool
 from kama_claude.core.tools.builtin.list_dir import ListDirTool
 from kama_claude.core.tools.builtin.read_file import ReadFileTool
+from kama_claude.core.tools.builtin.search_code import SearchCodeTool
 from kama_claude.core.tools.builtin.write_file import WriteFileTool
 
 # --- mock provider -----------------------------------------------------------
@@ -165,6 +166,28 @@ def test_runner_injects_workspace_into_read_and_list_tools(tmp_path: Path) -> No
     assert isinstance(list_tool, ListDirTool)
     assert read_tool._resolver.root == tmp_path.resolve(strict=True)
     assert list_tool._resolver.root == tmp_path.resolve(strict=True)
+
+
+# 功能：验证 Runner 注册 workspace-bound search_code 并尊重 tool whitelist
+# 设计：分别构建仅允许 search 和仅允许 read 的 registry，同时检查 resolver root
+def test_runner_registers_workspace_bound_search_code_with_whitelist(
+    tmp_path: Path,
+) -> None:
+    runner = AgentRunner(_config(), workspace_root=tmp_path.resolve())
+
+    search_registry = runner._build_registry(
+        TaskManager(tmp_path / "search-tasks"),
+        tool_whitelist=["search_code"],
+    )
+    read_registry = runner._build_registry(
+        TaskManager(tmp_path / "read-tasks"),
+        tool_whitelist=["read_file"],
+    )
+    search_tool = search_registry.get("search_code")
+
+    assert isinstance(search_tool, SearchCodeTool)
+    assert search_tool._resolver.root == tmp_path.resolve(strict=True)
+    assert read_registry.get("search_code") is None
 
 
 # 功能：验证 Runner registry 的 write 工具与 Bash 启动目录绑定 Runner workspace
