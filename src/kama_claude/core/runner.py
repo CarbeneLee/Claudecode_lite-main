@@ -29,6 +29,7 @@ from kama_claude.core.tools.builtin import (
     ListDirTool,
     NoteSaveTool,
     ReadFileTool,
+    SearchCodeTool,
     TaskCreateTool,
     TaskGetTool,
     TaskListTool,
@@ -107,6 +108,7 @@ class AgentRunner:
             BashTool(self._workspace_root),
             WriteFileTool(self._path_resolver, self._access_policy),
             ListDirTool(self._path_resolver, self._access_policy),
+            SearchCodeTool(self._path_resolver, self._access_policy),
         ]:
             if _ok(t.name):
                 registry.register(t)

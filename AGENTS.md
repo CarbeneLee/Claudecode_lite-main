@@ -118,3 +118,16 @@ This repository is currently used as a staged learning project.
 For S0–S2 learning tasks, prioritize core protocol, daemon, CLI, tests, and event flow. TUI work should not be expanded unless the task explicitly touches user-facing UI.
 
 For product-level features after S2, TUI remains the primary frontend and should be validated when the feature affects user interaction.
+
+## Project goals and learning deliverables
+
+- Build a local Coding Agent Runtime around AgentLoop, daemon/CLI/TUI, workspace-safe tools, sessions/context, Subagent, MCP, and observability.
+- Treat Docker reproducible deployment and repo-task evaluation as explicit future gaps, not current capabilities.
+- Every feature phase must deliver a reviewed implementation plan, RED/GREEN evidence, focused/full gates, an external diff report, and one learning devlog.
+- Every phase devlog must include comprehension questions with complete answers, interview questions with answer frameworks, resume-claim impact, and known limitations.
+- Roadmap entries are not current capabilities; never describe unimplemented work as completed or fabricate implementation/tests to match a resume claim.
+- README, devlogs, and resume matrices must distinguish `Implemented`, `Tested`, `Benchmarked`, and `Planned` evidence.
+- Devlogs must not contain API keys, tokens, private file contents, job-application details, or unredacted absolute paths.
+- Never automatically commit or push learning work, and never modify another repository while completing this repository's phase deliverables.
+- Use [docs/learning/README.md](docs/learning/README.md) for the evidence matrix and devlog workflow.
+- Use [docs/learning/devlog/TEMPLATE.md](docs/learning/devlog/TEMPLATE.md) for every new phase learning record.

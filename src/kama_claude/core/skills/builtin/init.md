@@ -4,6 +4,7 @@ description: 分析当前项目，生成 .kama/context.md 初始内容
 allowed_tools:
   - read_file
   - list_dir
+  - search_code
   - write_file
   - bash
 ---

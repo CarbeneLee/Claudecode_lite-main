@@ -147,6 +147,34 @@ async def test_runner_read_file_uses_workspace_not_process_cwd(
     assert provider.tool_result == "workspace-marker"
 
 
+# 功能：验证真实 Runner search_code 只搜索绑定 workspace 而非 daemon cwd
+# 设计：两个根目录写入不同 marker，经 LLM→registry→tool 路径检查相对路径输出
+async def test_runner_search_code_uses_workspace_not_process_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    daemon_cwd = tmp_path / "daemon"
+    workspace = tmp_path / "workspace"
+    daemon_cwd.mkdir()
+    workspace.mkdir()
+    (daemon_cwd / "daemon.txt").write_text("daemon-only-needle", encoding="utf-8")
+    (workspace / "workspace.txt").write_text(
+        "workspace-only-needle",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(daemon_cwd)
+    provider = _ToolThenEndProvider("search_code", {"query": "only-needle"})
+
+    outcome = await _runner(workspace, provider, tmp_path / "runs").run_and_capture(
+        "search"
+    )
+
+    assert outcome.status == "success"
+    assert "workspace.txt:1: workspace-only-needle" in provider.tool_result
+    assert "daemon.txt" not in provider.tool_result
+    assert str(workspace.resolve(strict=True)) not in provider.tool_result
+
+
 # 功能：验证 workspace A/B 的真实 Runner 分别读取各自 marker
 # 设计：两个 provider 和 Runner 使用相同 logical path，交叉比较 ToolResult
 async def test_two_runners_read_distinct_workspace_markers(tmp_path: Path) -> None:

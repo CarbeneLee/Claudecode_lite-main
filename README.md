@@ -50,6 +50,7 @@ KamaClaude 将交互客户端与常驻 Core daemon 分离：CLI/TUI 负责发起
 | --- | --- | --- |
 | Filesystem | `read_file` | 读取 workspace-relative 文本，最多返回 512 KiB |
 | Filesystem | `list_dir` | 递归目录树，深度最多 4、条目最多 200 |
+| Filesystem | `search_code` | 有界 literal 代码搜索，只返回 workspace-relative 路径 |
 | Filesystem | `write_file` | 在 workspace 内创建/覆盖文本，输入最多 1 MiB |
 | Process | `bash` | 从 workspace cwd 启动非交互 shell，输出最多 64 KiB |
 | Tasks | `task_create`, `task_update`, `task_list`, `task_get` | 管理当前 run 的结构化任务 |
@@ -57,15 +58,23 @@ KamaClaude 将交互客户端与常驻 Core daemon 分离：CLI/TUI 负责发起
 | Delegation | `spawn_agent`, `agent_result` | 启动前台/后台 Subagent，并查询后台结果 |
 | MCP | `<server>__<tool>` | daemon 启动时发现并包装配置的 MCP tools |
 
-`search_code` **尚未实现**，不在当前 registry 中。
-
 ### Workspace and Permissions
 
 - `agent.run` 与 `session.create` 都要求绝对、存在且为目录的 `workspace_root`，Core 将其解析为 canonical path。
 - Builtin filesystem tools 只接受 workspace-relative 路径；绝对路径、symlink 逃逸和 canonical containment 失败会被拒绝。
 - `.git`、`.env*`（允许 `.env.example`/`.env.template`）、常见私钥与 credential 文件受到敏感路径规则保护。
-- `read_file`/`list_dir` 默认允许，`write_file`/`bash` 默认请求审批；`always_allow`/`always_deny` 可持久化到 `~/.kama/policy.toml`。
+- `read_file`/`list_dir`/`search_code` 默认允许，`write_file`/`bash` 默认请求审批；`always_allow`/`always_deny` 可持久化到 `~/.kama/policy.toml`。
 - Bash 中出现绝对路径、`~`、`..`、`$HOME`、`$PWD` 或 `cd` 等 outside-cwd 特征时会强制进入审批路径。
+- `tool.call_started` 保留 schema validation 前的原始参数；事件消费者必须将其视为不可信结构化数据，并在展示边界转义。
+- `search_code` 结果是不可信仓库内容，可能包含类似 prompt injection 的文本。
+- `search_code` 从 canonical workspace root 逐组件使用 no-follow 文件描述符打开目录/文件，并将大小检查与读取绑定到同一已打开文件，拒绝 policy 检查后的 symlink swap。
+- Hardened `search_code` 当前支持具备 `dir_fd`、fd-based `scandir`、`O_NOFOLLOW` 与 `O_DIRECTORY` 的 POSIX/Linux/macOS；Windows secure backend 尚未实现，能力缺失时会 fail closed。Pure Python 不代表已经具备完整跨平台安全后端。
+- 显式搜索 root 不可读时返回稳定权限失败，FIFO/socket/device 等特殊 root 在 open 前返回 `invalid_input`；递归 child 不可读则计入 `skipped_unreadable` 并继续搜索。
+- 文件读取只把 empty bytes 视为 EOF；short read 会继续读取。恰好填满总 byte budget 的完整文件会保留，只有仍有未读内容或遇到下一个候选时才标记 `byte_limit`。
+- `search_code` 的普通 snippet 以 400 个转义后字符为目标；为保留完整 match，最坏可扩展到 514 字符，但最终输出仍严格受 32 KiB UTF-8 byte cap 限制。
+- 单目录条目超限会丢弃该目录的整个 batch 并结束搜索，不会搜索前 5,000 个部分候选。
+- 1 MiB 是单文件输入 byte cap，不代表峰值内存；whole-file UTF-8 decode、Unicode casefold offset mapping 与输出转义会产生额外的有界内存放大。
+- 搜索线程使用协作式 cancellation；Python 无法强制中断一个永久阻塞的 filesystem read，因此 120 秒不是任意文件系统上的绝对 wall-clock 上限。
 
 ### Reliability and Error Semantics
 
@@ -85,18 +94,22 @@ KamaClaude 将交互客户端与常驻 Core daemon 分离：CLI/TUI 负责发起
 
 ### Quality snapshot
 
-以下数据对应 baseline `58a96f1` 的本地 fresh verification：
+以下数据对应以 `706861b` 为基线的当前未提交 Phase 5 工作树，并来自 2026-07-18 的本地 fresh verification：
 
 | Gate | Result |
 | --- | --- |
-| Unit tests | 501 passed |
-| Integration tests | 25 passed |
+| Phase 5 search focused | 65 passed |
+| Phase 5 wiring | 146 passed |
+| Central invocation/loop regression | 104 passed |
+| Unit tests | 602 passed |
+| Integration tests | 26 passed |
 | Ruff | passed |
-| mypy strict | 92 source files, no issues |
+| mypy strict | 93 source files, no issues |
 | Generated wire protocol | up to date |
-| Mutation testing | invocation/errors 两文件局部 fresh run：465 generated，446 killed，19 survived，0 timeout；raw score 95.91% |
+| Phase 5 manual mutation probes | 11 类已在隔离副本中 killed；不是全仓库 mutation score |
+| Earlier scoped mutation run | invocation/errors 两文件：465 generated，446 killed，19 survived，0 timeout；raw score 95.91%（本轮未重跑） |
 
-Mutation score 只覆盖 `src/kama_claude/core/tools/errors.py` 与 `src/kama_claude/core/tools/invocation.py`，**不是整个仓库的 mutation coverage**。
+Earlier mutation score 只覆盖 `src/kama_claude/core/tools/errors.py` 与 `src/kama_claude/core/tools/invocation.py`，**不是整个仓库的 mutation coverage**。Phase 5 的 11 类 manual probes 也只证明相应测试能杀死指定 mutation。
 
 ## Architecture
 
@@ -153,6 +166,7 @@ CLI / TUI
 - 参数校验失败、权限拒绝和其他永久失败不会被自动重放。
 - 未知 Python exception 的内容被净化；validation feedback 不回显用户输入值。
 - cancellation 保持异步控制流；Bash 在超时/取消/异常路径尝试 kill 并 reap 子进程。
+- `search_code` 将 canonical containment/policy 与逐组件 no-follow fd open 结合，stat/read 绑定同一描述符。
 - MCP unavailable/tool error 被映射为稳定、安全的本地错误摘要。
 
 ### 当前不保证
@@ -160,7 +174,7 @@ CLI / TUI
 - Core 默认监听 loopback，但这是**受信本地客户端模型**，不是多用户认证或授权系统。
 - Bash 的 workspace 只是启动 cwd，**不是 OS sandbox**；shell 可以通过绝对路径、父目录、子进程或网络越过 workspace。
 - MCP tools 不经过 builtin filesystem resolver/policy；其权限与隔离取决于远端 server 和启动环境。
-- 路径校验与实际 I/O 间仍可能存在 TOCTOU；当前未使用 `openat`/`O_NOFOLLOW`/原子替换实现完整加固。
+- 除 `search_code` 读取路径外，其他 filesystem tools 的校验与实际 I/O 间仍可能存在 TOCTOU；写入路径也未实现原子替换。
 - MCP 成功内容仍是不可信数据；当前没有统一的成功输出大小、schema 或 prompt-injection 边界。
 
 ## Subagent lifecycle
@@ -266,16 +280,15 @@ uv run --project "$KAMACLAUDE_DIR" kama chat
 
 ```text
 List this workspace and read README.md.
+Search this workspace for the literal text "workspace".
 Create notes.txt containing a one-line summary of this workspace.
 ```
 
-`read_file`/`list_dir` 默认允许；`write_file` 会显示 permission request。CLI chat 使用 `y`（allow once）、`a`（always allow）、`n`（deny once）或 `d`（always deny）响应。任务结束后另开终端查看 trace：
+`read_file`/`list_dir`/`search_code` 默认允许；`write_file` 会显示 permission request。CLI chat 使用 `y`（allow once）、`a`（always allow）、`n`（deny once）或 `d`（always deny）响应。任务结束后另开终端查看 trace：
 
 ```bash
 uv run --project "$KAMACLAUDE_DIR" kama trace --layer event
 ```
-
-该流程不依赖尚未实现的 `search_code`。
 
 ## Testing
 
@@ -305,14 +318,12 @@ uv run mutmut results
 | Completed | Stable tool errors and conservative retry | Invocation/error tests + focused mutation testing |
 | Completed | Builtin/task producer cleanup | Bash/task error and cancellation tests |
 | Completed | Subagent/MCP lifecycle cleanup | Focused error/cancellation tests |
-| Next | `search_code` | Not registered or implemented yet |
+| Completed | Bounded workspace `search_code` | Resource/security/cancellation unit and integration tests |
 
 ## Roadmap
 
 ### Near term
 
-- `search_code`
-- Structured search result limits
 - Workspace summary
 - Trace enrichment
 
@@ -326,7 +337,7 @@ uv run mutmut results
 ### Security
 
 - Allowed workspace roots and client authentication
-- `openat`/`O_NOFOLLOW`/atomic-write hardening
+- 将 `search_code` 的 fd-bound 模式扩展到其他 filesystem tools，并补齐 atomic-write hardening
 - OS-level Bash sandbox
 - MCP capability policy and sandbox
 - MCP idempotency keys

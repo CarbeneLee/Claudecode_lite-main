@@ -26,6 +26,7 @@ def test_all_builtin_roles_found(role: str, tmp_path: Path) -> None:
     profile = loader.load(role)
     assert profile is not None, f"builtin role '{role}' not found"
     assert profile.allowed_tools  # 每个内建角色都有 allowed_tools
+    assert "search_code" in profile.allowed_tools
 
 
 # 功能：未知角色名应返回 None

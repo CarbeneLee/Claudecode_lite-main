@@ -7,6 +7,7 @@ from kama_claude.core.tools.builtin.bash import BashParams
 from kama_claude.core.tools.builtin.list_dir import ListDirParams
 from kama_claude.core.tools.builtin.note_save import NoteSaveParams
 from kama_claude.core.tools.builtin.read_file import ReadFileParams
+from kama_claude.core.tools.builtin.search_code import SearchCodeParams
 from kama_claude.core.tools.builtin.task_create import TaskCreateTool
 from kama_claude.core.tools.builtin.task_get import TaskGetTool
 from kama_claude.core.tools.builtin.task_update import TaskUpdateTool
@@ -93,6 +94,68 @@ def test_list_dir_params_defaults() -> None:
 def test_list_dir_params_max_depth_exceeded() -> None:
     with pytest.raises(ValidationError):
         ListDirParams.model_validate({"max_depth": 5})
+
+
+# 功能：验证 SearchCodeParams 保留 literal query 并提供冻结默认值
+# 设计：用含前后空格的最小输入锁定不 trim 语义和全部默认字段
+def test_search_code_params_defaults_preserve_literal_query() -> None:
+    params = SearchCodeParams.model_validate({"query": " needle "})
+
+    assert params.model_dump() == {
+        "query": " needle ",
+        "path": ".",
+        "include_glob": None,
+        "case_sensitive": False,
+        "max_results": 50,
+    }
+
+
+@pytest.mark.parametrize("field", ["query", "path", "include_glob"])
+@pytest.mark.parametrize("control", ["\x00", "\x1b", "\x7f", "\u2028", "\u2029"])
+# 功能：验证 search_code 的三个文本字段统一拒绝冻结控制字符
+# 设计：交叉参数字段与 C0、DEL、Unicode 行分隔符，防止 validator 覆盖不完整
+def test_search_code_params_reject_all_frozen_controls(
+    field: str,
+    control: str,
+) -> None:
+    invalid: dict[str, object] = {"query": "needle", field: f"ok{control}bad"}
+    with pytest.raises(ValidationError):
+        SearchCodeParams.model_validate(invalid)
+
+
+# 功能：验证 search_code 的结果上限、控制字符与 basename glob 边界
+# 设计：保留 max=200 正例并用代表性反例覆盖三类 schema 拒绝路径
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"query": "needle", "max_results": 0},
+        {"query": "needle", "max_results": 201},
+        {"query": "needle\x1bsecret"},
+        {"query": "needle", "path": "src\u2028hidden"},
+        {"query": "needle", "include_glob": "src/*.py"},
+        {"query": "needle", "include_glob": r"src\*.py"},
+        {"query": "needle", "include_glob": "**.py"},
+        {"query": "needle", "include_glob": "!*.py"},
+        {"query": ""},
+        {"query": " \t "},
+        {"query": "x" * 257},
+        {"query": "needle", "path": "p" * 1025},
+        {"query": "needle", "include_glob": " "},
+        {"query": "needle", "include_glob": "g" * 257},
+    ],
+)
+def test_search_code_params_reject_frozen_schema_boundaries(
+    invalid: dict[str, object],
+) -> None:
+    assert SearchCodeParams.model_validate(
+        {"query": "needle", "max_results": 200, "include_glob": "*.py"}
+    ).max_results == 200
+    assert SearchCodeParams.model_validate({"query": "\\" * 256}).query == "\\" * 256
+    assert SearchCodeParams.model_validate(
+        {"query": "needle", "include_glob": "[!a]*.py"}
+    ).include_glob == "[!a]*.py"
+    with pytest.raises(ValidationError):
+        SearchCodeParams.model_validate(invalid)
 
 
 # 功能：验证 NoteSaveParams 接受合法 content 字符串
