@@ -51,6 +51,15 @@ class EventSubscribeResult(BaseModel):
     replayed_count: int = 0
 
 
+class EventUnsubscribeCommand(BaseModel):
+    type: Literal["event.unsubscribe"] = "event.unsubscribe"
+    subscription_id: str
+
+
+class EventUnsubscribeResult(BaseModel):
+    removed: bool
+
+
 class SessionCreateCommand(BaseModel):
     type: Literal["session.create"] = "session.create"
     mode: SessionMode = "chat"
@@ -119,6 +128,7 @@ Command = Annotated[
     | EchoCommand
     | AgentRunCommand
     | EventSubscribeCommand
+    | EventUnsubscribeCommand
     | SessionCreateCommand
     | SessionSendMessageCommand
     | SessionGetHistoryCommand

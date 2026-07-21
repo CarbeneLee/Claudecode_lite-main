@@ -12,6 +12,8 @@ from kama_claude.core.bus.commands import (
     AgentRunResult,
     EventSubscribeCommand,
     EventSubscribeResult,
+    EventUnsubscribeCommand,
+    EventUnsubscribeResult,
     PingCommand,
     PongResult,
     SessionCloseCommand,
@@ -121,6 +123,17 @@ def generate() -> str:
         "id": "u-3",
         "result": {"subscription_id": "sub-abc123", "replayed_count": 0},
     }
+    unsubscribe_req_example = {
+        "jsonrpc": "2.0",
+        "id": "u-3b",
+        "method": "event.unsubscribe",
+        "params": {"subscription_id": "sub-abc123"},
+    }
+    unsubscribe_resp_example = {
+        "jsonrpc": "2.0",
+        "id": "u-3b",
+        "result": {"removed": True},
+    }
     session_id = "sess-abc123def456"
     session_create_req_example = {
         "jsonrpc": "2.0",
@@ -178,6 +191,18 @@ def generate() -> str:
         _model_section("EventSubscribeCommand", EventSubscribeCommand, subscribe_req_example),
         "\n",
         _model_section("EventSubscribeResult", EventSubscribeResult, subscribe_resp_example),
+        "\n",
+        _model_section(
+            "EventUnsubscribeCommand",
+            EventUnsubscribeCommand,
+            unsubscribe_req_example,
+        ),
+        "\n",
+        _model_section(
+            "EventUnsubscribeResult",
+            EventUnsubscribeResult,
+            unsubscribe_resp_example,
+        ),
         "\n",
         _model_section("SessionCreateCommand", SessionCreateCommand, session_create_req_example),
         "\n",

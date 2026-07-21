@@ -21,6 +21,7 @@ KamaClaude 将交互客户端与常驻 Core daemon 分离：CLI/TUI 负责发起
 - **Mutation-tested invocation core**：对 `tools/errors.py` 与 `tools/invocation.py` 做局部 mutation testing，而非用局部分数代表整个项目。
 - **Lifecycle cleanup**：Bash 子进程、Subagent 后台任务和 MCP 连接在超时、取消或 daemon 退出路径上执行清理。
 - **Subagent and MCP hardening**：明确前台/后台 Subagent 结果语义，并把 MCP 错误视为不可信远端输入。
+- **Connection-owned delivery**：每个 IPC connection 只有一个 writer task，并以独立有界 control/event queue 隔离慢客户端。
 - **Reproducible container runtime**：使用 digest-pinned Python/uv 输入、frozen lock、独立 test stage 和非 root Compose daemon/client 拓扑。
 
 这些改造不否定上游工作，也不意味着所有代码均由当前 fork 从零原创。上游 attribution 与 MIT 许可见文末。
@@ -42,6 +43,8 @@ KamaClaude 将交互客户端与常驻 Core daemon 分离：CLI/TUI 负责发起
 - 全局 `~/.kama/context.md`、项目 `.kama/context.md`、Session notes 分层进入 system prompt。
 - 支持 tool result 截断、上下文水位事件、自动 compact 配置和手动 `session.compact` 协议。
 - `EventBus` 将运行事件分发给 TUI/CLI、`events.jsonl` 和 trace；客户端可按 run 回放已落盘事件。
+- 每个 TCP connection 由 `ConnectionContext` 拥有 request tasks、唯一 writer 和独立有界 control/event queue；慢客户端只会耗尽并关闭自己的连接。
+- `event.unsubscribe` 只能删除当前 connection 自己拥有的 subscription；断开连接会取消并等待所属 request tasks，再移除全部 owned subscriptions。
 
 ### Built-in Tools
 
@@ -95,7 +98,7 @@ KamaClaude 将交互客户端与常驻 Core daemon 分离：CLI/TUI 负责发起
 
 ### Docker Runtime
 
-- 状态：**Implemented；locally tested on linux/arm64；linux/amd64 workflow defined but not yet executed；TUI manual pending**。
+- 状态：**Implemented；locally tested on linux/arm64；GitHub-hosted linux/amd64 workflow tested；TUI manual pending**。
 - Dockerfile 采用 `uv sync --frozen` 的两阶段 production builder：先安装 lock 中的运行时依赖，再复制并安装项目源码。
 - 独立 `test` stage 安装开发依赖并执行 unit、integration、Ruff、mypy 和 protocol-doc check；最终 runtime 只复制 production venv，不包含 `pytest` 或 `uv`。
 - `.dockerignore` 使用 default-deny allowlist，只把 Dockerfile 实际需要的源码、测试、脚本和构建元数据送入 build context；Dockerfile 的显式 `COPY` 再限制哪些输入进入 image layer。
@@ -116,6 +119,7 @@ KamaClaude 将交互客户端与常驻 Core daemon 分离：CLI/TUI 负责发起
 | Phase 6 daemon-free Docker contracts | 17 passed |
 | Docker test stage unit | 602 passed |
 | Docker test stage integration | 25 passed, 1 skipped |
+| GitHub Docker workflow | linux/amd64 build/inspect/runtime smoke succeeded（用户于 2026-07-20 确认） |
 | Host unit tests | 602 passed |
 | Host integration tests | 26 passed |
 | Ruff | passed |
@@ -128,6 +132,21 @@ KamaClaude 将交互客户端与常驻 Core daemon 分离：CLI/TUI 负责发起
 
 Earlier mutation score 只覆盖 `src/kama_claude/core/tools/errors.py` 与 `src/kama_claude/core/tools/invocation.py`，**不是整个仓库的 mutation coverage**。Phase 5/6 的 manual probes 也只证明相应测试能杀死指定 mutation。
 
+Phase 7A connection delivery closeout 的 2026-07-20 fresh verification：
+
+| Gate | Result |
+| --- | --- |
+| Phase 7A focused | 47 passed |
+| Full unit | 625 passed |
+| Full integration | 28 passed |
+| Docker contracts | 18 passed |
+| Ruff | passed |
+| mypy | 94 source files, no issues |
+| Generated wire protocol | up to date |
+| Independent review | Critical 0, Important 0, Ready |
+
+该证据证明 connection-owned single writer、资源边界、慢客户端隔离和 subscription ownership；不证明 durable cursor、自动重连、exactly-once 或 daemon restart 后 active run 恢复。
+
 ## Architecture
 
 运行时的主要数据流是：
@@ -135,6 +154,7 @@ Earlier mutation score 只覆盖 `src/kama_claude/core/tools/errors.py` 与 `src
 ```text
 CLI / TUI
   → loopback TCP + JSON-RPC 2.0 / NDJSON
+  → per-connection control/event queues + single writer
   → kama-core daemon
   → SessionManager / AgentRunner
   → AgentLoop ↔ LLM Provider
@@ -185,11 +205,14 @@ CLI / TUI
 - cancellation 保持异步控制流；Bash 在超时/取消/异常路径尝试 kill 并 reap 子进程。
 - `search_code` 将 canonical containment/policy 与逐组件 no-follow fd open 结合，stat/read 绑定同一描述符。
 - MCP unavailable/tool error 被映射为稳定、安全的本地错误摘要。
+- 单连接响应与事件由同一个 writer task 写入；control/event 容量隔离，持续 control flood 每八帧让出一次等待中的 event。
+- 单个慢客户端的 drain 或队列 overflow 只关闭该连接，不在 `EventBus.publish()` 中阻塞其他客户端。
 - Docker runtime 默认不发布无认证 daemon 端口；build context 同时受严格 `.dockerignore` 和显式 `COPY` 约束。
 
 ### 当前不保证
 
 - Core 默认监听 loopback，但这是**受信本地客户端模型**，不是多用户认证或授权系统。
+- Phase 7A 不提供 durable cursor、exactly-once delivery、response-first replay handoff、客户端自动重连或 daemon restart 后 active run 恢复。
 - Bash 的 workspace 只是启动 cwd，**不是 OS sandbox**；shell 可以通过绝对路径、父目录、子进程或网络越过 workspace。
 - MCP tools 不经过 builtin filesystem resolver/policy；其权限与隔离取决于远端 server 和启动环境。
 - 除 `search_code` 读取路径外，其他 filesystem tools 的校验与实际 I/O 间仍可能存在 TOCTOU；写入路径也未实现原子替换。
@@ -318,7 +341,7 @@ docker compose stop daemon
 docker compose down
 ```
 
-当前自动化证据覆盖本地 `linux/arm64` runtime；GitHub workflow 定义了 `linux/amd64` build/smoke，但在该 workflow 真正运行通过前不得把 amd64 标记为 Tested。smoke 使用 `SessionStore` 在 daemon recreate 前后写入并读回同一应用 artifact，只证明 package API 和 named volume persistence；它不证明 `SessionManager` 会自动 rehydrate，也不证明 daemon-level session resume。
+当前自动化证据覆盖本地 `linux/arm64` runtime，GitHub-hosted workflow 的 `linux/amd64` build/inspect/runtime smoke 也已由用户确认通过。smoke 使用 `SessionStore` 在 daemon recreate 前后写入并读回同一应用 artifact，只证明 package API 和 named volume persistence；它不证明 `SessionManager` 会自动 rehydrate，也不证明 daemon-level session resume。
 
 TUI 的交互式容器路径仍需用户在真实终端人工验收。在确认前，证据状态保持 **TUI manual pending**：
 
@@ -395,7 +418,8 @@ uv run mutmut results
 | Completed | Builtin/task producer cleanup | Bash/task error and cancellation tests |
 | Completed | Subagent/MCP lifecycle cleanup | Focused error/cancellation tests |
 | Completed | Bounded workspace `search_code` | Resource/security/cancellation unit and integration tests |
-| Completed (local arm64) | Reproducible Docker runtime | Pinned/frozen build、independent test stage、image inspect/history 和 runtime smoke |
+| Completed + Tested | Connection-owned IPC delivery isolation | Single writer、bounded queues、ownership、slow-client 和双客户端 integration tests |
+| Completed + Tested (local arm64 + CI linux/amd64) | Reproducible Docker runtime | Pinned/frozen build、independent test stage、image inspect/history 和 runtime smoke |
 
 ## Roadmap
 

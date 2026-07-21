@@ -6,12 +6,14 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 
 from pydantic import BaseModel
 
 from kama_claude.core.bus.envelope import EventPushEnvelope
 from kama_claude.core.trace.record import TraceRecord
 from kama_claude.core.trace.writer import TraceWriter
+from kama_claude.core.transport.connection import ConnectionContext
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +25,7 @@ def _now() -> str:
 @dataclass
 class _Subscription:
     sub_id: str
-    writer: asyncio.StreamWriter
+    context: ConnectionContext
     topics: list[str]
     scope: str
 
@@ -36,26 +38,40 @@ class IpcEventBroadcaster:
     # 注册一个客户端订阅，返回 subscription_id
     def subscribe(
         self,
-        writer: asyncio.StreamWriter,
+        context: ConnectionContext,
         topics: list[str],
         scope: str = "global",
     ) -> str:
+        context.ensure_open_for_subscription()
         sub_id = f"sub-{uuid.uuid4().hex[:8]}"
-        sub = _Subscription(sub_id=sub_id, writer=writer, topics=topics, scope=scope)
+        sub = _Subscription(
+            sub_id=sub_id,
+            context=context,
+            topics=topics,
+            scope=scope,
+        )
         self._subscriptions.append(sub)
         return sub_id
 
-    # 移除指定 writer 的所有订阅
-    def unsubscribe(self, writer: asyncio.StreamWriter) -> None:
-        self._subscriptions = [s for s in self._subscriptions if s.writer is not writer]
+    # 仅由所属 connection 删除指定 subscription_id
+    def unsubscribe(self, context: ConnectionContext, sub_id: str) -> bool:
+        for index, sub in enumerate(self._subscriptions):
+            if sub.context is context and sub.sub_id == sub_id:
+                del self._subscriptions[index]
+                return True
+        return False
+
+    # 移除指定 connection 拥有的全部订阅
+    def unsubscribe_all(self, context: ConnectionContext) -> None:
+        self._subscriptions = [
+            sub for sub in self._subscriptions if sub.context is not context
+        ]
 
     # 将事件推送到所有匹配的订阅客户端，写入失败时延迟清理死连接
     async def handle(self, event: BaseModel) -> None:
         event_dict = event.model_dump()
         event_type: str = event_dict.get("type", "")
         run_id: str | None = event_dict.get("run_id")
-
-        dead: list[asyncio.StreamWriter] = []
 
         for sub in list(self._subscriptions):
             if not self._matches_topic(event_type, sub.topics):
@@ -64,27 +80,53 @@ class IpcEventBroadcaster:
                 continue
             try:
                 envelope = EventPushEnvelope(event=event_dict)
-                sub.writer.write(envelope.model_dump_json().encode() + b"\n")
-                await sub.writer.drain()
-                if self._trace is not None:
-                    client_id = str(sub.writer.get_extra_info("peername", "<unknown>"))
-                    self._trace.emit(
-                        TraceRecord(
-                            ts=_now(),
-                            direction="CORE→CLIENT",
-                            layer="ipc",
-                            kind="push",
-                            run_id=run_id,
-                            client_id=client_id,
-                            data={"sub_id": sub.sub_id, "event_type": event_type},
-                        )
+                receipt = sub.context.enqueue_event(
+                    envelope,
+                    on_written=partial(
+                        self._emit_trace,
+                        sub.context,
+                        sub.sub_id,
+                        event_type,
+                        run_id,
                     )
-            except (ConnectionResetError, BrokenPipeError, OSError):
-                logger.debug("dead connection for sub %s, scheduling cleanup", sub.sub_id)
-                dead.append(sub.writer)
+                )
+                receipt.written.add_done_callback(self._observe_delivery)
+            except (ConnectionError, ValueError):
+                logger.warning(
+                    "event enqueue failed connection_id=%s sub_id=%s role=live",
+                    sub.context.connection_id,
+                    sub.sub_id,
+                )
+                self.unsubscribe_all(sub.context)
 
-        for writer in dead:
-            self.unsubscribe(writer)
+    # 观察 fire-and-forget live receipt 的终态，避免失败 Future 产生全局 warning
+    @staticmethod
+    def _observe_delivery(future: asyncio.Future[None]) -> None:
+        if future.cancelled():
+            return
+        future.exception()
+
+    # 在对应 event frame 成功 drain 后写入安全 trace 元数据
+    def _emit_trace(
+        self,
+        context: ConnectionContext,
+        sub_id: str,
+        event_type: str,
+        run_id: str | None,
+    ) -> None:
+        if self._trace is None:
+            return
+        self._trace.emit(
+            TraceRecord(
+                ts=_now(),
+                direction="CORE→CLIENT",
+                layer="ipc",
+                kind="push",
+                run_id=run_id,
+                client_id=str(context.peername),
+                data={"sub_id": sub_id, "event_type": event_type},
+            )
+        )
 
     # 检查事件类型是否匹配订阅的 topic 列表（支持 fnmatch glob 模式）
     @staticmethod

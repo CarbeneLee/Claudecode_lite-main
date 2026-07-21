@@ -297,6 +297,82 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
 }
 ```
 
+### EventUnsubscribeCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `subscription_id` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "event.unsubscribe",
+      "default": "event.unsubscribe",
+      "title": "Type",
+      "type": "string"
+    },
+    "subscription_id": {
+      "title": "Subscription Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "subscription_id"
+  ],
+  "title": "EventUnsubscribeCommand",
+  "type": "object"
+}
+```
+
+**Example:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "u-3b",
+  "method": "event.unsubscribe",
+  "params": {
+    "subscription_id": "sub-abc123"
+  }
+}
+```
+
+### EventUnsubscribeResult
+
+| Field | Type | Required |
+|---|---|---|
+| `removed` | `boolean` | yes |
+
+```json
+{
+  "properties": {
+    "removed": {
+      "title": "Removed",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "removed"
+  ],
+  "title": "EventUnsubscribeResult",
+  "type": "object"
+}
+```
+
+**Example:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "u-3b",
+  "result": {
+    "removed": true
+  }
+}
+```
+
 ### SessionCreateCommand
 
 | Field | Type | Required |

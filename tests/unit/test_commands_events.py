@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
+from kama_claude.core.bus import commands as commands_module
 from kama_claude.core.bus.commands import (
     AgentRunCommand,
     Command,
@@ -123,3 +124,29 @@ def test_core_started_event_roundtrip() -> None:
     evt2 = CoreStartedEvent.model_validate_json(evt.model_dump_json())
     assert evt2.listen_addr == "127.0.0.1:7437"
     assert evt2.type == "core.started"
+
+
+# 功能：验证 event.unsubscribe 命令可通过 Command 判别联合往返
+# 设计：使用真实 subscription_id 序列化，防止模型存在但遗漏 union 接线
+def test_event_unsubscribe_roundtrip_through_command_union() -> None:
+    model = getattr(commands_module, "EventUnsubscribeCommand", None)
+    assert model is not None
+    command = model(subscription_id="sub-12345678")
+
+    restored = TypeAdapter(Command).validate_json(command.model_dump_json())
+
+    assert isinstance(restored, model)
+    assert restored.subscription_id == "sub-12345678"
+
+
+# 功能：验证 event.unsubscribe result 明确区分已删除与不可见订阅
+# 设计：对 true/false 两种结果做 JSON 往返，锁定不泄漏 ownership 之外信息的单一布尔字段
+@pytest.mark.parametrize("removed", [True, False])
+def test_event_unsubscribe_result_roundtrip(removed: bool) -> None:
+    model = getattr(commands_module, "EventUnsubscribeResult", None)
+    assert model is not None
+    result = model(removed=removed)
+
+    restored = model.model_validate_json(result.model_dump_json())
+
+    assert restored.removed is removed

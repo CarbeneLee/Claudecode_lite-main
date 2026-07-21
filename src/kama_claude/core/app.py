@@ -21,6 +21,8 @@ from kama_claude.core.bus.commands import (
     EchoResult,
     EventSubscribeCommand,
     EventSubscribeResult,
+    EventUnsubscribeCommand,
+    EventUnsubscribeResult,
     PermissionRespondCommand,
     PermissionRespondResult,
     PongResult,
@@ -48,8 +50,9 @@ from kama_claude.core.runs import events_file, new_run_id
 from kama_claude.core.session import SessionManager, SessionStore
 from kama_claude.core.trace.record import TraceRecord
 from kama_claude.core.trace.writer import TraceWriter
+from kama_claude.core.transport.connection import ConnectionContext
 from kama_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
-from kama_claude.core.transport.socket_server import SocketServer, get_connection_writer
+from kama_claude.core.transport.socket_server import SocketServer, get_connection_context
 from kama_claude.core.workspace.errors import INVALID_WORKSPACE, InvalidWorkspaceError
 from kama_claude.core.workspace.validation import validate_workspace_root
 
@@ -195,23 +198,37 @@ class CoreApp:
     # 注册客户端事件订阅，可选先回放 events.jsonl 历史再接收实时流
     async def _subscribe_handler(self, params: dict[str, Any]) -> EventSubscribeResult:
         cmd = EventSubscribeCommand.model_validate(params)
-        writer = get_connection_writer()
+        context = get_connection_context()
+        context.ensure_open_for_subscription()
 
         replayed_count = 0
         if cmd.replay_from_run is not None:
             replayed_count = await self._replay_events(
-                cmd.replay_from_run, writer, cmd.topics
+                cmd.replay_from_run,
+                context,
+                cmd.topics,
             )
 
         assert self._broadcaster is not None
-        sub_id = self._broadcaster.subscribe(writer, cmd.topics, cmd.scope)
+        sub_id = self._broadcaster.subscribe(context, cmd.topics, cmd.scope)
         return EventSubscribeResult(subscription_id=sub_id, replayed_count=replayed_count)
 
-    # 从 events.jsonl 向 writer 回放匹配 topic 的历史事件，返回已回放条数
+    # 删除当前 connection 自己拥有的 subscription_id
+    async def _unsubscribe_handler(
+        self,
+        params: dict[str, Any],
+    ) -> EventUnsubscribeResult:
+        cmd = EventUnsubscribeCommand.model_validate(params)
+        context = get_connection_context()
+        assert self._broadcaster is not None
+        removed = self._broadcaster.unsubscribe(context, cmd.subscription_id)
+        return EventUnsubscribeResult(removed=removed)
+
+    # 从 events.jsonl 经 event queue 回放匹配历史并等待 drain
     async def _replay_events(
         self,
         run_id: str,
-        writer: asyncio.StreamWriter,
+        context: ConnectionContext,
         topics: list[str],
     ) -> int:
         path = events_file(run_id)
@@ -225,6 +242,7 @@ class CoreApp:
             return 0
 
         count = 0
+        written: list[asyncio.Future[None]] = []
         for line in path.read_text().splitlines():
             if not line:
                 continue
@@ -236,11 +254,12 @@ class CoreApp:
             if not any(fnmatch.fnmatch(event_type, p) for p in topics):
                 continue
             envelope = EventPushEnvelope(event=event)
-            writer.write(envelope.model_dump_json().encode() + b"\n")
+            receipt = context.enqueue_event(envelope)
+            written.append(receipt.written)
             count += 1
 
-        if count:
-            await writer.drain()
+        if written:
+            await asyncio.gather(*written)
         return count
 
     # 启动守护进程：加载配置、初始化日志、启动 trace、启动 TCP 服务器，并等待退出信号
@@ -304,6 +323,7 @@ class CoreApp:
         server.register("core.echo", self._echo_handler)
         server.register("agent.run", self._agent_run_handler)
         server.register("event.subscribe", self._subscribe_handler)
+        server.register("event.unsubscribe", self._unsubscribe_handler)
         server.register("session.create", self._session_create_handler)
         server.register("session.send_message", self._session_send_handler)
         server.register("session.get_history", self._session_history_handler)
