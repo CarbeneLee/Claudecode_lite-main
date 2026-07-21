@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import datetime
-import fnmatch
-import json
 import logging
 import signal
 import time
@@ -37,22 +35,26 @@ from kama_claude.core.bus.commands import (
     SessionSendMessageCommand,
     SessionSendMessageResult,
 )
-from kama_claude.core.bus.envelope import EventPushEnvelope, HandlerError
+from kama_claude.core.bus.envelope import INVALID_PARAMS, HandlerError
 from kama_claude.core.config import KamaConfig, get_config
 from kama_claude.core.events.bus import EventBus
+from kama_claude.core.events.journal import EventJournalCoordinator
 from kama_claude.core.llm.provider import AnthropicProvider
 from kama_claude.core.logging_setup import setup_logging
 from kama_claude.core.mcp.server import McpServerManager
 from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.permissions.storage import load_policy_file
 from kama_claude.core.runner import AgentRunner
-from kama_claude.core.runs import events_file, new_run_id
+from kama_claude.core.runs import new_run_id
 from kama_claude.core.session import SessionManager, SessionStore
 from kama_claude.core.trace.record import TraceRecord
 from kama_claude.core.trace.writer import TraceWriter
-from kama_claude.core.transport.connection import ConnectionContext
 from kama_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
-from kama_claude.core.transport.socket_server import SocketServer, get_connection_context
+from kama_claude.core.transport.socket_server import (
+    HandlerOutcome,
+    SocketServer,
+    get_connection_context,
+)
 from kama_claude.core.workspace.errors import INVALID_WORKSPACE, InvalidWorkspaceError
 from kama_claude.core.workspace.validation import validate_workspace_root
 
@@ -68,6 +70,7 @@ class CoreApp:
         self._start_time = time.monotonic()
         self._bus = EventBus()
         self._broadcaster: IpcEventBroadcaster | None = None
+        self._journal: EventJournalCoordinator | None = None
         self._trace: TraceWriter | None = None
         self._config: KamaConfig | None = None
         self._running_runs: set[asyncio.Task[Any]] = set()
@@ -110,7 +113,7 @@ class CoreApp:
             )
         )
 
-    # 启动一次 agent run：异步创建 AgentRunner 并立即返回 run_id
+    # 启动一次 agent run：在 durable owner 注册后返回 run_id
     async def _agent_run_handler(self, params: dict[str, Any]) -> AgentRunResult:
         assert self._sessions is not None
         cmd = AgentRunCommand.model_validate(params)
@@ -128,12 +131,90 @@ class CoreApp:
             workspace_root=workspace_root,
         )
         run_id = new_run_id()
-        run_task = asyncio.create_task(
-            self._sessions.send_message(session.id, cmd.goal, run_id=run_id)
-        )
+        run_registered: asyncio.Event | None = None
+        if self._journal is None:
+            run_task = asyncio.create_task(
+                self._sessions.send_message(session.id, cmd.goal, run_id=run_id)
+            )
+        else:
+            run_registered = asyncio.Event()
+            run_task = asyncio.create_task(
+                self._sessions.send_message(
+                    session.id,
+                    cmd.goal,
+                    run_id=run_id,
+                    run_registered=run_registered,
+                )
+            )
         self._running_runs.add(run_task)
         run_task.add_done_callback(self._running_runs.discard)
+        if run_registered is not None:
+            try:
+                await self._await_run_registration(run_task, run_registered)
+            except asyncio.CancelledError:
+                await self._close_unexposed_session(session.id)
+                raise
+            except Exception:
+                await self._close_unexposed_session(session.id)
+                raise
         return AgentRunResult(run_id=run_id)
+
+    # 等待 run durable owner 注册，外层取消时回收 detached run 并保留原异常
+    async def _await_run_registration(
+        self,
+        run_task: asyncio.Task[Any],
+        run_registered: asyncio.Event,
+    ) -> None:
+        registered_waiter = asyncio.create_task(run_registered.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {run_task, registered_waiter},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if registered_waiter in done:
+                return
+            await run_task
+            raise RuntimeError("run registration handshake was not completed")
+        except asyncio.CancelledError:
+            run_task.cancel()
+            await self._await_secondary_task(run_task, role="run_startup")
+            raise
+        finally:
+            registered_waiter.cancel()
+            await self._await_secondary_task(
+                registered_waiter,
+                role="registration_waiter",
+                log_failure=False,
+            )
+
+    # 将未向客户端暴露的 one-shot session 收敛到 durable closed 终态
+    async def _close_unexposed_session(self, session_id: str) -> None:
+        assert self._sessions is not None
+        close_task = asyncio.create_task(self._sessions.close(session_id))
+        await self._await_secondary_task(close_task, role="session_startup_cleanup")
+
+    @staticmethod
+    # 屏蔽重复取消并等待 cleanup task 终态，失败时只记录脱敏 secondary
+    async def _await_secondary_task(
+        task: asyncio.Task[Any],
+        *,
+        role: str,
+        log_failure: bool = True,
+    ) -> None:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            if log_failure:
+                logger.error("startup cleanup failed role=%s", role)
 
     # 创建 chat 或 one_shot session，并返回 session_id
     async def _session_create_handler(self, params: dict[str, Any]) -> SessionCreateResult:
@@ -195,23 +276,48 @@ class CoreApp:
         await self._sessions.close(cmd.session_id)
         return SessionCloseResult(status="closed")
 
-    # 注册客户端事件订阅，可选先回放 events.jsonl 历史再接收实时流
-    async def _subscribe_handler(self, params: dict[str, Any]) -> EventSubscribeResult:
+    # 注册 live 或 response-first durable replay subscription
+    async def _subscribe_handler(
+        self,
+        params: dict[str, Any],
+    ) -> EventSubscribeResult | HandlerOutcome:
         cmd = EventSubscribeCommand.model_validate(params)
         context = get_connection_context()
         context.ensure_open_for_subscription()
-
-        replayed_count = 0
-        if cmd.replay_from_run is not None:
-            replayed_count = await self._replay_events(
-                cmd.replay_from_run,
-                context,
-                cmd.topics,
-            )
-
         assert self._broadcaster is not None
-        sub_id = self._broadcaster.subscribe(context, cmd.topics, cmd.scope)
-        return EventSubscribeResult(subscription_id=sub_id, replayed_count=replayed_count)
+        durable_stream: str | None = None
+        after_seq: int | None = cmd.after_seq
+        if cmd.replay_from_run is not None:
+            durable_stream = f"run:{cmd.replay_from_run}"
+            after_seq = cmd.after_seq or 0
+        elif cmd.after_seq is not None:
+            if not cmd.scope.startswith(("run:", "session:")):
+                raise HandlerError(
+                    INVALID_PARAMS,
+                    "after_seq requires run: or session: scope",
+                )
+            durable_stream = cmd.scope
+
+        if durable_stream is None:
+            sub_id = self._broadcaster.subscribe(context, cmd.topics, cmd.scope)
+            return EventSubscribeResult(subscription_id=sub_id)
+
+        assert self._journal is not None
+        prepared = await self._broadcaster.prepare_durable_subscription(
+            self._journal,
+            context,
+            topics=cmd.topics,
+            stream_id=durable_stream,
+            after_seq=after_seq or 0,
+        )
+        result = EventSubscribeResult(
+            subscription_id=prepared.subscription_id,
+            replayed_count=0,
+            stream_id=prepared.stream_id,
+            accepted_after_seq=prepared.accepted_after_seq,
+            high_watermark_seq=prepared.high_watermark_seq,
+        )
+        return HandlerOutcome(result=result, post_response=prepared.activation)
 
     # 删除当前 connection 自己拥有的 subscription_id
     async def _unsubscribe_handler(
@@ -224,43 +330,19 @@ class CoreApp:
         removed = self._broadcaster.unsubscribe(context, cmd.subscription_id)
         return EventUnsubscribeResult(removed=removed)
 
-    # 从 events.jsonl 经 event queue 回放匹配历史并等待 drain
-    async def _replay_events(
-        self,
-        run_id: str,
-        context: ConnectionContext,
-        topics: list[str],
-    ) -> int:
-        path = events_file(run_id)
-        if not path.exists():
-            for candidate in Path("~/.kama/sessions").expanduser().glob(
-                f"*/runs/{run_id}/events.jsonl"
-            ):
-                path = candidate
-                break
-        if not path.exists():
-            return 0
-
-        count = 0
-        written: list[asyncio.Future[None]] = []
-        for line in path.read_text().splitlines():
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            event_type: str = event.get("type", "")
-            if not any(fnmatch.fnmatch(event_type, p) for p in topics):
-                continue
-            envelope = EventPushEnvelope(event=event)
-            receipt = context.enqueue_event(envelope)
-            written.append(receipt.written)
-            count += 1
-
-        if written:
-            await asyncio.gather(*written)
-        return count
+    # 先停止连接请求和 detached runs，再关闭 MCP、journal 与 trace
+    async def _shutdown(self, server: SocketServer) -> None:
+        for run_task in list(self._running_runs):
+            run_task.cancel()
+        if self._running_runs:
+            await asyncio.gather(*self._running_runs, return_exceptions=True)
+        await server.stop()
+        if self._mcp_manager is not None:
+            await self._mcp_manager.stop_all()
+        if self._journal is not None:
+            await self._journal.close()
+        if self._trace is not None:
+            await self._trace.stop()
 
     # 启动守护进程：加载配置、初始化日志、启动 trace、启动 TCP 服务器，并等待退出信号
     async def run(self) -> None:
@@ -288,7 +370,12 @@ class CoreApp:
         )
 
         self._broadcaster = IpcEventBroadcaster(trace=self._trace)
-        self._bus.subscribe(self._broadcaster.handle)
+        self._journal = EventJournalCoordinator(
+            on_durable=self._broadcaster.publish_durable,
+            on_live_only=self._broadcaster.publish_live_only,
+            on_stream_failure=self._broadcaster.fail_stream,
+        )
+        self._bus.subscribe(self._journal.handle)
         sessions_root = Path("~/.kama/sessions").expanduser()
         store = SessionStore(sessions_root)
         assert self._config is not None
@@ -308,10 +395,12 @@ class CoreApp:
                 trace=self._trace,
                 permission_manager=self._permission_manager,
                 mcp_manager=self._mcp_manager,
+                journal=self._journal,
             ),
             bus=self._bus,
             provider=compact_provider,
         )
+        self._sessions.attach_journal(self._journal)
 
         server = SocketServer(
             self._config.host,
@@ -343,15 +432,7 @@ class CoreApp:
         await shutdown.wait()
 
         logger.info("shutting down")
-        for run_task in list(self._running_runs):
-            run_task.cancel()
-        if self._running_runs:
-            await asyncio.gather(*self._running_runs, return_exceptions=True)
-        if self._mcp_manager is not None:
-            await self._mcp_manager.stop_all()
-        await server.stop()
-        if self._trace is not None:
-            await self._trace.stop()
+        await self._shutdown(server)
 
 
 # 同步入口：启动 CoreApp 事件循环

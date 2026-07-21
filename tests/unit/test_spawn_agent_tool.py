@@ -55,6 +55,7 @@ def _make_tool(
     tmp_path: Path,
     provider: Any = None,
     depth: int = 0,
+    journal: Any = None,
 ) -> tuple[SpawnAgentTool, BackgroundTaskRegistry, EventBus]:
     bus = EventBus()
     registry = BackgroundTaskRegistry()
@@ -69,8 +70,45 @@ def _make_tool(
         runs_dir=tmp_path,
         session_id="sess-test",
         depth=depth,
+        journal=journal,
     )
     return tool, registry, bus
+
+
+# 功能：验证 child run stream 注册严格早于 SubagentStartedEvent 发布
+# 设计：fake journal 与真实 parent bus 共享顺序列表，执行最短前台 child lifecycle 比较边界顺序
+async def test_child_stream_registers_before_subagent_started(tmp_path: Path) -> None:
+    order: list[str] = []
+
+    class RecordingJournal:
+        # 记录 child run owner 与 parent session mapping 注册
+        async def register_run(
+            self,
+            run_id: str,
+            run_path: Path,
+            *,
+            session_id: str | None,
+        ) -> object:
+            order.append(f"register:{run_id}:{session_id}")
+            return object()
+
+    tool, _registry, bus = _make_tool(tmp_path, journal=RecordingJournal())
+
+    async def collect(event: object) -> None:
+        if isinstance(event, SubagentStartedEvent):
+            order.append(f"event:{event.run_id}")
+
+    bus.subscribe(collect)
+
+    await tool.invoke({"description": "child", "prompt": "finish"})
+
+    register_index = next(
+        index for index, item in enumerate(order) if item.startswith("register:")
+    )
+    event_index = next(
+        index for index, item in enumerate(order) if item.startswith("event:")
+    )
+    assert register_index < event_index
 
 
 # 功能：验证 SpawnAgentTool 必须显式接收 workspace_root

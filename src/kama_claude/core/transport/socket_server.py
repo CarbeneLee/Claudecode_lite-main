@@ -6,8 +6,9 @@ import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
 
 from pydantic import BaseModel, ValidationError
 
@@ -29,11 +30,26 @@ from kama_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
 
 logger = logging.getLogger(__name__)
 
+class PostResponseActivation(Protocol):
+    # 在 response frame 成功 drain 后启动后续 delivery lifecycle
+    async def on_written(self) -> None: ...
+
+    # 在 response 构造、入队或写入失败时清理尚未 activation 的状态
+    async def on_failure(self, exc: BaseException) -> None: ...
+
+
+@dataclass(frozen=True)
+class HandlerOutcome:
+    result: BaseModel | dict[str, Any]
+    post_response: PostResponseActivation | None = None
+
+
 type CommandHandler = Callable[[dict[str, Any]], Awaitable[Any]]
 
 _connection_var: ContextVar[ConnectionContext] = ContextVar("_connection_var")
 
 
+# 生成 UTC ISO timestamp 供安全 trace 使用
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -46,6 +62,7 @@ _MAX_LINE_BYTES = 64 * 1024 * 1024  # 64 MB per frame，兼容 MCP 大文件工�
 
 
 class SocketServer:
+    # 初始化 TCP server、handler registry、trace 与 connection 集合
     def __init__(
         self,
         host: str,
@@ -210,8 +227,8 @@ class SocketServer:
                 make_error(req.id, INVALID_REQUEST, "Invalid params", str(e)),
             )
             return
-        except Exception as e:
-            logger.exception("handler %s raised: %s", req.method, e)
+        except Exception:
+            logger.error("handler failed method=%s role=handler", req.method)
             await self._send(
                 context,
                 make_error(req.id, INTERNAL_ERROR, "Internal error"),
@@ -220,11 +237,47 @@ class SocketServer:
         finally:
             _connection_var.reset(connection_token)
 
+        post_response: PostResponseActivation | None = None
+        if isinstance(result, HandlerOutcome):
+            post_response = result.post_response
+            result = result.result
         result_data: Any = result.model_dump() if isinstance(result, BaseModel) else result
         try:
             await self._send(context, JsonRpcSuccess(id=req.id, result=result_data))
-        except (ConnectionError, OSError):
+        except asyncio.CancelledError as exc:
+            if post_response is not None:
+                await self._notify_response_failure(post_response, exc)
+            raise
+        except (ConnectionError, OSError, TypeError, ValueError) as exc:
+            if post_response is not None:
+                await self._notify_response_failure(post_response, exc)
             logger.debug("client disconnected before response for %s", req.method)
+            return
+
+        if post_response is not None:
+            try:
+                await post_response.on_written()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error(
+                    "post-response activation failed method=%s role=activation",
+                    req.method,
+                )
+                context.initiate_close("post-response activation failure")
+
+    @staticmethod
+    # 运行 response failure cleanup，secondary 失败不得覆盖 primary 对象
+    async def _notify_response_failure(
+        activation: PostResponseActivation,
+        primary: BaseException,
+    ) -> None:
+        try:
+            await activation.on_failure(primary)
+        except asyncio.CancelledError:
+            logger.warning("response failure cleanup cancelled role=post_response")
+        except Exception:
+            logger.error("response failure cleanup failed role=post_response")
 
     # 将响应放入 control queue 并等待唯一 writer 完成 drain
     async def _send(self, context: ConnectionContext, msg: BaseModel) -> None:

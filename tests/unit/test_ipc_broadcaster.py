@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import gc
 import json
+from pathlib import Path
 from typing import cast
 
 import pytest
 
 from kama_claude.core.bus.events import RunStartedEvent, StepStartedEvent
+from kama_claude.core.events.journal import EventJournalCoordinator
 from kama_claude.core.transport.connection import (
     MAX_EVENT_FRAMES,
     ConnectionContext,
@@ -131,21 +133,26 @@ async def test_topic_glob_matches_step_not_run() -> None:
     assert cast(dict[str, object], _last_envelope(writer)["event"])["type"] == "step.started"
 
 
-# 功能：验证 global scope 接收不同 run_id 且 run scope 只接收目标 run
-# 设计：两个真实 context 共享 broadcaster，分别断言全局两帧与局部一帧
-async def test_scope_filters_preserve_existing_semantics() -> None:
+# 功能：验证 durable callback 中 global scope 接收不同 run 且 run scope 只接收目标 stream
+# 设计：两个真实 run journal 共享 broadcaster，证明 scoped live 不再绕过 append+flush 生产路径
+async def test_scope_filters_preserve_existing_semantics(tmp_path: Path) -> None:
     broadcaster = IpcEventBroadcaster()
+    coordinator = EventJournalCoordinator(on_durable=broadcaster.publish_durable)
+    await coordinator.register_run("r1", tmp_path / "r1", session_id=None)
+    await coordinator.register_run("r2", tmp_path / "r2", session_id=None)
     global_context, global_writer = _make_context("conn-global")
     run_context, run_writer = _make_context("conn-run")
     broadcaster.subscribe(global_context, topics=["run.*"], scope="global")
     broadcaster.subscribe(run_context, topics=["run.*"], scope="run:r1")
 
-    await broadcaster.handle(_run_started("r1"))
-    await broadcaster.handle(_run_started("r2"))
+    await coordinator.handle(_run_started("r1"))
+    await coordinator.handle(_run_started("r2"))
+    await coordinator.flush_all()
     while len(global_writer.frames) < 2 or len(run_writer.frames) < 1:
         await asyncio.sleep(0)
     await global_context.close("test complete")
     await run_context.close("test complete")
+    await coordinator.close()
 
     assert len(global_writer.frames) == 2
     assert len(run_writer.frames) == 1

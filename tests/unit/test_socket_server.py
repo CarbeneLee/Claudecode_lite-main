@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import socket
 from typing import Any, cast
+
+import pytest
 
 from kama_claude.core.transport.socket_server import (
     SocketServer,
@@ -323,3 +326,39 @@ async def test_writer_failure_removes_subscription_before_reader_loop_exits() ->
     finally:
         reader.eof.set()
         await connection_task
+
+
+# 功能：验证未知 handler 异常返回安全内部错误且日志不泄漏路径或 secret
+# 设计：通过真实 TCP request 抛出含敏感文本的 PermissionError，同时检查 response 和 caplog
+async def test_unknown_handler_exception_is_redacted_from_log_and_response(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "startup-secret"
+    private_path = "/private/journal"
+    failure = PermissionError(f"{private_path} token={secret}")
+
+    # 抛出固定异常对象以命中 SocketServer 的未知 handler 边界
+    async def failing_handler(params: dict[str, Any]) -> dict[str, bool]:
+        raise failure
+
+    port = _free_port()
+    server = SocketServer("127.0.0.1", port)
+    server.register("test.failure", failing_handler)
+    await server.start()
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    caplog.set_level(logging.ERROR, logger="kama_claude.core.transport.socket_server")
+
+    try:
+        await _send_request(writer, "test.failure")
+        response = json.loads(await reader.readline())
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        await server.stop()
+
+    assert response["error"]["message"] == "Internal error"
+    assert secret not in json.dumps(response)
+    assert private_path not in json.dumps(response)
+    assert secret not in caplog.text
+    assert private_path not in caplog.text
+    assert "handler failed method=test.failure role=handler" in caplog.text

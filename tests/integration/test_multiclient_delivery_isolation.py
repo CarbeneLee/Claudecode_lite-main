@@ -80,37 +80,21 @@ async def test_subscription_ownership_and_disconnect_isolation(
         await client_b.close()
 
 
-# 功能：验证 7A legacy replay event frames 仍严格早于 subscribe success response
-# 设计：先用真实 run 生成完整 journal，再用 raw TCP 按 NDJSON 顺序读取直到对应 response
-async def test_legacy_replay_remains_before_subscribe_response(
+# 功能：验证 7B replay event frames 严格晚于包含 high watermark 的 subscribe success response
+# 设计：run 创建后立即订阅其 durable stream，让 high=0 的 live 与 high>0 的 replay 分支共用响应屏障
+async def test_durable_replay_starts_after_subscribe_response(
     running_daemon: subprocess.Popen[bytes],
     free_port: int,
     tmp_path: Path,
 ) -> None:
     producer = SocketClient("127.0.0.1", free_port)
     await producer.connect()
-    run_started = asyncio.Event()
-    run_id_holder: list[str] = []
-
-    # 等待 LLM 调用前同步 flush 的 started event，避免把外部 provider 延迟引入交付测试
-    async def on_event(event: dict[str, Any]) -> None:
-        if event.get("type") == "run.started":
-            run_id_holder.append(str(event["run_id"]))
-            run_started.set()
-
-    producer.on_event(on_event)
     producer_loop = asyncio.create_task(producer.run_event_loop())
     try:
-        await producer.send_command(
-            "event.subscribe",
-            {"topics": ["run.*"], "scope": "global"},
-        )
         result = await producer.send_command(
             "agent.run",
-            {"goal": "legacy ordering", "workspace_root": str(tmp_path.resolve())},
+            {"goal": "durable response ordering", "workspace_root": str(tmp_path.resolve())},
         )
-        await asyncio.wait_for(run_started.wait(), timeout=5.0)
-        assert result["run_id"] in run_id_holder
     finally:
         producer_loop.cancel()
         await asyncio.gather(producer_loop, return_exceptions=True)
@@ -124,27 +108,27 @@ async def test_legacy_replay_remains_before_subscribe_response(
         "method": "event.subscribe",
         "params": {
             "topics": ["run.*"],
-            "scope": "global",
-            "replay_from_run": result["run_id"],
+            "scope": f"run:{result['run_id']}",
+            "after_seq": 0,
         },
     }
     writer.write(json.dumps(request).encode() + b"\n")
     await writer.drain()
-    frames: list[dict[str, Any]] = []
-
     try:
-        while True:
-            line = await asyncio.wait_for(reader.readline(), timeout=5.0)
-            assert line
-            frame = json.loads(line)
-            frames.append(frame)
-            if frame.get("id") == request_id:
-                break
+        response_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+        assert response_line
+        response = json.loads(response_line)
+        frame = json.loads(await asyncio.wait_for(reader.readline(), timeout=5.0))
     finally:
         writer.close()
         await writer.wait_closed()
 
-    assert frames[-1]["id"] == request_id
-    assert frames[-1]["result"]["replayed_count"] == len(frames) - 1
-    assert all(frame.get("kind") == "event" for frame in frames[:-1])
-    assert frames[:-1]
+    assert response["id"] == request_id
+    assert response["result"]["stream_id"] == f"run:{result['run_id']}"
+    high_watermark = response["result"]["high_watermark_seq"]
+    assert response["result"]["replayed_count"] == 0
+    assert frame.get("kind") == "event"
+    assert frame.get("stream_id") == f"run:{result['run_id']}"
+    assert frame.get("seq") == 1
+    assert frame.get("event", {}).get("type") == "run.started"
+    assert frame.get("delivery") == ("replay" if high_watermark else "live")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -35,6 +36,28 @@ class _Runner:
         return RunOutcome(status="success", result="done", reason=None)
 
 
+class _RecordingJournal:
+    # 初始化 lifecycle 调用顺序记录
+    def __init__(self, order: list[str]) -> None:
+        self.order = order
+
+    # 记录 session stream owner 在首事件前注册
+    async def register_session(self, session_id: str, session_path: Path) -> object:
+        self.order.append(f"register:session:{session_id}")
+        return object()
+
+    # 记录 run stream 与 parent session mapping 在首 run 事件前注册
+    async def register_run(
+        self,
+        run_id: str,
+        run_path: Path,
+        *,
+        session_id: str | None,
+    ) -> object:
+        self.order.append(f"register:run:{run_id}:{session_id}")
+        return object()
+
+
 # 功能：验证 create 会创建 active session、写入 meta 并发布 session.created 事件
 # 设计：用真实 SessionStore + EventBus 收集事件，覆盖 manager 与 store/bus 的协作边界
 async def test_create_session_writes_meta_and_event(tmp_path: Path) -> None:
@@ -60,6 +83,65 @@ async def test_create_session_writes_meta_and_event(tmp_path: Path) -> None:
     assert store.read_meta(session.id).title == "title"
     assert store.read_meta(session.id).workspace_root == workspace_root
     assert [e.type for e in events] == ["session.created"]  # type: ignore[attr-defined]
+
+
+# 功能：验证 session stream owner 注册严格早于 session.created 发布与 meta 后续使用
+# 设计：journal 与 bus 共享顺序列表，比较注册和真实 event handler 的先后而非 mock 调用次数
+async def test_session_stream_registers_before_session_created_event(tmp_path: Path) -> None:
+    order: list[str] = []
+    bus = EventBus()
+
+    # 把首个 session event 写入共享顺序记录
+    async def collect(event: Any) -> None:
+        order.append(f"event:{event.type}")
+
+    bus.subscribe(collect)
+    manager = SessionManager(
+        SessionStore(tmp_path / "sessions"),
+        cast(Any, lambda _workspace_root: _Runner()),
+        bus,
+        journal=cast(Any, _RecordingJournal(order)),
+    )
+
+    session = await manager.create("chat", workspace_root=tmp_path.resolve())
+
+    assert order.index(f"register:session:{session.id}") < order.index(
+        "event:session.created"
+    )
+
+
+# 功能：验证 slash skill 的 run stream/mapping 注册严格早于 skill.invoked
+# 设计：使用真实 skill loader 触发第一个 run-bound event，并在共享顺序列表中比较生命周期边界
+async def test_run_stream_registers_before_skill_invoked_event(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    skill_dir = workspace / ".kama" / "skills"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "demo.md").write_text(
+        "---\nname: demo\ndescription: demo\n---\nDo $ARGUMENTS\n",
+        encoding="utf-8",
+    )
+    order: list[str] = []
+    bus = EventBus()
+
+    # 把首个 run-bound skill event 写入共享顺序记录
+    async def collect(event: Any) -> None:
+        order.append(f"event:{event.type}")
+
+    bus.subscribe(collect)
+    store = SessionStore(tmp_path / "sessions")
+    manager = SessionManager(
+        store,
+        cast(Any, lambda _workspace_root: _Runner()),
+        bus,
+        journal=cast(Any, _RecordingJournal(order)),
+    )
+    session = await manager.create("chat", workspace_root=workspace.resolve())
+
+    run_id = await manager.send_message(session.id, "/demo now")
+
+    assert order.index(f"register:run:{run_id}:{session.id}") < order.index(
+        "event:skill.invoked"
+    )
 
 
 # 功能：验证 chat session 处理一条消息后进入 waiting_for_input，并保留 user/assistant thread

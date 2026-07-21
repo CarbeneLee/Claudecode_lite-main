@@ -99,35 +99,40 @@ async def test_two_clients_both_receive_broadcast(
         await client2.close()
 
 
-# 功能：验证客户端断开后使用 replay_from_run 重连，订阅响应中 replayed_count > 0
-# 设计：client1 触发 run 并等到 run.started 落盘（run.started 在 LLM 调用前写入 events.jsonl），
-#       稍作等待后断开；client2 用 replay_from_run=run_id 订阅，断言 replayed_count > 0，
-#       不依赖 API Key，只需验证 replay 机制读出了已落盘的 run.started
+# 功能：验证客户端断开后按 run 重连，先收到 watermark 响应再收到真实回放事件
+# 设计：两个客户分别触发和回放，用 Event 等待目标 run 帧而不使用固定延时或计划数量
 async def test_disconnect_and_replay_from_run(
     running_daemon: subprocess.Popen[bytes],
     free_port: int,
     tmp_path: Path,
 ) -> None:
-    # Phase 1: trigger a run and wait for run.started to be written to disk
     client1 = SocketClient("127.0.0.1", free_port)
     await client1.connect()
 
     started_event: asyncio.Event = asyncio.Event()
-    run_id_holder: list[str] = []
+    run_id = ""
 
+    # 只接受目标 durable run stream 的 run.started 帧
     async def on_event(event: dict[str, Any]) -> None:
-        if event.get("type") == "run.started":
-            run_id_holder.append(event.get("run_id", ""))
+        if event.get("type") == "run.started" and event.get("run_id") == run_id:
             started_event.set()
 
     client1.on_event(on_event)
     loop1 = asyncio.create_task(client1.run_event_loop())
 
     try:
-        await client1.send_command("event.subscribe", {"topics": ["run.*"], "scope": "global"})
-        await client1.send_command(
+        run_result = await client1.send_command(
             "agent.run",
             {"goal": "replay test", "workspace_root": str(tmp_path.resolve())},
+        )
+        run_id = run_result["run_id"]
+        await client1.send_command(
+            "event.subscribe",
+            {
+                "topics": ["run.*"],
+                "scope": f"run:{run_id}",
+                "after_seq": 0,
+            },
         )
         await asyncio.wait_for(started_event.wait(), timeout=5.0)
     finally:
@@ -135,15 +140,18 @@ async def test_disconnect_and_replay_from_run(
         await asyncio.gather(loop1, return_exceptions=True)
         await client1.close()
 
-    assert run_id_holder, "run.started was never received"
-    run_id = run_id_holder[0]
-
-    # Brief pause to ensure the event is flushed to disk before we replay
-    await asyncio.sleep(0.05)
-
-    # Phase 2: reconnect with replay_from_run and verify replayed_count > 0
     client2 = SocketClient("127.0.0.1", free_port)
     await client2.connect()
+    replayed_event = asyncio.Event()
+    replayed: list[dict[str, Any]] = []
+
+    # 记录与目标 run 匹配的真实回放帧
+    async def on_replayed_event(event: dict[str, Any]) -> None:
+        if event.get("run_id") == run_id and event.get("type", "").startswith("run."):
+            replayed.append(event)
+            replayed_event.set()
+
+    client2.on_event(on_replayed_event)
     loop2 = asyncio.create_task(client2.run_event_loop())
 
     try:
@@ -155,9 +163,12 @@ async def test_disconnect_and_replay_from_run(
                 "replay_from_run": run_id,
             },
         )
-        assert result.get("replayed_count", 0) > 0, (
-            f"Expected replayed_count > 0 for run_id={run_id!r}, got {result}"
-        )
+        assert result["replayed_count"] == 0
+        assert result["stream_id"] == f"run:{run_id}"
+        assert result["accepted_after_seq"] == 0
+        assert result["high_watermark_seq"] >= 1
+        await asyncio.wait_for(replayed_event.wait(), timeout=5.0)
+        assert replayed
     finally:
         loop2.cancel()
         await asyncio.gather(loop2, return_exceptions=True)

@@ -11,7 +11,7 @@ from kama_claude.core.compact.compactor import Compactor
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus, EventHandler
-from kama_claude.core.events.writer import EventWriter
+from kama_claude.core.events.journal import EventJournalCoordinator
 from kama_claude.core.llm.base import LLMProvider
 from kama_claude.core.llm.provider import AnthropicProvider
 from kama_claude.core.loop import AgentLoop
@@ -22,7 +22,11 @@ from kama_claude.core.runs import RUNS_DIR, new_run_id
 from kama_claude.core.session.model import Session
 from kama_claude.core.session.store import SessionStore
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
-from kama_claude.core.subagent.tool import AgentResultTool, SpawnAgentTool
+from kama_claude.core.subagent.tool import (
+    AgentResultTool,
+    SpawnAgentTool,
+    _cancel_background_tasks,
+)
 from kama_claude.core.task.manager import TaskManager
 from kama_claude.core.tools.builtin import (
     BashTool,
@@ -68,20 +72,26 @@ class AgentRunner:
         trace: TraceWriter | None = None,
         permission_manager: PermissionManager | None = None,
         mcp_manager: McpServerManager | None = None,
+        journal: EventJournalCoordinator | None = None,
     ) -> None:
         self._config = config
         self._path_resolver = WorkspacePathResolver(workspace_root)
         self._workspace_root = self._path_resolver.root
         self._access_policy = WorkspaceAccessPolicy(self._workspace_root)
-        self._bus = bus
+        self._bus = bus or EventBus()
         self._provider = provider
         self._extra_handlers: list[EventHandler] = extra_handlers or []
         self._runs_dir = runs_dir or RUNS_DIR
         self._trace = trace
         self._permission_manager = permission_manager
         self._mcp_manager = mcp_manager
+        self._journal = journal or EventJournalCoordinator()
+        self._owns_journal = journal is None
+        if self._owns_journal:
+            self._bus.subscribe(self._journal.handle)
         # 跨 run 共享的后台 subagent 任务注册表
         self._task_registry = BackgroundTaskRegistry()
+        self._background_tasks: dict[str, set[asyncio.Task[None]]] = {}
 
     # 构建工具注册表，注入 TaskManager（任务工具共享同一实例）；可选注入 SpawnAgentTool
     def _build_registry( #条件化工具注入
@@ -139,6 +149,8 @@ class AgentRunner:
                         runs_dir=runs_dir,
                         session_id=session_id,
                         depth=0, # 防止agent无限递归调用自身，depth=0表示这是顶层agent
+                        journal=self._journal,
+                        background_tasks=self._background_tasks,
                     )
                 )
             if _ok("agent_result"):
@@ -183,9 +195,21 @@ class AgentRunner:
         # TaskManager 存储在 run_path / ".tasks"，每个 run 相互隔离
         task_manager = TaskManager(run_path / ".tasks")
 
-        bus = self._bus if self._bus is not None else EventBus()
+        bus = self._bus
         for h in self._extra_handlers:
             bus.subscribe(h)
+
+        stream_id = f"run:{run_id}"
+        if not self._journal.has_stream(stream_id):
+            await self._journal.register_run(
+                run_id,
+                run_path,
+                session_id=(
+                    session.id
+                    if session is not None and not self._owns_journal
+                    else None
+                ),
+            )
 
         # 创建包含本次运行基本信息和状态的执行上下文
         context = ExecutionContext(
@@ -202,66 +226,78 @@ class AgentRunner:
         )
         prefill_len = len(history) #避免重复存储历史消息
 
-        # EventWriter 是异步上下文管理器，自动处理文件打开和关闭
-        async with EventWriter(run_path / "events.jsonl") as writer:
-            # 订阅事件总线，确保所有运行和步骤事件写入 events.jsonl
-            writer.subscribe(bus)
-            await bus.publish(RunStartedEvent(run_id=run_id, goal=goal, ts=_now()))
+        await bus.publish(RunStartedEvent(run_id=run_id, goal=goal, ts=_now()))
 
-            cancelled = False
-            try:
-                provider: LLMProvider = self._provider or AnthropicProvider(
-                    self._config.llm.default_model
+        cancelled_error: asyncio.CancelledError | None = None
+        try:
+            provider: LLMProvider = self._provider or AnthropicProvider(
+                self._config.llm.default_model
+            )
+            if self._trace is not None:
+                provider = TracingProvider(
+                    provider,
+                    self._trace,
+                    include_payload=self._config.trace.include_llm_payload,
                 )
-                if self._trace is not None:
-                    provider = TracingProvider(
-                        provider,
-                        self._trace,
-                        include_payload=self._config.trace.include_llm_payload,
-                    )
-                session_id_str = session.id if session is not None else ""
-                child_runs_dir = (
-                    store.runs_dir(session.id)
-                    if session is not None and store is not None
-                    else self._runs_dir
-                )
-                registry = self._build_registry(
-                    task_manager,
-                    session=session,
-                    store=store,
-                    run_id=run_id,
-                    provider=provider,
-                    bus=bus,
-                    child_runs_dir=child_runs_dir,
-                    session_id=session_id_str,
-                    tool_whitelist=tool_whitelist,
-                )
-                session_dir = (
-                    store.session_dir(session.id)
-                    if session is not None and store is not None
-                    else run_path
-                )
-                compactor = Compactor(bus, session_dir, session_id_str)
-                loop = AgentLoop(
-                    provider, registry, bus,
-                    permission_manager=self._permission_manager,
-                    compactor=compactor,
-                    compact_threshold=self._config.compaction.auto_threshold, #触发压缩上下文的阈值
-                    session_id=session_id_str,
-                )
-                await loop.run(context)
-            # CancelledError 单独处理，并通过标志位在退出前恢复取消传播
-            except asyncio.CancelledError:
-                cancelled = True #确保取消不丢失数据
-                if not context.is_done():
+            session_id_str = session.id if session is not None else ""
+            child_runs_dir = (
+                store.runs_dir(session.id)
+                if session is not None and store is not None
+                else self._runs_dir
+            )
+            registry = self._build_registry(
+                task_manager,
+                session=session,
+                store=store,
+                run_id=run_id,
+                provider=provider,
+                bus=bus,
+                child_runs_dir=child_runs_dir,
+                session_id=session_id_str,
+                tool_whitelist=tool_whitelist,
+            )
+            session_dir = (
+                store.session_dir(session.id)
+                if session is not None and store is not None
+                else run_path
+            )
+            compactor = Compactor(bus, session_dir, session_id_str)
+            loop = AgentLoop(
+                provider, registry, bus,
+                permission_manager=self._permission_manager,
+                compactor=compactor,
+                compact_threshold=self._config.compaction.auto_threshold, #触发压缩上下文的阈值
+                session_id=session_id_str,
+            )
+            await loop.run(context)
+        # CancelledError 单独处理，并保存对象供 terminal barrier 后原样恢复
+        except asyncio.CancelledError as exc:
+            cancelled_error = exc
+            if not context.is_done():
+                context.mark_failed("cancelled")
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "agent run failed run_id=%s step=%d", run_id, context.step
+            )
+            if not context.is_done():
+                context.mark_failed("llm_error")
+
+        try:
+            await _cancel_background_tasks(self._background_tasks.pop(run_id, set()))
+        except asyncio.CancelledError as exc:
+            if cancelled_error is None:
+                cancelled_error = exc
+                if not context.is_done() or context.status == "success":
                     context.mark_failed("cancelled")
-            except Exception:
-                logging.getLogger(__name__).exception(
-                    "agent run failed run_id=%s step=%d", run_id, context.step
+            else:
+                logging.getLogger(__name__).error(
+                    "background cleanup cancellation treated as secondary "
+                    "run_id=%s role=cleanup",
+                    run_id,
                 )
-                if not context.is_done():
-                    context.mark_failed("llm_error")
 
+        terminal_failure: asyncio.CancelledError | Exception | None = None
+        try:
             await bus.publish(
                 RunFinishedEvent(
                     run_id=run_id,
@@ -271,12 +307,23 @@ class AgentRunner:
                     ts=_now(),
                 )
             )
+        except asyncio.CancelledError as exc:
+            terminal_failure = exc
+        except Exception as exc:
+            terminal_failure = exc
 
         if session is not None and store is not None:
             store.append_messages(session.id, context.messages[prefill_len:], run_id=run_id)
 
-        if cancelled:
-            raise asyncio.CancelledError()
+        if cancelled_error is not None:
+            if terminal_failure is not None:
+                logging.getLogger(__name__).error(
+                    "terminal journal failure treated as secondary run_id=%s role=terminal",
+                    run_id,
+                )
+            raise cancelled_error
+        if terminal_failure is not None:
+            raise terminal_failure
 
         return RunOutcome(
             status=context.status,

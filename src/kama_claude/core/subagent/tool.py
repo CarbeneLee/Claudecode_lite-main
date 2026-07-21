@@ -12,7 +12,7 @@ from kama_claude.core.agents.loader import AgentProfile, AgentProfileLoader
 from kama_claude.core.bus.events import SubagentFinishedEvent, SubagentStartedEvent
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
-from kama_claude.core.events.writer import EventWriter
+from kama_claude.core.events.journal import EventJournalCoordinator
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.memory.loader import load_context_file
 from kama_claude.core.runs import new_run_id
@@ -37,10 +37,40 @@ if TYPE_CHECKING:
 
 
 _LOGGER = logging.getLogger(__name__)
+type _BackgroundTaskOwners = dict[str, set[asyncio.Task[None]]]
 
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+# 取消并等待同一 parent 拥有的后台 children，重复 cancellation 后仍先完成清理
+async def _cancel_background_tasks(tasks: set[asyncio.Task[None]]) -> None:
+    if not tasks:
+        return
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    waiter = asyncio.gather(*tasks, return_exceptions=True)
+    primary: asyncio.CancelledError | None = None
+    while not waiter.done():
+        try:
+            await asyncio.shield(waiter)
+        except asyncio.CancelledError as exc:
+            if primary is None:
+                primary = exc
+    outcomes = waiter.result()
+    failures = sum(
+        isinstance(outcome, Exception)
+        for outcome in outcomes
+    )
+    if failures:
+        _LOGGER.error(
+            "background child cleanup failures=%d role=secondary",
+            failures,
+        )
+    if primary is not None:
+        raise primary
 
 
 class SpawnAgentParams(BaseModel):
@@ -106,6 +136,8 @@ class SpawnAgentTool(BaseTool):
         runs_dir: Path,
         session_id: str,
         depth: int = 0,
+        journal: EventJournalCoordinator | None = None,
+        background_tasks: _BackgroundTaskOwners | None = None,
     ) -> None:
         self._provider = provider
         self._path_resolver = WorkspacePathResolver(workspace_root)
@@ -120,6 +152,8 @@ class SpawnAgentTool(BaseTool):
         self._runs_dir = runs_dir
         self._session_id = session_id
         self._depth = depth
+        self._journal = journal
+        self._background_tasks = background_tasks if background_tasks is not None else {}
 
     # 派生子 agent，前台时阻塞直到完成并返回结果，后台时立即返回 run_id
     async def invoke(self, params: dict[str, object]) -> ToolResult:
@@ -170,6 +204,13 @@ class SpawnAgentTool(BaseTool):
         child_run_path = self._runs_dir / child_run_id
         child_run_path.mkdir(parents=True, exist_ok=True)
 
+        if self._journal is not None:
+            await self._journal.register_run(
+                child_run_id,
+                child_run_path,
+                session_id=self._session_id or None,
+            )
+
         await self._parent_bus.publish(
             SubagentStartedEvent(
                 run_id=child_run_id,
@@ -192,6 +233,7 @@ class SpawnAgentTool(BaseTool):
                 )
             )
             self._task_registry.register(child_run_id, task, child_context)
+            self._background_tasks.setdefault(self._parent_run_id, set()).add(task)
             try:
                 await lifecycle_entered.wait()
             except asyncio.CancelledError:
@@ -246,9 +288,7 @@ class SpawnAgentTool(BaseTool):
         try:
             if lifecycle_entered is not None:
                 lifecycle_entered.set()
-            async with EventWriter(run_path / "events.jsonl") as writer:
-                writer.subscribe(bus)
-                await loop.run(context)
+            await loop.run(context)
         except asyncio.CancelledError as exc:
             context.mark_failed("cancelled")
             primary_failure = exc
@@ -256,6 +296,18 @@ class SpawnAgentTool(BaseTool):
             _LOGGER.exception("subagent execution failed run_id=%s", run_id)
             context.mark_failed("subagent_error")
             primary_failure = exc
+
+        try:
+            await _cancel_background_tasks(self._background_tasks.pop(run_id, set()))
+        except asyncio.CancelledError as exc:
+            if primary_failure is None:
+                context.mark_failed("cancelled")
+                primary_failure = exc
+            else:
+                _LOGGER.error(
+                    "nested background cleanup cancellation role=secondary run_id=%s",
+                    run_id,
+                )
 
         try:
             await self._parent_bus.publish(
@@ -355,6 +407,8 @@ class SpawnAgentTool(BaseTool):
                 runs_dir=self._runs_dir,
                 session_id=self._session_id,
                 depth=self._depth + 1,
+                journal=self._journal,
+                background_tasks=self._background_tasks,
             )
             if _allowed("spawn_agent"):
                 registry.register(nested)

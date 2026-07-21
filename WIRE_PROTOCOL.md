@@ -193,6 +193,7 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
 | `topics` | `array` | yes |
 | `scope` | `string` | no |
 | `replay_from_run` | `string | null` | no |
+| `after_seq` | `integer | null` | no |
 
 ```json
 {
@@ -226,6 +227,19 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
       ],
       "default": null,
       "title": "Replay From Run"
+    },
+    "after_seq": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "After Seq"
     }
   },
   "required": [
@@ -262,6 +276,9 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
 |---|---|---|
 | `subscription_id` | `string` | yes |
 | `replayed_count` | `integer` | no |
+| `stream_id` | `string | null` | no |
+| `accepted_after_seq` | `integer | null` | no |
+| `high_watermark_seq` | `integer | null` | no |
 
 ```json
 {
@@ -274,6 +291,42 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
       "default": 0,
       "title": "Replayed Count",
       "type": "integer"
+    },
+    "stream_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Stream Id"
+    },
+    "accepted_after_seq": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Accepted After Seq"
+    },
+    "high_watermark_seq": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "High Watermark Seq"
     }
   },
   "required": [
@@ -682,6 +735,11 @@ Events pushed from daemon to subscribed clients over the same TCP connection.
 | Field | Type | Required |
 |---|---|---|
 | `kind` | `string` | no |
+| `subscription_id` | `string | null` | no |
+| `delivery` | `string | null` | no |
+| `event_id` | `string | null` | no |
+| `stream_id` | `string | null` | no |
+| `seq` | `integer | null` | no |
 | `event` | `object` | yes |
 
 ```json
@@ -692,6 +750,70 @@ Events pushed from daemon to subscribed clients over the same TCP connection.
       "default": "event",
       "title": "Kind",
       "type": "string"
+    },
+    "subscription_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Subscription Id"
+    },
+    "delivery": {
+      "anyOf": [
+        {
+          "enum": [
+            "replay",
+            "live"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Delivery"
+    },
+    "event_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Event Id"
+    },
+    "stream_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Stream Id"
+    },
+    "seq": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Seq"
     },
     "event": {
       "additionalProperties": true,

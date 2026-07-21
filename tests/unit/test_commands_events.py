@@ -8,6 +8,8 @@ from kama_claude.core.bus.commands import (
     AgentRunCommand,
     Command,
     EchoCommand,
+    EventSubscribeCommand,
+    EventSubscribeResult,
     PingCommand,
     PongResult,
     SessionCreateCommand,
@@ -150,3 +152,37 @@ def test_event_unsubscribe_result_roundtrip(removed: bool) -> None:
     restored = model.model_validate_json(result.model_dump_json())
 
     assert restored.removed is removed
+
+
+# 功能：验证 event.subscribe 可携带非负 after_seq 且保留 stream scope
+# 设计：通过 Command 判别联合往返，锁定 7B cursor 输入但不加入 7C daemon identity
+def test_event_subscribe_after_seq_roundtrip() -> None:
+    command = EventSubscribeCommand(
+        topics=["run.*"],
+        scope="run:run-1",
+        after_seq=42,
+    )
+
+    restored = TypeAdapter(Command).validate_json(command.model_dump_json())
+
+    assert isinstance(restored, EventSubscribeCommand)
+    assert restored.after_seq == 42
+    assert restored.scope == "run:run-1"
+
+
+# 功能：验证 subscribe result 返回 response-time 已知的 stream、accepted cursor 与 high watermark
+# 设计：执行 JSON 往返并保留 replayed_count 兼容字段，避免把 delivery progress 伪装成响应事实
+def test_event_subscribe_result_carries_response_time_cursor_metadata() -> None:
+    result = EventSubscribeResult(
+        subscription_id="sub-12345678",
+        replayed_count=0,
+        stream_id="run:run-1",
+        accepted_after_seq=3,
+        high_watermark_seq=9,
+    )
+
+    restored = EventSubscribeResult.model_validate_json(result.model_dump_json())
+
+    assert restored.stream_id == "run:run-1"
+    assert restored.accepted_after_seq == 3
+    assert restored.high_watermark_seq == 9

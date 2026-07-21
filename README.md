@@ -22,6 +22,7 @@ KamaClaude 将交互客户端与常驻 Core daemon 分离：CLI/TUI 负责发起
 - **Lifecycle cleanup**：Bash 子进程、Subagent 后台任务和 MCP 连接在超时、取消或 daemon 退出路径上执行清理。
 - **Subagent and MCP hardening**：明确前台/后台 Subagent 结果语义，并把 MCP 错误视为不可信远端输入。
 - **Connection-owned delivery**：每个 IPC connection 只有一个 writer task，并以独立有界 control/event queue 隔离慢客户端。
+- **Durable event replay**：run/session 使用 v2 JSONL journal、全局 event identity 与 stream-local cursor；订阅响应写入后才启动 replay，并在 catch-up 后无竞态切换 live。
 - **Reproducible container runtime**：使用 digest-pinned Python/uv 输入、frozen lock、独立 test stage 和非 root Compose daemon/client 拓扑。
 
 这些改造不否定上游工作，也不意味着所有代码均由当前 fork 从零原创。上游 attribution 与 MIT 许可见文末。
@@ -42,7 +43,9 @@ KamaClaude 将交互客户端与常驻 Core daemon 分离：CLI/TUI 负责发起
 - `thread.jsonl` 保存多轮消息，`notes.md` 保存主动记忆，每个 run 独立保存事件与 task 状态。
 - 全局 `~/.kama/context.md`、项目 `.kama/context.md`、Session notes 分层进入 system prompt。
 - 支持 tool result 截断、上下文水位事件、自动 compact 配置和手动 `session.compact` 协议。
-- `EventBus` 将运行事件分发给 TUI/CLI、`events.jsonl` 和 trace；客户端可按 run 回放已落盘事件。
+- `EventBus` 先把可持久事件交给 `EventJournalCoordinator`；run/session 的 v2 journal flush 成功后，客户端才收到带 `event_id`、`stream_id` 和 stream-local `seq` 的 live delivery。
+- durable subscribe 返回已接受 cursor 与 high watermark；success response 完成 socket drain 后才启动 replay，期间的新事件进入有界 catch-up buffer，随后按序切换到 live。
+- 旧 `events.jsonl` 只读兼容为稳定 synthetic identity/seq；新事件只写 `events.v2.jsonl`，不会继续扩展 legacy 文件。
 - 每个 TCP connection 由 `ConnectionContext` 拥有 request tasks、唯一 writer 和独立有界 control/event queue；慢客户端只会耗尽并关闭自己的连接。
 - `event.unsubscribe` 只能删除当前 connection 自己拥有的 subscription；断开连接会取消并等待所属 request tasks，再移除全部 owned subscriptions。
 
@@ -147,6 +150,23 @@ Phase 7A connection delivery closeout 的 2026-07-20 fresh verification：
 
 该证据证明 connection-owned single writer、资源边界、慢客户端隔离和 subscription ownership；不证明 durable cursor、自动重连、exactly-once 或 daemon restart 后 active run 恢复。
 
+Phase 7B durable journal/replay closeout 的 2026-07-21 fresh verification：
+
+| Gate | Result |
+| --- | --- |
+| Phase 7B focused | 139 covered；final combined run 136 passed + 3 loopback `EPERM`，该 3 条已在本轮早先非隔离运行通过 |
+| Full unit | 685 covered；684-test full run + 新增 safe-log 定向测试通过 |
+| Full integration | 34 covered；32-test full run + 2 条 startup closeout 定向测试通过 |
+| Docker contracts | 18 passed |
+| Ruff | passed |
+| mypy | 95 source files, no issues |
+| Generated wire protocol | up to date |
+| Journal benchmark | 10,000 events / 20,002 durable records；31,183.032 records/s；enqueue p95 0.065 ms；terminal 5.555 ms |
+| Phase 7B manual mutation probes | 5/5 specified mutations killed in an isolated copy |
+| Independent review | Critical 0, Important 0, Minor 2, Ready |
+
+该证据证明当前 daemon 生命周期内的 durable cursor、response-first replay、严格 v2 校验、run/session overlap identity 和 replay/live handoff；不证明 exactly-once、客户端自动重连、SessionManager rehydration、执行续跑或 daemon restart recovery。
+
 ## Architecture
 
 运行时的主要数据流是：
@@ -161,7 +181,10 @@ CLI / TUI
   → ToolRegistry
   → validation / permission / invocation / workspace policy
   → builtin tools / Subagent / MCP
-  → EventBus → CLI/TUI + events.jsonl + trace
+  → EventBus → EventJournalCoordinator
+             → run/session events.v2.jsonl
+             → durable callback → response-first replay/catch-up/live → CLI/TUI
+             → live-only events + trace
 ```
 
 关键边界：
@@ -169,7 +192,7 @@ CLI / TUI
 - **Protocol boundary**：command/response 使用 JSON-RPC 2.0；push event 使用 NDJSON event envelope。
 - **Session boundary**：workspace 在 Session 创建时固定，多轮消息不会切换到 daemon cwd。
 - **Invocation boundary**：所有 registry tool 都经过同一参数校验、权限、错误分类、重试与事件管线。
-- **Observation boundary**：事件文件按 run 持久化；daemon trace 可记录 IPC、event 和 LLM 层。
+- **Observation boundary**：事件按 frozen routing table 写入 run/session stream；同一 domain event 在重叠 stream 共享 `event_id`，但各自维护 `seq`。本轮 delivery trace 只记录 subscription/event-type 元数据；既有 command trace 仍可能包含 command params。
 
 ## Tool invocation pipeline
 
@@ -212,7 +235,7 @@ CLI / TUI
 ### 当前不保证
 
 - Core 默认监听 loopback，但这是**受信本地客户端模型**，不是多用户认证或授权系统。
-- Phase 7A 不提供 durable cursor、exactly-once delivery、response-first replay handoff、客户端自动重连或 daemon restart 后 active run 恢复。
+- Phase 7B 提供 daemon 生命周期内的 durable cursor 与 response-first replay handoff，但不提供 exactly-once delivery、客户端自动重连、跨重启 subscription 恢复、SessionManager rehydration 或 daemon restart 后 active run 恢复。
 - Bash 的 workspace 只是启动 cwd，**不是 OS sandbox**；shell 可以通过绝对路径、父目录、子进程或网络越过 workspace。
 - MCP tools 不经过 builtin filesystem resolver/policy；其权限与隔离取决于远端 server 和启动环境。
 - 除 `search_code` 读取路径外，其他 filesystem tools 的校验与实际 I/O 间仍可能存在 TOCTOU；写入路径也未实现原子替换。
@@ -227,7 +250,7 @@ CLI / TUI
 - Parent Agent 调用 `spawn_agent` 后，系统创建独立 `ExecutionContext`、EventBus、registry 与 run directory。
 - Child 不继承 parent 对话历史，但会加载全局/project context，并可应用 planner/executor/reviewer profile。
 - 前台模式等待 child 完成并直接返回 ToolResult；后台模式返回 `run_id`，parent 用 `agent_result` 轮询。
-- Child 事件桥接到 parent EventBus，同时写入 child `events.jsonl`。
+- Child 事件桥接到 parent EventBus，并由共享 journal coordinator 路由到 child run、parent run 与可选 session stream；新事件写入各 stream 的 `events.v2.jsonl`。
 - 取消进入 child lifecycle 后会标记失败、尝试发出一次 terminal event，并恢复原始 cancellation 控制流。
 
 ## Quick start
