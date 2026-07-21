@@ -275,6 +275,7 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
 | Field | Type | Required |
 |---|---|---|
 | `subscription_id` | `string` | yes |
+| `daemon_instance_id` | `string` | yes |
 | `replayed_count` | `integer` | no |
 | `stream_id` | `string | null` | no |
 | `accepted_after_seq` | `integer | null` | no |
@@ -285,6 +286,10 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
   "properties": {
     "subscription_id": {
       "title": "Subscription Id",
+      "type": "string"
+    },
+    "daemon_instance_id": {
+      "title": "Daemon Instance Id",
       "type": "string"
     },
     "replayed_count": {
@@ -330,7 +335,8 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
     }
   },
   "required": [
-    "subscription_id"
+    "subscription_id",
+    "daemon_instance_id"
   ],
   "title": "EventSubscribeResult",
   "type": "object"
@@ -345,6 +351,7 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
   "id": "u-3",
   "result": {
     "subscription_id": "sub-abc123",
+    "daemon_instance_id": "daemon-abc123def456",
     "replayed_count": 0
   }
 }
@@ -740,6 +747,7 @@ Events pushed from daemon to subscribed clients over the same TCP connection.
 | `event_id` | `string | null` | no |
 | `stream_id` | `string | null` | no |
 | `seq` | `integer | null` | no |
+| `daemon_instance_id` | `string` | yes |
 | `event` | `object` | yes |
 
 ```json
@@ -815,6 +823,10 @@ Events pushed from daemon to subscribed clients over the same TCP connection.
       "default": null,
       "title": "Seq"
     },
+    "daemon_instance_id": {
+      "title": "Daemon Instance Id",
+      "type": "string"
+    },
     "event": {
       "additionalProperties": true,
       "title": "Event",
@@ -822,6 +834,7 @@ Events pushed from daemon to subscribed clients over the same TCP connection.
     }
   },
   "required": [
+    "daemon_instance_id",
     "event"
   ],
   "title": "EventPushEnvelope",
@@ -834,6 +847,12 @@ Events pushed from daemon to subscribed clients over the same TCP connection.
 ```json
 {
   "kind": "event",
+  "subscription_id": "sub-abc123",
+  "delivery": "live",
+  "event_id": "evt-abc123",
+  "stream_id": "run:20260516-100000-abc123",
+  "seq": 1,
+  "daemon_instance_id": "daemon-abc123def456",
   "event": {
     "type": "step.started",
     "run_id": "20260516-100000-abc123",

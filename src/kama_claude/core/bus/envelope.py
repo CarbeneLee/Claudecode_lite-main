@@ -19,6 +19,7 @@ class EventPushEnvelope(BaseModel):
     event_id: str | None = None
     stream_id: str | None = None
     seq: int | None = None
+    daemon_instance_id: str
     event: dict[str, Any]  # Event.model_dump() 的序列化结果
 
 

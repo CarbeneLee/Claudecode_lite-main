@@ -6,7 +6,10 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from pydantic import ValidationError
 
+from kama_claude.core.bus.commands import EventSubscribeResult
+from kama_claude.core.bus.envelope import EventPushEnvelope
 from kama_claude.core.bus.events import RunStartedEvent
 from kama_claude.core.events import journal as journal_module
 from kama_claude.core.events.journal import (
@@ -163,6 +166,57 @@ def _request_line() -> bytes:
             "params": {},
         }
     ).encode() + b"\n"
+
+
+# 功能：验证 subscribe result 与 event envelope 的协议模型都保留同一 daemon instance identity
+# 设计：向两个 Pydantic 模型传入固定身份并检查 JSON dump，直接锁定 wire field 名称和值
+def test_subscription_protocol_models_include_same_daemon_instance_id() -> None:
+    daemon_instance_id = "daemon-protocol-1"
+    result = EventSubscribeResult(
+        subscription_id="sub-1",
+        daemon_instance_id=daemon_instance_id,
+    )
+    envelope = EventPushEnvelope(
+        subscription_id="sub-1",
+        delivery="live",
+        daemon_instance_id=daemon_instance_id,
+        event={"type": "run.started"},
+    )
+
+    assert result.model_dump()["daemon_instance_id"] == daemon_instance_id
+    assert envelope.model_dump()["daemon_instance_id"] == daemon_instance_id
+
+
+# 功能：验证 subscribe result 与 event envelope 均强制要求 daemon instance identity
+# 设计：直接校验缺字段的原始 payload 会触发 Pydantic 错误，防止未来误加兼容默认值弱化 wire contract
+def test_subscription_protocol_models_require_daemon_instance_id() -> None:
+    with pytest.raises(ValidationError):
+        EventSubscribeResult.model_validate({"subscription_id": "sub-1"})
+    with pytest.raises(ValidationError):
+        EventPushEnvelope.model_validate(
+            {
+                "subscription_id": "sub-1",
+                "delivery": "live",
+                "event": {"type": "run.started"},
+            }
+        )
+
+
+# 功能：验证 live-only delivery envelope 也携带 broadcaster 稳定的 daemon instance identity
+# 设计：经过真实 ConnectionContext queue 发送非 durable 事件，解析 wire frame 排除仅 replay 分支补字段
+async def test_live_only_delivery_includes_daemon_instance_id() -> None:
+    broadcaster = IpcEventBroadcaster()
+    assert hasattr(broadcaster, "daemon_instance_id")
+    context, writer = _connection()
+    broadcaster.subscribe(context, ["run.*"])
+
+    await broadcaster.publish_live_only(_event("live-only"))
+    while not writer.frames:
+        await asyncio.sleep(0)
+    await context.close("test complete")
+
+    envelope = json.loads(writer.frames[0])
+    assert envelope["daemon_instance_id"] == broadcaster.daemon_instance_id
 
 
 # 功能：验证 post-response activation 严格等待 success frame 的 written receipt

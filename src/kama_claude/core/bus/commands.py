@@ -49,6 +49,7 @@ class EventSubscribeCommand(BaseModel):
 
 class EventSubscribeResult(BaseModel):
     subscription_id: str
+    daemon_instance_id: str
     replayed_count: int = 0
     stream_id: str | None = None
     accepted_after_seq: int | None = None

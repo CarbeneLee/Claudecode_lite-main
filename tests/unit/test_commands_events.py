@@ -170,11 +170,12 @@ def test_event_subscribe_after_seq_roundtrip() -> None:
     assert restored.scope == "run:run-1"
 
 
-# 功能：验证 subscribe result 返回 response-time 已知的 stream、accepted cursor 与 high watermark
-# 设计：执行 JSON 往返并保留 replayed_count 兼容字段，避免把 delivery progress 伪装成响应事实
+# 功能：验证 subscribe result 返回 daemon 身份及 response-time cursor metadata
+# 设计：执行 JSON 往返并保留必填身份和 cursor 字段，锁定 7C 重连握手所需的完整事实
 def test_event_subscribe_result_carries_response_time_cursor_metadata() -> None:
     result = EventSubscribeResult(
         subscription_id="sub-12345678",
+        daemon_instance_id="daemon-1",
         replayed_count=0,
         stream_id="run:run-1",
         accepted_after_seq=3,
@@ -183,6 +184,7 @@ def test_event_subscribe_result_carries_response_time_cursor_metadata() -> None:
 
     restored = EventSubscribeResult.model_validate_json(result.model_dump_json())
 
+    assert restored.daemon_instance_id == "daemon-1"
     assert restored.stream_id == "run:run-1"
     assert restored.accepted_after_seq == 3
     assert restored.high_watermark_seq == 9

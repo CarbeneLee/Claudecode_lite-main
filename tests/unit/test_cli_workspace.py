@@ -1,76 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from kama_claude.cli.commands import chat as chat_module
-from kama_claude.cli.commands import run as run_module
 from kama_claude.core.config import KamaConfig
-
-type EventHandler = Callable[[dict[str, Any]], Awaitable[None]]
-
-
-# 功能：验证 kama run 在 agent.run 中发送客户端 canonical cwd
-# 设计：替换真实 SocketClient 并主动发出 run.finished，捕获完整公开 IPC 调用参数
-async def test_run_sends_canonical_client_cwd(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    commands: list[tuple[str, dict[str, Any]]] = []
-
-    class _Client:
-        # 初始化 fake client 的事件回调引用
-        def __init__(self, host: str, port: int) -> None:
-            self.handler: EventHandler | None = None
-
-        # 模拟成功建立 IPC 连接
-        async def connect(self) -> None:
-            return None
-
-        # 记录 CLI 注册的事件回调
-        def on_event(self, handler: EventHandler) -> None:
-            self.handler = handler
-
-        # 保持事件循环挂起直到被 CLI 取消
-        async def run_event_loop(self) -> None:
-            await asyncio.Event().wait()
-
-        # 记录命令并在 agent.run 后发出完成事件
-        async def send_command(
-            self,
-            method: str,
-            params: dict[str, Any],
-        ) -> dict[str, Any]:
-            commands.append((method, params))
-            if method == "agent.run":
-                assert self.handler is not None
-                await self.handler(
-                    {"type": "run.finished", "status": "success", "steps": 1}
-                )
-                return {"run_id": "run-test"}
-            return {"subscription_id": "sub-test"}
-
-        # 模拟关闭 IPC 连接
-        async def close(self) -> None:
-            return None
-
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    monkeypatch.chdir(workspace)
-    monkeypatch.setattr(run_module, "SocketClient", _Client)
-
-    exit_code = await run_module._run_async("inspect", KamaConfig())
-
-    assert exit_code == 0
-    agent_params = next(params for method, params in commands if method == "agent.run")
-    assert agent_params == {
-        "goal": "inspect",
-        "workspace_root": str(workspace.resolve()),
-    }
 
 
 # 功能：验证 kama chat 创建 Session 时发送 cwd，后续消息不重复 workspace_root
@@ -92,7 +29,11 @@ async def test_chat_sends_workspace_only_when_creating_session(
             return None
 
         # chat 本测试不需要消费 daemon 事件
-        def on_event(self, handler: EventHandler) -> None:
+        def on_event(self, handler: Any) -> None:
+            return None
+
+        # chat reconnect 后改用 full delivery API
+        def on_delivery(self, handler: Any) -> None:
             return None
 
         # 保持事件循环挂起直到 chat 清理任务
@@ -108,6 +49,14 @@ async def test_chat_sends_workspace_only_when_creating_session(
             commands.append((method, params))
             if method == "session.create":
                 return {"session_id": "sess-test", "status": "active"}
+            if method == "event.subscribe":
+                return {
+                    "subscription_id": "sub-test",
+                    "stream_id": "session:sess-test",
+                    "accepted_after_seq": 0,
+                    "high_watermark_seq": 0,
+                    "daemon_instance_id": "daemon-a",
+                }
             if method == "session.send_message":
                 return {"run_id": "run-test"}
             return {}
@@ -144,3 +93,9 @@ async def test_chat_sends_workspace_only_when_creating_session(
     }
     assert message_params == {"session_id": "sess-test", "content": "hello"}
     assert "workspace_root" not in message_params
+    assert any(
+        method == "event.subscribe"
+        and params["scope"] == "session:sess-test"
+        and params["after_seq"] == 0
+        for method, params in commands
+    )

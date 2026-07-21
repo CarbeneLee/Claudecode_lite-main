@@ -9,6 +9,7 @@ from rich.markdown import Markdown
 from textual.widget import Widget
 
 import kama_claude.tui.app as tui_app_module
+from kama_claude.core.transport.socket_client import EventDelivery
 from kama_claude.tui.app import (
     KamaTuiApp,
     LLMStreamBlock,
@@ -16,6 +17,25 @@ from kama_claude.tui.app import (
     _param_summary,
     _preview,
 )
+
+
+# 构造带指定持久元数据的真实 delivery 供 TUI cursor 测试使用
+def _delivery(
+    *,
+    event: dict[str, Any],
+    event_id: str | None,
+    stream_id: str | None,
+    seq: int | None,
+) -> EventDelivery:
+    return EventDelivery(
+        subscription_id="sub-test",
+        delivery="replay",
+        event_id=event_id,
+        stream_id=stream_id,
+        seq=seq,
+        daemon_instance_id="daemon-test",
+        event=event,
+    )
 
 
 # 功能：验证 _preview 超出长度时截断并追加省略号
@@ -211,6 +231,206 @@ def test_unknown_event_silently_ignored() -> None:
     assert appended == []
 
 
+# 功能：验证同一事件经 run/session 重叠订阅到达时两条 stream cursor 均推进但只渲染一次
+# 设计：使用共享 event_id 的两个真实 EventDelivery，以可观测 render 计数区分 cursor 确认与 UI 去重
+async def test_delivery_advances_overlapping_stream_cursors_and_renders_once() -> None:
+    app = KamaTuiApp("127.0.0.1", 9999)
+    rendered: list[dict[str, Any]] = []
+    app._handle_event_inner = rendered.append  # type: ignore[method-assign]
+    event = {
+        "type": "run.finished",
+        "run_id": "run-1",
+        "status": "success",
+        "steps": 2,
+        "ts": "t",
+    }
+
+    await app._handle_delivery(
+        _delivery(event=event, event_id="evt-1", stream_id="run:run-1", seq=7)
+    )
+    await app._handle_delivery(
+        _delivery(event=event, event_id="evt-1", stream_id="session:sess-1", seq=11)
+    )
+
+    assert rendered == [event]
+    assert app._stream_cursors == {"run:run-1": 7, "session:sess-1": 11}
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {
+            "type": "tool.call_started",
+            "tool_use_id": "tool-1",
+            "tool_name": "bash",
+            "params": {"command": "true"},
+            "run_id": "run-1",
+            "ts": "t",
+        },
+        {"type": "llm.token", "token": "hello", "run_id": "run-1", "ts": "t"},
+        {
+            "type": "run.finished",
+            "run_id": "run-1",
+            "status": "success",
+            "steps": 1,
+            "ts": "t",
+        },
+    ],
+)
+# 功能：验证重连重放不会重复渲染工具块、LLM token 或 run terminal 块
+# 设计：对三种有状态 UI 事件重放同一 event_id/seq，直接观测渲染调用次数和 cursor
+async def test_replayed_delivery_does_not_repeat_stateful_render(
+    event: dict[str, Any],
+) -> None:
+    app = KamaTuiApp("127.0.0.1", 9999)
+    rendered: list[dict[str, Any]] = []
+    app._handle_event_inner = rendered.append  # type: ignore[method-assign]
+    delivery = _delivery(
+        event=event,
+        event_id="evt-stateful",
+        stream_id="run:run-1",
+        seq=3,
+    )
+
+    await app._handle_delivery(delivery)
+    await app._handle_delivery(delivery)
+
+    assert rendered == [event]
+    assert app._stream_cursors == {"run:run-1": 3}
+
+
+@pytest.mark.parametrize(
+    ("event_id", "stream_id", "seq"),
+    [
+        (None, "run:run-1", 1),
+        ("evt-live", None, 1),
+        ("evt-live", "run:run-1", None),
+    ],
+)
+# 功能：验证缺失任一持久元数据的 live-only 事件仍渲染且不污染 cursor/dedup 状态
+# 设计：逐一缺失 event_id、stream_id、seq，重复投递以证明兼容路径没有持久去重副作用
+async def test_live_only_delivery_does_not_change_durable_tracking(
+    event_id: str | None,
+    stream_id: str | None,
+    seq: int | None,
+) -> None:
+    app = KamaTuiApp("127.0.0.1", 9999)
+    rendered: list[dict[str, Any]] = []
+    app._handle_event_inner = rendered.append  # type: ignore[method-assign]
+    event = {"type": "llm.token", "token": "live", "run_id": "run-1", "ts": "t"}
+    delivery = _delivery(
+        event=event,
+        event_id=event_id,
+        stream_id=stream_id,
+        seq=seq,
+    )
+
+    await app._handle_delivery(delivery)
+    await app._handle_delivery(delivery)
+
+    assert rendered == [event, event]
+    assert app._stream_cursors == {}
+    assert app._rendered_event_ids == set()
+
+
+# 功能：验证事件 handler 失败时 cursor/dedup 不前移，后续重放仍可成功处理
+# 设计：首次处理抛出固定异常，然后替换为可观测 handler 重放同一 delivery，断言提交发生在成功之后
+async def test_delivery_handler_failure_leaves_cursor_retryable() -> None:
+    app = KamaTuiApp("127.0.0.1", 9999)
+    event = {"type": "run.started", "run_id": "run-1", "goal": "goal", "ts": "t"}
+    delivery = _delivery(
+        event=event,
+        event_id="evt-retry",
+        stream_id="run:run-1",
+        seq=5,
+    )
+
+    # 模拟首次 UI 渲染在提交 cursor 前失败
+    def fail(_: dict[str, Any]) -> None:
+        raise RuntimeError("render failed")
+
+    app._handle_event_inner = fail  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="render failed"):
+        await app._handle_delivery(delivery)
+
+    assert app._stream_cursors == {}
+    assert app._rendered_event_ids == set()
+
+    rendered: list[dict[str, Any]] = []
+    app._handle_event_inner = rendered.append  # type: ignore[method-assign]
+    await app._handle_delivery(delivery)
+
+    assert rendered == [event]
+    assert app._stream_cursors == {"run:run-1": 5}
+
+
+# 功能：验证真实 tool.call_started handler 在重放时只创建一个状态块
+# 设计：保留真实 TUI 路由与 ToolCallBlock，只替换 DOM mount 边界，避免 list.append handler 假阳性
+async def test_real_tool_handler_deduplicates_stateful_replay() -> None:
+    app = KamaTuiApp("127.0.0.1", 9999)
+    appended: list[Widget] = []
+    app._append = appended.append  # type: ignore[method-assign]
+    event = {
+        "type": "tool.call_started",
+        "tool_use_id": "tool-replay",
+        "tool_name": "bash",
+        "params": {"command": "true"},
+        "run_id": "run-1",
+        "ts": "t",
+    }
+    delivery = _delivery(
+        event=event,
+        event_id="evt-tool-replay",
+        stream_id="run:run-1",
+        seq=6,
+    )
+
+    await app._handle_delivery(delivery)
+    await app._handle_delivery(delivery)
+
+    assert len(appended) == 1
+    assert isinstance(appended[0], ToolCallBlock)
+    assert list(app._pending_tool_blocks) == ["tool-replay"]
+    assert app._stream_cursors == {"run:run-1": 6}
+
+
+# 功能：验证 compact/send_message 错误不会把底层异常 secret 渲染到 TUI
+# 设计：两种命令分别注入含 secret 的 IpcError/RuntimeError，只允许固定安全文案
+async def test_tui_command_errors_use_fixed_safe_messages() -> None:
+    from kama_claude.core.transport.socket_client import IpcError
+
+    class _Client:
+        # 按命令类型抛出两种含 secret 的底层失败
+        async def send_command(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "session.compact":
+                raise IpcError(-32000, "secret-compact-token")
+            raise RuntimeError("secret-send-token")
+
+    class _Prompt:
+        disabled = True
+        read_only = False
+        border_title = ""
+
+    app = KamaTuiApp("127.0.0.1", 9999)
+    app._client = _Client()  # type: ignore[assignment]
+    app._session_id = "sess-1"
+    app._busy = True
+    prompt = _Prompt()
+    appended: list[str] = []
+    app._prompt = lambda: prompt  # type: ignore[method-assign]
+    app._append = lambda widget: appended.append(str(widget.content))  # type: ignore[method-assign]
+    app._update_header = lambda state: None  # type: ignore[method-assign]
+
+    await app._do_compact()
+    await app._do_send_message("hello")
+
+    rendered = "\n".join(appended)
+    assert "secret-compact-token" not in rendered
+    assert "secret-send-token" not in rendered
+    assert "compact failed" in rendered
+    assert "send failed" in rendered
+
+
 # 功能：验证 TUI 的 session.create 发送当前进程的 canonical cwd
 # 设计：直接运行 socket loop 并替换 SocketClient/DOM 边界，捕获真实 send_command payload
 async def test_tui_session_create_sends_canonical_client_cwd(
@@ -233,8 +453,8 @@ async def test_tui_session_create_sends_canonical_client_cwd(
         async def run_event_loop(self) -> None:
             await asyncio.Event().wait()
 
-        # TUI workspace 测试不需要处理推送事件
-        def on_event(self, handler: object) -> None:
+        # TUI workspace 测试不需要处理完整 delivery
+        def on_delivery(self, handler: object) -> None:
             return None
 
         # 记录 IPC payload，在 session.create 后通知测试停止循环
@@ -242,12 +462,27 @@ async def test_tui_session_create_sends_canonical_client_cwd(
             self,
             method: str,
             params: dict[str, Any],
-        ) -> dict[str, Any]:
-            commands.append((method, params))
-            if method == "session.create":
-                created.set()
-                return {"session_id": "sess-test", "status": "active"}
-            return {"subscription_id": "sub-test"}
+            ) -> dict[str, Any]:
+                commands.append((method, params))
+                if method == "event.subscribe" and params.get("scope") == "global":
+                    return {
+                        "subscription_id": "sub-handshake",
+                        "daemon_instance_id": "daemon-test",
+                    }
+                if method == "event.unsubscribe":
+                    return {"removed": True}
+                if method == "session.create":
+                    created.set()
+                    return {"session_id": "sess-test", "status": "active"}
+                if method == "event.subscribe":
+                    return {
+                        "subscription_id": "sub-test",
+                        "daemon_instance_id": "daemon-test",
+                        "stream_id": params["scope"],
+                        "accepted_after_seq": params["after_seq"],
+                        "high_watermark_seq": params["after_seq"],
+                    }
+                raise AssertionError(f"unexpected method {method}")
 
         # 模拟关闭 IPC 连接
         async def close(self) -> None:

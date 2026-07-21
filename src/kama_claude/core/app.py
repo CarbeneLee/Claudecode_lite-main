@@ -5,6 +5,7 @@ import datetime
 import logging
 import signal
 import time
+import uuid
 from datetime import UTC
 from pathlib import Path
 from typing import Any
@@ -66,8 +67,10 @@ def _now() -> str:
 
 
 class CoreApp:
+    # 初始化单个 daemon 实例的稳定身份与运行时组件引用
     def __init__(self) -> None:
         self._start_time = time.monotonic()
+        self._daemon_instance_id = uuid.uuid4().hex
         self._bus = EventBus()
         self._broadcaster: IpcEventBroadcaster | None = None
         self._journal: EventJournalCoordinator | None = None
@@ -300,7 +303,10 @@ class CoreApp:
 
         if durable_stream is None:
             sub_id = self._broadcaster.subscribe(context, cmd.topics, cmd.scope)
-            return EventSubscribeResult(subscription_id=sub_id)
+            return EventSubscribeResult(
+                subscription_id=sub_id,
+                daemon_instance_id=self._broadcaster.daemon_instance_id,
+            )
 
         assert self._journal is not None
         prepared = await self._broadcaster.prepare_durable_subscription(
@@ -312,6 +318,7 @@ class CoreApp:
         )
         result = EventSubscribeResult(
             subscription_id=prepared.subscription_id,
+            daemon_instance_id=self._broadcaster.daemon_instance_id,
             replayed_count=0,
             stream_id=prepared.stream_id,
             accepted_after_seq=prepared.accepted_after_seq,
@@ -369,7 +376,10 @@ class CoreApp:
             len(load_policy_file(policy_file)),
         )
 
-        self._broadcaster = IpcEventBroadcaster(trace=self._trace)
+        self._broadcaster = IpcEventBroadcaster(
+            trace=self._trace,
+            daemon_instance_id=self._daemon_instance_id,
+        )
         self._journal = EventJournalCoordinator(
             on_durable=self._broadcaster.publish_durable,
             on_live_only=self._broadcaster.publish_live_only,

@@ -104,9 +104,15 @@ class _ReplayActivation:
 
 class IpcEventBroadcaster:
     # 初始化 connection-owned subscriptions 与安全 delivery trace
-    def __init__(self, trace: TraceWriter | None = None) -> None:
+    def __init__(
+        self,
+        trace: TraceWriter | None = None,
+        *,
+        daemon_instance_id: str | None = None,
+    ) -> None:
         self._subscriptions: list[_Subscription] = []
         self._trace = trace
+        self.daemon_instance_id = daemon_instance_id or uuid.uuid4().hex
         self._global_event_ids: set[str] = set()
         self._global_event_order: deque[str] = deque()
 
@@ -214,6 +220,7 @@ class IpcEventBroadcaster:
             envelope = EventPushEnvelope(
                 subscription_id=sub.sub_id,
                 delivery="live",
+                daemon_instance_id=self.daemon_instance_id,
                 event=event_dict,
             )
             try:
@@ -305,6 +312,7 @@ class IpcEventBroadcaster:
             event_id=record.event_id,
             stream_id=record.stream_id,
             seq=record.seq,
+            daemon_instance_id=self.daemon_instance_id,
             event=record.event,
         )
         try:
@@ -326,9 +334,9 @@ class IpcEventBroadcaster:
         receipt.written.add_done_callback(self._observe_delivery)
         return receipt.written
 
-    @staticmethod
     # 计算完整 envelope JSONL bytes 作为 catch-up 精确容量依据
     def _delivery_size(
+        self,
         sub: _Subscription,
         record: JournalRecord,
         delivery: Literal["replay", "live"],
@@ -339,6 +347,7 @@ class IpcEventBroadcaster:
             event_id=record.event_id,
             stream_id=record.stream_id,
             seq=record.seq,
+            daemon_instance_id=self.daemon_instance_id,
             event=record.event,
         )
         return len(ConnectionContext._encode_frame(envelope))

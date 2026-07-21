@@ -167,6 +167,22 @@ Phase 7B durable journal/replay closeout 的 2026-07-21 fresh verification：
 
 该证据证明当前 daemon 生命周期内的 durable cursor、response-first replay、严格 v2 校验、run/session overlap identity 和 replay/live handoff；不证明 exactly-once、客户端自动重连、SessionManager rehydration、执行续跑或 daemon restart recovery。
 
+Phase 7C client reconnect closeout 的 2026-07-21 fresh verification：
+
+| Gate | Result |
+| --- | --- |
+| Phase 7C focused | 142 passed |
+| Full unit | 761 passed |
+| Full integration | 37 passed |
+| Docker contracts | 18 passed |
+| Ruff | passed |
+| mypy | 95 source files, no issues |
+| Generated wire protocol | up to date |
+| Phase 7C manual mutation probes | 6/6 specified mutations killed in an isolated copy |
+| Independent review | Critical 0, Important 0, Minor 0, Ready |
+
+该证据证明 CLI/TUI 在当前客户端进程内具备有界重连、per-stream cursor、event-id rendering dedup 和 daemon identity 降级语义；不证明 exactly-once、cursor 永久化、SessionManager rehydration、跨 daemon restart 的 active run/session 恢复或任意网络故障下的无损交互。
+
 ## Architecture
 
 运行时的主要数据流是：
@@ -230,12 +246,14 @@ CLI / TUI
 - MCP unavailable/tool error 被映射为稳定、安全的本地错误摘要。
 - 单连接响应与事件由同一个 writer task 写入；control/event 容量隔离，持续 control flood 每八帧让出一次等待中的 event。
 - 单个慢客户端的 drain 或队列 overflow 只关闭该连接，不在 `EventBus.publish()` 中阻塞其他客户端。
+- CLI/TUI 只在 event handler 成功后推进 stream cursor；TUI 对 overlapping subscription 使用 event ID 去重渲染，同时分别推进两个 stream cursor。
+- 同一 daemon 断线使用内存 cursor 有界重连；daemon identity 变化时显式结束旧 active view，并清理旧 session 的 pending permission/tool 状态。
 - Docker runtime 默认不发布无认证 daemon 端口；build context 同时受严格 `.dockerignore` 和显式 `COPY` 约束。
 
 ### 当前不保证
 
 - Core 默认监听 loopback，但这是**受信本地客户端模型**，不是多用户认证或授权系统。
-- Phase 7B 提供 daemon 生命周期内的 durable cursor 与 response-first replay handoff，但不提供 exactly-once delivery、客户端自动重连、跨重启 subscription 恢复、SessionManager rehydration 或 daemon restart 后 active run 恢复。
+- Phase 7C 提供客户端进程内的自动重连、cursor resume 与渲染去重，但不提供 exactly-once delivery、cursor 永久化、SessionManager rehydration 或 daemon restart 后 active run/session 恢复。
 - Bash 的 workspace 只是启动 cwd，**不是 OS sandbox**；shell 可以通过绝对路径、父目录、子进程或网络越过 workspace。
 - MCP tools 不经过 builtin filesystem resolver/policy；其权限与隔离取决于远端 server 和启动环境。
 - 除 `search_code` 读取路径外，其他 filesystem tools 的校验与实际 I/O 间仍可能存在 TOCTOU；写入路径也未实现原子替换。
@@ -442,6 +460,7 @@ uv run mutmut results
 | Completed | Subagent/MCP lifecycle cleanup | Focused error/cancellation tests |
 | Completed | Bounded workspace `search_code` | Resource/security/cancellation unit and integration tests |
 | Completed + Tested | Connection-owned IPC delivery isolation | Single writer、bounded queues、ownership、slow-client 和双客户端 integration tests |
+| Completed + Tested | CLI/TUI client reconnect and dedup | daemon identity、full delivery、bounded reconnect、cursor/dedup unit tests 与真实 TCP resume matrix |
 | Completed + Tested (local arm64 + CI linux/amd64) | Reproducible Docker runtime | Pinned/frozen build、independent test stage、image inspect/history 和 runtime smoke |
 
 ## Roadmap

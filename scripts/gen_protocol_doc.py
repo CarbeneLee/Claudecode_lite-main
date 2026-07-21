@@ -77,6 +77,7 @@ def _model_section(name: str, model: type, example: dict | None = None) -> str: 
 # 生成完整的 WIRE_PROTOCOL.md 文档字符串
 def generate() -> str:
     run_id = "20260516-100000-abc123"
+    daemon_instance_id = "daemon-abc123def456"
     ts = "2026-05-16T10:00:00.001Z"
 
     ping_req_example = {
@@ -121,7 +122,11 @@ def generate() -> str:
     subscribe_resp_example = {
         "jsonrpc": "2.0",
         "id": "u-3",
-        "result": {"subscription_id": "sub-abc123", "replayed_count": 0},
+        "result": {
+            "subscription_id": "sub-abc123",
+            "daemon_instance_id": daemon_instance_id,
+            "replayed_count": 0,
+        },
     }
     unsubscribe_req_example = {
         "jsonrpc": "2.0",
@@ -163,6 +168,12 @@ def generate() -> str:
     }
     event_push_example = {
         "kind": "event",
+        "subscription_id": "sub-abc123",
+        "delivery": "live",
+        "event_id": "evt-abc123",
+        "stream_id": f"run:{run_id}",
+        "seq": 1,
+        "daemon_instance_id": daemon_instance_id,
         "event": {
             "type": "step.started",
             "run_id": run_id,

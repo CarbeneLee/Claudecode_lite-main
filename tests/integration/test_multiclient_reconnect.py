@@ -15,6 +15,7 @@ from kama_claude.core.events.journal import EventJournalCoordinator
 from kama_claude.core.session.manager import SessionManager
 from kama_claude.core.session.store import SessionStore
 from kama_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
+from kama_claude.core.transport.socket_client import SocketClient
 from kama_claude.core.transport.socket_server import SocketServer
 
 
@@ -25,18 +26,24 @@ def _free_port() -> int:
         return cast(int, sock.getsockname()[1])
 
 
-# 发送固定 event.subscribe JSON-RPC request
-async def _subscribe(writer: asyncio.StreamWriter, run_id: str) -> None:
+# 发送带显式 cursor 的 event.subscribe JSON-RPC request
+async def _subscribe(
+    writer: asyncio.StreamWriter,
+    run_id: str,
+    *,
+    after_seq: int = 0,
+    request_id: str = "subscribe-1",
+) -> None:
     writer.write(
         json.dumps(
             {
                 "jsonrpc": "2.0",
-                "id": "subscribe-1",
+                "id": request_id,
                 "method": "event.subscribe",
                 "params": {
                     "topics": ["run.*"],
                     "scope": f"run:{run_id}",
-                    "after_seq": 0,
+                    "after_seq": after_seq,
                 },
             }
         ).encode()
@@ -49,7 +56,11 @@ async def _subscribe(writer: asyncio.StreamWriter, run_id: str) -> None:
 async def _server(
     tmp_path: Path,
 ) -> tuple[SocketServer, EventJournalCoordinator, str, int]:
-    broadcaster = IpcEventBroadcaster()
+    app = CoreApp()
+    assert hasattr(app, "_daemon_instance_id")
+    broadcaster = IpcEventBroadcaster(
+        daemon_instance_id=app._daemon_instance_id,
+    )
     coordinator = EventJournalCoordinator(on_durable=broadcaster.publish_durable)
     run_id = "run-response-first"
     await coordinator.register_run(run_id, tmp_path / run_id, session_id=None)
@@ -61,7 +72,6 @@ async def _server(
         )
     )
     await coordinator.flush_all()
-    app = CoreApp()
     app._broadcaster = broadcaster
     app._journal = coordinator
     port = _free_port()
@@ -69,6 +79,18 @@ async def _server(
     server.register("event.subscribe", app._subscribe_handler)
     await server.start()
     return server, coordinator, run_id, port
+
+
+# 功能：验证 CoreApp 生命期内 daemon identity 稳定且新实例获得不同身份
+# 设计：同时构造两个实例，对单实例重复读取并跨实例比较，不依赖时钟或进程重启
+def test_core_app_daemon_instance_id_is_stable_and_unique() -> None:
+    first = CoreApp()
+    second = CoreApp()
+
+    assert hasattr(first, "_daemon_instance_id")
+    first_identity = first._daemon_instance_id
+    assert first._daemon_instance_id == first_identity
+    assert second._daemon_instance_id != first_identity
 
 
 # 功能：验证真实 TCP 中 subscribe success frame 严格先于第一条 replay EventPushEnvelope
@@ -85,11 +107,14 @@ async def test_subscribe_response_is_written_before_first_replay_frame(
         replay = json.loads(await reader.readline())
 
         assert response["id"] == "subscribe-1"
+        assert response["result"]["subscription_id"].startswith("sub-")
         assert response["result"]["stream_id"] == f"run:{run_id}"
         assert response["result"]["high_watermark_seq"] == 1
+        assert response["result"]["daemon_instance_id"]
         assert replay["kind"] == "event"
         assert replay["delivery"] == "replay"
         assert replay["seq"] == 1
+        assert replay["daemon_instance_id"] == response["result"]["daemon_instance_id"]
     finally:
         writer.close()
         await writer.wait_closed()
@@ -97,8 +122,8 @@ async def test_subscribe_response_is_written_before_first_replay_frame(
         await coordinator.close()
 
 
-# 功能：验证 replay reader 被阻塞时 subscribe response 仍已 written 且 event queue 尚无 replay
-# 设计：用 Event gate 包住 coordinator.read_replay，先读取响应并确认 reader entered，再释放 gate读取首事件
+# 功能：验证 subscribe response 已含身份与 watermark 时，第一个 replay delivery callback 仍未发生
+# 设计：用 gate 阻塞真实 replay reader，通过 SocketClient send_command/on_delivery 分别观测 response 与 callback 边界
 async def test_slow_replay_reader_does_not_delay_subscribe_response(
     tmp_path: Path,
 ) -> None:
@@ -108,30 +133,150 @@ async def test_slow_replay_reader_does_not_delay_subscribe_response(
     original = coordinator.read_replay
 
     # 在真实 replay reader 前设置 gate，分离 response written 与磁盘读取时序
+    # 在测试门闩放行前阻塞真实 replay reader
     async def gated_read(*args: Any, **kwargs: Any) -> Any:
         entered.set()
         await release.wait()
         return await original(*args, **kwargs)
 
     coordinator.read_replay = cast(Any, gated_read)
-    reader, writer = await asyncio.open_connection("127.0.0.1", port)
-    try:
-        await _subscribe(writer, run_id)
+    client = SocketClient("127.0.0.1", port)
+    deliveries: list[Any] = []
+    delivered = asyncio.Event()
 
-        response = json.loads(await reader.readline())
+    # 收集 SocketClient 解析后的完整 delivery 并通知测试继续
+    async def collect_delivery(delivery: Any) -> None:
+        deliveries.append(delivery)
+        delivered.set()
+
+    assert hasattr(client, "on_delivery")
+    client.on_delivery(collect_delivery)
+    await client.connect()
+    loop_task = asyncio.create_task(client.run_event_loop())
+    try:
+        response = await client.send_command(
+            "event.subscribe",
+            {
+                "topics": ["run.*"],
+                "scope": f"run:{run_id}",
+                "after_seq": 0,
+            },
+        )
         await entered.wait()
 
-        assert response["result"]["subscription_id"].startswith("sub-")
-        assert response["result"]["high_watermark_seq"] == 1
+        assert response["subscription_id"].startswith("sub-")
+        assert response["high_watermark_seq"] == 1
+        assert response["daemon_instance_id"]
+        assert deliveries == []
         release.set()
-        replay = json.loads(await reader.readline())
-        assert replay["delivery"] == "replay"
+        await asyncio.wait_for(delivered.wait(), timeout=2.0)
+        assert deliveries[0].delivery == "replay"
+        assert deliveries[0].daemon_instance_id == response["daemon_instance_id"]
     finally:
         release.set()
-        writer.close()
-        await writer.wait_closed()
+        loop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await loop_task
+        await client.close()
         await server.stop()
         await coordinator.close()
+
+
+# 功能：验证真实 TCP 断线重连会从最后成功处理的 seq 继续且不重放旧帧
+# 设计：首连接消费 seq=1 后断开，再追加 terminal 事件并以 after_seq=1 新建连接，锁定 cursor resume 边界
+async def test_real_tcp_reconnect_resumes_after_last_processed_seq(
+    tmp_path: Path,
+) -> None:
+    server, coordinator, run_id, port = await _server(tmp_path)
+    first_reader, first_writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        await _subscribe(first_writer, run_id)
+        first_response = json.loads(await first_reader.readline())
+        first_replay = json.loads(await first_reader.readline())
+        assert first_response["result"]["accepted_after_seq"] == 0
+        assert first_replay["seq"] == 1
+
+        first_writer.close()
+        await first_writer.wait_closed()
+        await coordinator.handle(
+            RunFinishedEvent(
+                run_id=run_id,
+                status="completed",
+                steps=1,
+                reason=None,
+                ts="2026-07-21T00:00:01Z",
+            )
+        )
+        await coordinator.flush_all()
+
+        second_reader, second_writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            await _subscribe(
+                second_writer,
+                run_id,
+                after_seq=1,
+                request_id="subscribe-2",
+            )
+            second_response = json.loads(await second_reader.readline())
+            resumed_replay = json.loads(await second_reader.readline())
+
+            assert second_response["id"] == "subscribe-2"
+            assert second_response["result"]["accepted_after_seq"] == 1
+            assert second_response["result"]["high_watermark_seq"] == 2
+            assert resumed_replay["seq"] == 2
+            assert resumed_replay["event"]["type"] == "run.finished"
+            assert (
+                resumed_replay["daemon_instance_id"]
+                == first_response["result"]["daemon_instance_id"]
+            )
+        finally:
+            second_writer.close()
+            await second_writer.wait_closed()
+    finally:
+        if not first_writer.is_closing():
+            first_writer.close()
+            await first_writer.wait_closed()
+        await server.stop()
+        await coordinator.close()
+
+
+# 功能：验证两个真实 daemon transport 暴露不同 identity，客户端可区分重连与重启
+# 设计：顺序启动两套真实 TCP server 并读取 subscribe response，避免用 mock identity 冒充进程边界
+async def test_real_tcp_daemon_restart_changes_subscribe_identity(
+    tmp_path: Path,
+) -> None:
+    first_server, first_coordinator, first_run, first_port = await _server(
+        tmp_path / "first"
+    )
+    first_reader, first_writer = await asyncio.open_connection("127.0.0.1", first_port)
+    try:
+        await _subscribe(first_writer, first_run)
+        first_response = json.loads(await first_reader.readline())
+    finally:
+        first_writer.close()
+        await first_writer.wait_closed()
+        await first_server.stop()
+        await first_coordinator.close()
+
+    second_server, second_coordinator, second_run, second_port = await _server(
+        tmp_path / "second"
+    )
+    second_reader, second_writer = await asyncio.open_connection(
+        "127.0.0.1", second_port
+    )
+    try:
+        await _subscribe(second_writer, second_run, request_id="subscribe-2")
+        second_response = json.loads(await second_reader.readline())
+
+        assert (
+            second_response["result"]["daemon_instance_id"]
+            != first_response["result"]["daemon_instance_id"]
+        )
+    finally:
+        second_writer.close()
+        await second_writer.wait_closed()
+        await second_server.stop()
+        await second_coordinator.close()
 
 
 # 功能：验证 daemon shutdown 先取消并等待 connection request 的 terminal publish，再关闭 journal

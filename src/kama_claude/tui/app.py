@@ -4,8 +4,10 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from rich.markdown import Markdown
 from textual import events
@@ -19,9 +21,200 @@ from textual.widgets import Label, Static, TextArea
 
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.skills.loader import SkillLoader
-from kama_claude.core.transport.socket_client import IpcError, SocketClient
+from kama_claude.core.transport.socket_client import EventDelivery, IpcError, SocketClient
 
 log = logging.getLogger(__name__)
+
+type _DaemonTransition = Literal["initial", "same", "changed"]
+type _DeliveryConsumer = Callable[[EventDelivery], Awaitable[None]]
+
+_RECONNECT_ATTEMPT_LIMIT = 5
+_RECONNECT_DELAY_SECONDS = 2.0
+_EVENT_TOPICS = [
+    "session.*",
+    "run.*",
+    "step.*",
+    "tool.*",
+    "llm.token",
+    "llm.usage",
+    "log.*",
+    "permission.*",
+    "context.*",
+    "subagent.*",
+    "skill.*",
+]
+
+
+class _ConnectionLost(RuntimeError):
+    pass
+
+
+class _SessionCreateOutcomeUnknown(RuntimeError):
+    pass
+
+
+class _HistoricalReplayUnavailable(RuntimeError):
+    pass
+
+
+class _DeliveryGate:
+    # 初始化 subscribe response 之前的 delivery 缓冲门闩
+    def __init__(self, consumer: _DeliveryConsumer) -> None:
+        self._consumer = consumer
+        self._pending: list[EventDelivery] = []
+        self._ready = False
+        self._lock = asyncio.Lock()
+
+    # 在 daemon 身份和订阅响应尚未确认时缓冲 delivery
+    async def handle(self, delivery: EventDelivery) -> None:
+        async with self._lock:
+            if not self._ready:
+                self._pending.append(delivery)
+                return
+            await self._consumer(delivery)
+
+    # 确认订阅响应后依到达顺序放行已缓冲 delivery
+    async def open(self) -> None:
+        async with self._lock:
+            self._ready = True
+            pending = self._pending
+            self._pending = []
+            for delivery in pending:
+                await self._consumer(delivery)
+
+    # 连接未完成握手时丢弃不可归属的缓冲 delivery
+    async def discard(self) -> None:
+        async with self._lock:
+            self._pending = []
+
+
+@dataclass(slots=True)
+class _TuiReconnectState:
+    daemon_instance_id: str | None = None
+    replay_run_id: str | None = None
+    session_id: str | None = None
+    busy: bool = False
+    stream_cursors: dict[str, int] = field(default_factory=dict)
+    rendered_event_ids: set[str] = field(default_factory=set)
+    pending_tool_ids: set[str] = field(default_factory=set)
+    pending_permission_ids: set[str] = field(default_factory=set)
+    session_create_unknown_daemon_id: str | None = None
+
+    # 接受握手返回的 daemon 身份，并在实例变化时原子失效旧状态
+    def accept_daemon(self, daemon_instance_id: str) -> _DaemonTransition:
+        if self.daemon_instance_id is None:
+            self.daemon_instance_id = daemon_instance_id
+            return "initial"
+        if self.daemon_instance_id == daemon_instance_id:
+            return "same"
+        self.daemon_instance_id = daemon_instance_id
+        self.session_id = None
+        self.busy = False
+        self.stream_cursors.clear()
+        self.rendered_event_ids.clear()
+        self.pending_tool_ids.clear()
+        self.pending_permission_ids.clear()
+        self.session_create_unknown_daemon_id = None
+        return "changed"
+
+    # 当 daemon 明确报告 session 不存在时清理旧视图但保留 daemon 身份
+    def invalidate_session(self) -> None:
+        self.session_id = None
+        self.busy = False
+        self.stream_cursors.clear()
+        self.rendered_event_ids.clear()
+        self.pending_tool_ids.clear()
+        self.pending_permission_ids.clear()
+
+    # 返回当前 TUI 视图的 durable stream 与已成功处理 cursor
+    def subscription_target(self, stream_id: str | None = None) -> tuple[str, int]:
+        target = stream_id
+        if target is None and self.replay_run_id is not None:
+            target = f"run:{self.replay_run_id}"
+        if target is None and self.session_id is not None:
+            target = f"session:{self.session_id}"
+        if target is None:
+            raise RuntimeError("durable subscription target is unavailable")
+        return target, self.stream_cursors.get(target, 0)
+
+    # 在 handler 成功后才提交持久 cursor 和渲染去重标识
+    async def process_delivery(
+        self,
+        delivery: EventDelivery,
+        handler: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        event_id = delivery.event_id
+        stream_id = delivery.stream_id
+        seq = delivery.seq
+        if event_id is None or stream_id is None or seq is None:
+            await handler(delivery.event)
+            return
+        if event_id not in self.rendered_event_ids:
+            await handler(delivery.event)
+            self.rendered_event_ids.add(event_id)
+        self.stream_cursors[stream_id] = max(self.stream_cursors.get(stream_id, 0), seq)
+
+
+# 判断 CancelledError 是否来自 TUI socket worker 的外层取消
+def _caller_is_cancelling() -> bool:
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
+# 取消读循环并关闭 socket，清理异常只记录角色不记录参数
+async def _close_tui_connection(
+    client: SocketClient,
+    loop_task: asyncio.Task[None] | None,
+) -> None:
+    if loop_task is not None and not loop_task.done():
+        loop_task.cancel()
+    if loop_task is not None:
+        await asyncio.gather(loop_task, return_exceptions=True)
+    try:
+        await client.close()
+    except (ConnectionError, OSError):
+        log.warning("secondary cleanup failed role=tui_connection_close")
+
+
+# 丢弃未开门 delivery 并关闭当前 TUI 连接的全部资源
+async def _cleanup_tui_connection(
+    gate: _DeliveryGate,
+    client: SocketClient,
+    loop_task: asyncio.Task[None] | None,
+) -> None:
+    await gate.discard()
+    await _close_tui_connection(client, loop_task)
+
+
+# 在保留首次 cancellation 时屏蔽重复 cancellation 直到 cleanup 终态
+async def _await_tui_cleanup(awaitable: Awaitable[Any]) -> None:
+    cleanup_task = asyncio.ensure_future(awaitable)
+    current = asyncio.current_task()
+    baseline_cancels = current.cancelling() if current is not None else 0
+    cleanup_cancellation: asyncio.CancelledError | None = None
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError as exc:
+            if baseline_cancels == 0 and cleanup_cancellation is None:
+                cleanup_cancellation = exc
+                baseline_cancels = current.cancelling() if current is not None else 1
+                continue
+            if current is not None:
+                while current.cancelling() > baseline_cancels:
+                    current.uncancel()
+            continue
+        except Exception:
+            log.warning("secondary cleanup failed role=tui_connection")
+            return
+    try:
+        cleanup_task.result()
+    except asyncio.CancelledError:
+        log.warning("secondary cleanup cancelled role=tui_connection")
+    except Exception:
+        log.warning("secondary cleanup failed role=tui_connection")
+    if cleanup_cancellation is not None:
+        raise cleanup_cancellation
 
 
 def _preview(s: str, n: int) -> str:
@@ -259,8 +452,10 @@ class PermissionBlock(Static):
     _LABEL_MAP: dict[str, str] = {
         "allow_once":   "allowed (once)",
         "always_allow": "always allowed",
+        "auto_allow":   "automatically allowed",
         "deny_once":    "denied",
         "always_deny":  "always denied",
+        "auto_deny":    "automatically denied",
         "timeout":      "⏱ timed out",
     }
     LABEL_MAP = _LABEL_MAP
@@ -289,7 +484,7 @@ class PermissionBlock(Static):
         if self._resolved:
             return
         self._resolved = True
-        allowed = decision in ("allow_once", "always_allow")
+        allowed = decision in ("allow_once", "always_allow", "auto_allow")
         icon = "[bold green]✓[/bold green]" if allowed else "[bold red]✗[/bold red]"
         label = self._LABEL_MAP.get(decision, decision)
         preview = f"  [dim]{self._param_preview}[/dim]" if self._param_preview else ""
@@ -512,16 +707,41 @@ class KamaTuiApp(App[None]):
         self._host = host
         self._port = port
         self._replay_run_id = replay_run_id
+        self._reconnect_state = _TuiReconnectState(replay_run_id=replay_run_id)
         self._client: SocketClient | None = None
         self._current_llm: LLMStreamBlock | None = None
         self._pending_tool_blocks: dict[str, ToolCallBlock] = {}
         self._pending_permission_blocks: dict[str, PermissionBlock] = {}
-        self._session_id: str | None = None
-        self._busy = False
+        self._permission_owners: dict[str, tuple[str | None, str | None]] = {}
+        self._permission_selects: dict[str, PermissionSelect] = {}
+        self._connection_ready = False
+        self._reported_session_unknown_daemon_id: str | None = None
         self._last_context_pct: float = 0.0
         self._slash_items: list[tuple[str, str]] = []
         self._subagent_run_ids: dict[str, str] = {}  # child run_id -> description
         self._subagent_start_times: dict[str, float] = {}  # child run_id -> start time
+        self._stream_cursors = self._reconnect_state.stream_cursors
+        self._rendered_event_ids = self._reconnect_state.rendered_event_ids
+
+    @property
+    # 透过重连状态对象读取当前 session 标识
+    def _session_id(self) -> str | None:
+        return self._reconnect_state.session_id
+
+    @_session_id.setter
+    # 透过重连状态对象更新当前 session 标识
+    def _session_id(self, value: str | None) -> None:
+        self._reconnect_state.session_id = value
+
+    @property
+    # 透过重连状态对象读取 agent 忙碌状态
+    def _busy(self) -> bool:
+        return self._reconnect_state.busy
+
+    @_busy.setter
+    # 透过重连状态对象更新 agent 忙碌状态
+    def _busy(self, value: bool) -> None:
+        self._reconnect_state.busy = value
 
     def compose(self) -> ComposeResult:
         yield Label("[bold]KamaClaude[/bold]  [dim]connecting...[/dim]", id="header")
@@ -657,8 +877,14 @@ class KamaTuiApp(App[None]):
                 f"  [dim]summary={summary_tokens} tokens  saved≈{saved_tokens} tokens[/dim]",
                 classes="log-line",
             ))
-        except (IpcError, RuntimeError, OSError) as e:
-            self._append(Static(f"[red]compact error: {e}[/red]", classes="log-line"))
+        except (IpcError, RuntimeError, OSError):
+            log.warning("tui command failed role=session_compact")
+            self._append(
+                Static(
+                    "[red]compact failed; retry when connected[/red]",
+                    classes="log-line",
+                )
+            )
 
     # 在 worker 中执行 IPC 发送，使 App 消息泵在 agent 运行期间仍能处理键盘/焦点等消息
     async def _do_send_message(self, content: str) -> None:
@@ -669,7 +895,8 @@ class KamaTuiApp(App[None]):
                 "session.send_message",
                 {"session_id": self._session_id, "content": content},
             )
-        except (IpcError, RuntimeError, OSError) as e:
+        except (IpcError, RuntimeError, OSError):
+            log.warning("tui command failed role=session_send_message")
             self._busy = False
             prompt = self._prompt()
             if prompt is not None:
@@ -677,35 +904,88 @@ class KamaTuiApp(App[None]):
                 prompt.read_only = False
                 prompt.border_title = "type a message — enter to send, ⌘/⇧/⌥+enter for newline"
             self._update_header("ready")
-            self._append(Static(f"[red]send error: {e}[/red]", classes="log-line"))
+            self._append(
+                Static(
+                    "[red]send failed; retry when connected[/red]",
+                    classes="log-line",
+                )
+            )
 
     # 处理内联审批控件的用户决策：发送 IPC 响应并恢复输入框
     async def on_permission_select_decided(self, msg: PermissionSelect.Decided) -> None:
         tool_use_id = msg.tool_use_id
         decision = msg.decision
         log.info("permission decided tool_use_id=%s decision=%s", tool_use_id, decision)
+        owner = self._permission_owners.get(tool_use_id)
+        current_owner = (
+            self._reconnect_state.daemon_instance_id,
+            self._session_id,
+        )
+        if owner is None or owner != current_owner:
+            self._pending_permission_blocks.pop(tool_use_id, None)
+            self._reconnect_state.pending_permission_ids.discard(tool_use_id)
+            self._permission_owners.pop(tool_use_id, None)
+            select = self._permission_selects.pop(tool_use_id, msg.widget)
+            try:
+                select.remove()
+            except Exception:
+                log.warning("secondary cleanup failed role=stale_permission_widget")
+            return
+        if self._client is None:
+            log.info("permission decision deferred until same-daemon reconnect")
+            return
+        client = self._client
         try:
-            msg.widget.remove()
-            perm_block = self._pending_permission_blocks.pop(tool_use_id, None)
-            if perm_block is not None:
+            await client.send_command(
+                "permission.respond",
+                {"tool_use_id": tool_use_id, "decision": decision},
+            )
+        except asyncio.CancelledError:
+            if _caller_is_cancelling():
+                raise
+            log.warning("tui command failed role=permission_respond")
+            return
+        except (IpcError, RuntimeError, OSError):
+            log.warning("tui command failed role=permission_respond")
+            return
+
+        current_owner = (
+            self._reconnect_state.daemon_instance_id,
+            self._session_id,
+        )
+        if self._permission_owners.get(tool_use_id) != current_owner:
+            return
+        self._finish_permission(tool_use_id, decision)
+
+    # 统一提交 granted/denied 权限终态并按 busy/pending 状态恢复输入框
+    def _finish_permission(self, tool_use_id: str, decision: str) -> None:
+        perm_block = self._pending_permission_blocks.pop(tool_use_id, None)
+        self._reconnect_state.pending_permission_ids.discard(tool_use_id)
+        self._permission_owners.pop(tool_use_id, None)
+        if perm_block is not None:
+            try:
                 perm_block._resolve(decision)
-            if self._client is not None:
-                try:
-                    await self._client.send_command(
-                        "permission.respond",
-                        {"tool_use_id": tool_use_id, "decision": decision},
-                    )
-                except (IpcError, RuntimeError, OSError):
-                    pass
-            if not self._pending_permission_blocks:
-                p = self._prompt()
-                if p is not None:
-                    p.disabled = False
-                    p.read_only = False
-                    p.border_title = "type a message — enter to send, ⌘/⇧/⌥+enter for newline"
-                    p.focus()
+            except Exception:
+                log.warning("secondary cleanup failed role=permission_block_resolve")
+        select = self._permission_selects.pop(tool_use_id, None)
+        try:
+            if select is not None:
+                select.remove()
         except Exception:
-            log.exception("on_permission_select_decided failed tool_use_id=%s", tool_use_id)
+            log.warning("secondary cleanup failed role=permission_widget_remove")
+        if not self._reconnect_state.pending_permission_ids:
+            p = self._prompt()
+            if p is not None:
+                p.read_only = False
+                if self._busy:
+                    p.disabled = True
+                    p.border_title = "agent is working..."
+                else:
+                    p.disabled = False
+                    p.border_title = (
+                        "type a message — enter to send, ⌘/⇧/⌥+enter for newline"
+                    )
+                    p.focus()
 
     # 向日志视图追加一个 widget 并滚动到底部
     def _append(self, widget: Widget) -> None:
@@ -761,90 +1041,300 @@ class KamaTuiApp(App[None]):
             f"{session}  [{color}]{state}[/{color}]"
         )
 
-    # 管理 SocketClient 生命周期：连接、订阅事件、断线重连
-    async def _socket_loop(self) -> None:
-        header = self.query_one("#header", Label)
+    # 根据已恢复的 session 状态设置输入框和顶部状态
+    def _set_connected_ui(self) -> None:
+        prompt = self._prompt()
+        if self._replay_run_id is not None:
+            if prompt is not None:
+                prompt.disabled = True
+                prompt.read_only = False
+                prompt.border_title = "replay mode"
+            self._update_header("ready")
+            return
+        if prompt is not None:
+            prompt.read_only = False
+            if self._reconnect_state.pending_permission_ids:
+                prompt.disabled = True
+                prompt.border_title = "permission required"
+            elif self._busy:
+                prompt.disabled = True
+                prompt.border_title = "agent is working..."
+            else:
+                prompt.disabled = False
+                prompt.border_title = "type a message — enter to send, ⌘/⇧/⌥+enter for newline"
+                prompt.focus()
+        self._update_header("running" if self._busy else "ready")
 
-        while True:
-            client = SocketClient(self._host, self._port)
-            self._client = None
+    # 清理已不属于当前 daemon/session 的未完成 UI 对象
+    def _clear_pending_view(self) -> None:
+        self._pending_tool_blocks.clear()
+        self._pending_permission_blocks.clear()
+        self._permission_owners.clear()
+        self._subagent_run_ids.clear()
+        self._subagent_start_times.clear()
+        self._break_llm()
+        for select in self._permission_selects.values():
             try:
-                await client.connect()
-            except (ConnectionRefusedError, OSError):
-                log.warning("connection refused %s:%s, retrying", self._host, self._port)
-                self._update_header("disconnected")
-                await asyncio.sleep(2)
-                continue
+                select.remove()
+            except Exception:
+                log.warning("secondary cleanup failed role=tui_permission_widget_clear")
+        self._permission_selects.clear()
 
-            log.info("connected to %s:%s", self._host, self._port)
-            self._client = client
-            self._update_header("connecting")
+    # 显示 daemon 重启或 session 丢失造成的明确历史边界
+    def _append_recovery_notice(
+        self,
+        reason: Literal["daemon_changed", "session_unavailable"],
+    ) -> None:
+        if reason == "daemon_changed":
+            if self._replay_run_id is not None:
+                message = (
+                    "[bold yellow]daemon restarted[/bold yellow]  "
+                    "[dim]active execution is not recoverable; checking historical replay[/dim]"
+                )
+            else:
+                message = (
+                    "[bold yellow]daemon restarted[/bold yellow]  "
+                    "[dim]the previous active session/run cannot be recovered; "
+                    "starting a new session[/dim]"
+                )
+        else:
+            message = (
+                "[bold yellow]session unavailable[/bold yellow]  "
+                "[dim]the previous view ended; starting a new session without mixing history[/dim]"
+            )
+        self._append(Static(message, classes="log-line"))
+
+    # 用无事件 global 订阅完成 response-first daemon identity 握手并立即解除
+    async def _handshake_daemon(self, client: SocketClient) -> str:
+        result = await client.send_command(
+            "event.subscribe",
+            {"topics": [], "scope": "global"},
+        )
+        subscription_id = str(result["subscription_id"])
+        daemon_instance_id = str(result["daemon_instance_id"])
+        await client.send_command(
+            "event.unsubscribe",
+            {"subscription_id": subscription_id},
+        )
+        return daemon_instance_id
+
+    # 创建一个新 chat session，仅在已证明可安全创建的 daemon 上调用
+    async def _create_chat_session(self, client: SocketClient) -> None:
+        created = await client.send_command(
+            "session.create",
+            {
+                "mode": "chat",
+                "workspace_root": str(Path.cwd().resolve()),
+            },
+        )
+        self._session_id = str(created["session_id"])
+        log.info("session created session_id=%s", self._session_id)
+
+    # 为当前 session/replay 视图建立从已提交 cursor 开始的 durable 订阅
+    async def _subscribe_current_view(
+        self,
+        client: SocketClient,
+        daemon_instance_id: str,
+    ) -> None:
+        stream_id, after_seq = self._reconnect_state.subscription_target()
+        result = await client.send_command(
+            "event.subscribe",
+            {
+                "topics": _EVENT_TOPICS,
+                "scope": stream_id,
+                "after_seq": after_seq,
+            },
+        )
+        if str(result["daemon_instance_id"]) != daemon_instance_id:
+            raise _ConnectionLost("daemon identity changed during subscribe")
+
+    # 运行单次连接：握手、状态判定、durable 订阅与读循环共享同一 cleanup
+    async def _run_connection(self, client: SocketClient) -> None:
+        loop_task: asyncio.Task[None] | None = None
+        gate = _DeliveryGate(self._handle_delivery)
+        phase = "connect"
+        self._connection_ready = False
+        try:
+            await client.connect()
+            client.on_delivery(gate.handle)
             loop_task = asyncio.create_task(client.run_event_loop())
 
-            async def on_event(event: dict[str, Any]) -> None:
-                self._handle_event(event)
+            phase = "handshake"
+            daemon_instance_id = await self._handshake_daemon(client)
+            replay_target: str | None = None
+            replay_cursor = 0
+            replay_rendered_ids: set[str] = set()
+            if self._replay_run_id is not None:
+                replay_target = f"run:{self._replay_run_id}"
+                replay_cursor = self._stream_cursors.get(replay_target, 0)
+                replay_rendered_ids = set(self._rendered_event_ids)
+            transition = self._reconnect_state.accept_daemon(daemon_instance_id)
+            replay_daemon_changed = (
+                transition == "changed" and self._replay_run_id is not None
+            )
+            if transition == "changed":
+                if replay_target is not None:
+                    self._stream_cursors[replay_target] = replay_cursor
+                    self._rendered_event_ids.update(replay_rendered_ids)
+                self._clear_pending_view()
+                self._append_recovery_notice("daemon_changed")
 
-            client.on_event(on_event)
+            if self._replay_run_id is None and self._session_id is not None:
+                phase = "session_check"
+                try:
+                    await client.send_command(
+                        "session.get_history",
+                        {"session_id": self._session_id},
+                    )
+                except IpcError as exc:
+                    if exc.code != -32010:
+                        raise
+                    self._reconnect_state.invalidate_session()
+                    self._clear_pending_view()
+                    self._append_recovery_notice("session_unavailable")
 
+            if self._replay_run_id is None and self._session_id is None:
+                if (
+                    self._reconnect_state.session_create_unknown_daemon_id
+                    == daemon_instance_id
+                ):
+                    raise _SessionCreateOutcomeUnknown(
+                        "session creation outcome is unknown on this daemon"
+                    )
+                phase = "session_create"
+                await self._create_chat_session(client)
+
+            phase = "subscribe"
             try:
-                loop_task.add_done_callback(
-                    lambda t: log.error("loop_task failed: %s", t.exception())
-                    if not t.cancelled() and t.exception() is not None
-                    else None
+                await self._subscribe_current_view(client, daemon_instance_id)
+            except IpcError:
+                if replay_daemon_changed:
+                    raise _HistoricalReplayUnavailable(
+                        "historical replay stream unavailable on new daemon"
+                    ) from None
+                raise
+            if replay_daemon_changed:
+                self._append(
+                    Static(
+                        "[bold yellow]historical replay continuing[/bold yellow]  "
+                        "[dim]the persisted run stream was found on the new daemon[/dim]",
+                        classes="log-line",
+                    )
                 )
-                params: dict[str, Any] = {
-                    "topics": [
-                        "session.*",
-                        "run.*",
-                        "step.*",
-                        "tool.*",
-                        "llm.token",
-                        "llm.usage",
-                        "log.*",
-                        "permission.*",
-                        "context.*",
-                        "subagent.*",
-                        "skill.*",
-                    ],
-                    "scope": "global",
-                }
-                if self._replay_run_id is not None:
-                    params["replay_from_run"] = self._replay_run_id
-                await client.send_command("event.subscribe", params)
-                created = await client.send_command(
-                    "session.create",
-                    {
-                        "mode": "chat",
-                        "workspace_root": str(Path.cwd().resolve()),
-                    },
+            phase = "delivery_open"
+            self._client = client
+            await gate.open()
+            self._connection_ready = True
+            self._set_connected_ui()
+
+            phase = "event_loop"
+            await loop_task
+        except asyncio.CancelledError:
+            if _caller_is_cancelling():
+                raise
+            if phase == "session_create":
+                unknown_daemon_instance_id = self._reconnect_state.daemon_instance_id
+                self._reconnect_state.session_create_unknown_daemon_id = (
+                    unknown_daemon_instance_id
                 )
-                self._session_id = str(created["session_id"])
-                log.info("session created session_id=%s", self._session_id)
-                prompt = self._prompt()
-                if prompt is not None:
-                    prompt.disabled = False
-                    prompt.read_only = False
-                    prompt.border_title = "type a message — enter to send, ⌘/⇧/⌥+enter for newline"
-                    prompt.focus()
-                self._update_header("ready")
-                await loop_task
-            except IpcError as e:
-                header.update(f"[bold]KamaClaude[/bold]  [red]subscribe error: {e}[/red]")
-            finally:
-                if not loop_task.done():
-                    loop_task.cancel()
+                raise _SessionCreateOutcomeUnknown(
+                    "session creation response was lost"
+                ) from None
+            raise _ConnectionLost("connection closed during handshake") from None
+        except _SessionCreateOutcomeUnknown:
+            raise
+        except _ConnectionLost:
+            raise
+        except (ConnectionError, OSError):
+            if phase == "session_create":
+                self._reconnect_state.session_create_unknown_daemon_id = (
+                    self._reconnect_state.daemon_instance_id
+                )
+                raise _SessionCreateOutcomeUnknown(
+                    "session creation transport outcome was lost"
+                ) from None
+            raise _ConnectionLost("transport disconnected") from None
+        except Exception:
+            if phase in {"delivery_open", "event_loop"}:
+                raise _ConnectionLost("event handler or transport failed") from None
+            raise
+        finally:
+            await _await_tui_cleanup(_cleanup_tui_connection(gate, client, loop_task))
+            if self._client is client:
                 self._client = None
-                self._session_id = None
+
+    # 管理 SocketClient 生命周期：连接、订阅事件、断线重连
+    async def _socket_loop(self) -> None:
+        attempts = 0
+        while attempts < _RECONNECT_ATTEMPT_LIMIT:
+            self._update_header("connecting")
+            client = SocketClient(self._host, self._port)
+            try:
+                await self._run_connection(client)
+            except asyncio.CancelledError:
+                raise
+            except _SessionCreateOutcomeUnknown:
+                self._update_header("disconnected")
+                unknown_daemon_id = (
+                    self._reconnect_state.session_create_unknown_daemon_id
+                )
+                if self._reported_session_unknown_daemon_id != unknown_daemon_id:
+                    self._reported_session_unknown_daemon_id = unknown_daemon_id
+                    self._append(
+                        Static(
+                            "[bold red]session state unknown[/bold red]  "
+                            "[dim]this daemon will not receive another create; "
+                            "waiting for a new daemon instance[/dim]",
+                            classes="log-line",
+                        )
+                    )
                 prompt = self._prompt()
                 if prompt is not None:
                     prompt.disabled = True
                     prompt.read_only = False
-                    prompt.border_title = "disconnected, retrying..."
-                self._break_llm()
-                await client.close()
-
+                    prompt.border_title = "session state unknown; waiting for daemon restart"
+            except _HistoricalReplayUnavailable:
+                self._update_header("disconnected")
+                self._append(
+                    Static(
+                        "[bold red]historical replay unavailable[/bold red]  "
+                        "[dim]the old run stream is not owned by this daemon[/dim]",
+                        classes="log-line",
+                    )
+                )
+                prompt = self._prompt()
+                if prompt is not None:
+                    prompt.disabled = True
+                    prompt.read_only = False
+                    prompt.border_title = "historical replay unavailable"
+                return
+            except (IpcError, _ConnectionLost):
+                log.warning("tui reconnectable failure role=socket_connection")
+            if self._connection_ready:
+                attempts = 0
+            attempts += 1
+            if attempts >= _RECONNECT_ATTEMPT_LIMIT:
+                break
+            prompt = self._prompt()
+            if prompt is not None:
+                prompt.disabled = True
+                prompt.read_only = False
+                prompt.border_title = "disconnected, retrying..."
             self._update_header("disconnected")
-            await asyncio.sleep(2)
+            await self._wait_before_reconnect()
+
+        self._update_header("disconnected")
+        self._append(
+            Static(
+                "[bold red]reconnect exhausted[/bold red]  "
+                "[dim]restart the TUI after checking the daemon[/dim]",
+                classes="log-line",
+            )
+        )
+
+    # 在有界重连尝试之间等待，独立方法便于 Event 门控测试
+    async def _wait_before_reconnect(self) -> None:
+        await asyncio.sleep(_RECONNECT_DELAY_SECONDS)
 
     # 根据事件 type 路由到对应渲染逻辑；捕获异常防止 socket loop 因单个事件崩溃
     def _handle_event(self, event: dict[str, Any]) -> None:
@@ -852,6 +1342,13 @@ class KamaTuiApp(App[None]):
             self._handle_event_inner(event)
         except Exception:
             log.exception("_handle_event crashed  event_type=%s", event.get("type", "?"))
+
+    # 处理完整 delivery：成功渲染后按 stream 推进 cursor，并用 event_id 避免重复渲染
+    async def _handle_delivery(self, delivery: EventDelivery) -> None:
+        async def render(event: dict[str, Any]) -> None:
+            self._handle_event_inner(event)
+
+        await self._reconnect_state.process_delivery(delivery, render)
 
     # 实际的事件路由逻辑
     def _handle_event_inner(self, event: dict[str, Any]) -> None:
@@ -953,6 +1450,7 @@ class KamaTuiApp(App[None]):
             if run_id in self._subagent_run_ids:
                 tc_block.styles.padding = (0, 2, 0, 6)
             self._pending_tool_blocks[tool_use_id] = tc_block
+            self._reconnect_state.pending_tool_ids.add(tool_use_id)
             self._append(tc_block)
 
         elif t == "tool.call_finished":
@@ -962,6 +1460,7 @@ class KamaTuiApp(App[None]):
             if tool_use_id in self._pending_tool_blocks:
                 tc_done = self._pending_tool_blocks.pop(tool_use_id)
                 tc_done.set_result(output, elapsed_ms)
+            self._reconnect_state.pending_tool_ids.discard(tool_use_id)
 
         elif t == "tool.call_failed":
             tool_use_id = str(event.get("tool_use_id", ""))
@@ -970,6 +1469,7 @@ class KamaTuiApp(App[None]):
             if tool_use_id in self._pending_tool_blocks:
                 tc_done = self._pending_tool_blocks.pop(tool_use_id)
                 tc_done.set_result(error_msg, elapsed_ms, is_error=True)
+            self._reconnect_state.pending_tool_ids.discard(tool_use_id)
 
         elif t == "run.finished":
             status = event.get("status", "")
@@ -1027,37 +1527,29 @@ class KamaTuiApp(App[None]):
             )
             perm_block = PermissionBlock(tool_use_id, tool_name, param_preview)
             self._pending_permission_blocks[tool_use_id] = perm_block
+            self._reconnect_state.pending_permission_ids.add(tool_use_id)
+            self._permission_owners[tool_use_id] = (
+                self._reconnect_state.daemon_instance_id,
+                self._session_id,
+            )
             prompt = self._prompt()
             if prompt is not None:
                 prompt.disabled = True
                 prompt.border_title = "permission required"
             self._append(perm_block)
             select = PermissionSelect(tool_use_id)
+            self._permission_selects[tool_use_id] = select
             self._mount_permission_select(select)
             log.debug(
                 "PermissionSelect mounted before #prompt  pending=%d",
                 len(self._pending_permission_blocks),
             )
 
-        elif t == "permission.denied":
-            # 处理超时或断连等非用户交互触发的 deny
+        elif t in {"permission.granted", "permission.denied"}:
+            # 用共享终态路径处理用户响应、自动策略与重放事件
             tool_use_id = str(event.get("tool_use_id", ""))
             decision = str(event.get("decision", "denied"))
-            if tool_use_id in self._pending_permission_blocks:
-                perm_block = self._pending_permission_blocks.pop(tool_use_id)
-                perm_block._resolve(decision)
-                try:
-                    select = self.query_one(PermissionSelect)
-                    select.remove()
-                except Exception:
-                    pass
-                if not self._pending_permission_blocks:
-                    p = self._prompt()
-                    if p is not None:
-                        p.disabled = False
-                        p.read_only = False
-                        p.border_title = "type a message — enter to send, ⌘/⇧/⌥+enter for newline"
-                        p.focus()
+            self._finish_permission(tool_use_id, decision)
 
         elif t == "log.line":
             level = event.get("level", "INFO")
