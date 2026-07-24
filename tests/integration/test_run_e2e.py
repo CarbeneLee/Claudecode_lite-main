@@ -25,6 +25,7 @@ load_dotenv(Path(__file__).parent.parent.parent / ".env", override=False)
 pytestmark = pytest.mark.integration
 
 
+# 创建包含固定 magic number 的真实 workspace 文件
 @pytest.fixture()
 def sample_file(tmp_path: Path) -> Path:
     f = tmp_path / "sample.txt"
@@ -35,9 +36,8 @@ def sample_file(tmp_path: Path) -> Path:
     return f
 
 
-# 功能：验证完整的端到端 agent 链路：调用真实 LLM → 执行 read_file → 成功完成并写入 events.jsonl
-# 设计：使用真实 ANTHROPIC_API_KEY 和真实文件，goal 中指定一个具体的数字（7391）以便断言 LLM 确实读了文件；
-#       通过 events.jsonl 的事件序列断言每个关键阶段都被记录，而非只检查 stdout，因为 events.jsonl 是 S1 的核心验收产物
+# 功能：验证完整的端到端 agent 链路：调用真实 LLM → 执行 read_file → 成功完成并写入 events.v2.jsonl
+# 设计：用真实 provider 与固定 magic number 验证工具闭环，再解析 v2 wrapper 事件序列并证明 legacy 文件不再写入
 async def test_run_e2e_reads_file_and_succeeds(
     sample_file: Path,
     tmp_path: Path,
@@ -61,15 +61,20 @@ async def test_run_e2e_reads_file_and_succeeds(
     )
     await runner.run(goal)
 
-    # ── events.jsonl must exist ──────────────────────────────────────────────
-    jsonl_files = list(runs_dir.rglob("events.jsonl"))
-    assert len(jsonl_files) == 1, "expected exactly one events.jsonl"
+    # ── events.v2.jsonl must be the only newly written journal ───────────────
+    jsonl_files = list(runs_dir.rglob("events.v2.jsonl"))
+    assert len(jsonl_files) == 1, "expected exactly one events.v2.jsonl"
+    assert list(runs_dir.rglob("events.jsonl")) == []
 
-    events = [
+    rows = [
         json.loads(line)
         for line in jsonl_files[0].read_text(encoding="utf-8").splitlines()
         if line
     ]
+    assert all(row["schema_version"] == 2 for row in rows)
+    assert [row["seq"] for row in rows] == list(range(1, len(rows) + 1))
+    assert len({row["event_id"] for row in rows}) == len(rows)
+    events = [row["event"] for row in rows]
     types = [e["type"] for e in events]
 
     # ── event sequence assertions (from §6.4) ────────────────────────────────

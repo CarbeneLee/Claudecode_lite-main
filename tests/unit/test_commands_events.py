@@ -3,10 +3,13 @@ from __future__ import annotations
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
+from kama_claude.core.bus import commands as commands_module
 from kama_claude.core.bus.commands import (
     AgentRunCommand,
     Command,
     EchoCommand,
+    EventSubscribeCommand,
+    EventSubscribeResult,
     PingCommand,
     PongResult,
     SessionCreateCommand,
@@ -123,3 +126,65 @@ def test_core_started_event_roundtrip() -> None:
     evt2 = CoreStartedEvent.model_validate_json(evt.model_dump_json())
     assert evt2.listen_addr == "127.0.0.1:7437"
     assert evt2.type == "core.started"
+
+
+# 功能：验证 event.unsubscribe 命令可通过 Command 判别联合往返
+# 设计：使用真实 subscription_id 序列化，防止模型存在但遗漏 union 接线
+def test_event_unsubscribe_roundtrip_through_command_union() -> None:
+    model = getattr(commands_module, "EventUnsubscribeCommand", None)
+    assert model is not None
+    command = model(subscription_id="sub-12345678")
+
+    restored = TypeAdapter(Command).validate_json(command.model_dump_json())
+
+    assert isinstance(restored, model)
+    assert restored.subscription_id == "sub-12345678"
+
+
+# 功能：验证 event.unsubscribe result 明确区分已删除与不可见订阅
+# 设计：对 true/false 两种结果做 JSON 往返，锁定不泄漏 ownership 之外信息的单一布尔字段
+@pytest.mark.parametrize("removed", [True, False])
+def test_event_unsubscribe_result_roundtrip(removed: bool) -> None:
+    model = getattr(commands_module, "EventUnsubscribeResult", None)
+    assert model is not None
+    result = model(removed=removed)
+
+    restored = model.model_validate_json(result.model_dump_json())
+
+    assert restored.removed is removed
+
+
+# 功能：验证 event.subscribe 可携带非负 after_seq 且保留 stream scope
+# 设计：通过 Command 判别联合往返，锁定 7B cursor 输入但不加入 7C daemon identity
+def test_event_subscribe_after_seq_roundtrip() -> None:
+    command = EventSubscribeCommand(
+        topics=["run.*"],
+        scope="run:run-1",
+        after_seq=42,
+    )
+
+    restored = TypeAdapter(Command).validate_json(command.model_dump_json())
+
+    assert isinstance(restored, EventSubscribeCommand)
+    assert restored.after_seq == 42
+    assert restored.scope == "run:run-1"
+
+
+# 功能：验证 subscribe result 返回 daemon 身份及 response-time cursor metadata
+# 设计：执行 JSON 往返并保留必填身份和 cursor 字段，锁定 7C 重连握手所需的完整事实
+def test_event_subscribe_result_carries_response_time_cursor_metadata() -> None:
+    result = EventSubscribeResult(
+        subscription_id="sub-12345678",
+        daemon_instance_id="daemon-1",
+        replayed_count=0,
+        stream_id="run:run-1",
+        accepted_after_seq=3,
+        high_watermark_seq=9,
+    )
+
+    restored = EventSubscribeResult.model_validate_json(result.model_dump_json())
+
+    assert restored.daemon_instance_id == "daemon-1"
+    assert restored.stream_id == "run:run-1"
+    assert restored.accepted_after_seq == 3
+    assert restored.high_watermark_seq == 9

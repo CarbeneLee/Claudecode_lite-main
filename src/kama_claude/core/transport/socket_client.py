@@ -4,11 +4,26 @@ import asyncio
 import json
 import uuid
 from collections.abc import Awaitable, Callable
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from kama_claude.core.bus.envelope import JsonRpcRequest
 
 type EventHandler = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class EventDelivery:
+    subscription_id: str
+    delivery: Literal["replay", "live"]
+    event_id: str | None
+    stream_id: str | None
+    seq: int | None
+    daemon_instance_id: str
+    event: dict[str, Any]
+
+
+type DeliveryHandler = Callable[[EventDelivery], Awaitable[None]]
 
 _MAX_LINE_BYTES = 64 * 1024 * 1024  # 64 MB per frame，兼容 MCP 大文件工具结果
 
@@ -20,6 +35,7 @@ class IpcError(RuntimeError):
 
 
 class SocketClient:
+    # 初始化 TCP 客户端连接状态与事件回调集合
     def __init__(self, host: str, port: int) -> None:
         self._host = host
         self._port = port
@@ -27,6 +43,7 @@ class SocketClient:
         self._writer: asyncio.StreamWriter | None = None
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._event_handlers: list[EventHandler] = []
+        self._delivery_handlers: list[DeliveryHandler] = []
 
     # 建立到 core 守护进程的 TCP 连接
     async def connect(self) -> None:
@@ -46,6 +63,10 @@ class SocketClient:
     # 注册服务器推送事件的回调，可多次调用以添加多个 handler
     def on_event(self, handler: EventHandler) -> None:
         self._event_handlers.append(handler)
+
+    # 注册服务器完整 delivery envelope 回调，保留 cursor 与 daemon 身份元数据
+    def on_delivery(self, handler: DeliveryHandler) -> None:
+        self._delivery_handlers.append(handler)
 
     # 发送 JSON-RPC 命令并等待响应，成功返回 result dict，失败抛出 IpcError
     async def send_command(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -104,3 +125,15 @@ class SocketClient:
             event_data: dict[str, Any] = msg.get("event", {})
             for handler in self._event_handlers:
                 await handler(event_data)
+            if self._delivery_handlers:
+                delivery = EventDelivery(
+                    subscription_id=msg["subscription_id"],
+                    delivery=msg["delivery"],
+                    event_id=msg.get("event_id"),
+                    stream_id=msg.get("stream_id"),
+                    seq=msg.get("seq"),
+                    daemon_instance_id=msg["daemon_instance_id"],
+                    event=event_data,
+                )
+                for delivery_handler in self._delivery_handlers:
+                    await delivery_handler(delivery)

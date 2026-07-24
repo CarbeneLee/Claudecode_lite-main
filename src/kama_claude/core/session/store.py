@@ -32,6 +32,12 @@ class SessionStore:
     def runs_dir(self, sid: str) -> Path:
         return self.session_dir(sid) / "runs"
 
+    # 创建并返回指定 session 目录，供 journal owner 在 meta 前注册
+    def ensure_session_dir(self, sid: str) -> Path:
+        path = self.session_dir(sid)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
     # 将 session meta 写入 meta.json
     def write_meta(self, session: Session) -> None:
         path = self.session_dir(session.id)

@@ -193,6 +193,7 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
 | `topics` | `array` | yes |
 | `scope` | `string` | no |
 | `replay_from_run` | `string | null` | no |
+| `after_seq` | `integer | null` | no |
 
 ```json
 {
@@ -226,6 +227,19 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
       ],
       "default": null,
       "title": "Replay From Run"
+    },
+    "after_seq": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "After Seq"
     }
   },
   "required": [
@@ -261,7 +275,11 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
 | Field | Type | Required |
 |---|---|---|
 | `subscription_id` | `string` | yes |
+| `daemon_instance_id` | `string` | yes |
 | `replayed_count` | `integer` | no |
+| `stream_id` | `string | null` | no |
+| `accepted_after_seq` | `integer | null` | no |
+| `high_watermark_seq` | `integer | null` | no |
 
 ```json
 {
@@ -270,14 +288,55 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
       "title": "Subscription Id",
       "type": "string"
     },
+    "daemon_instance_id": {
+      "title": "Daemon Instance Id",
+      "type": "string"
+    },
     "replayed_count": {
       "default": 0,
       "title": "Replayed Count",
       "type": "integer"
+    },
+    "stream_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Stream Id"
+    },
+    "accepted_after_seq": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Accepted After Seq"
+    },
+    "high_watermark_seq": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "High Watermark Seq"
     }
   },
   "required": [
-    "subscription_id"
+    "subscription_id",
+    "daemon_instance_id"
   ],
   "title": "EventSubscribeResult",
   "type": "object"
@@ -292,7 +351,84 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
   "id": "u-3",
   "result": {
     "subscription_id": "sub-abc123",
+    "daemon_instance_id": "daemon-abc123def456",
     "replayed_count": 0
+  }
+}
+```
+
+### EventUnsubscribeCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `subscription_id` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "event.unsubscribe",
+      "default": "event.unsubscribe",
+      "title": "Type",
+      "type": "string"
+    },
+    "subscription_id": {
+      "title": "Subscription Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "subscription_id"
+  ],
+  "title": "EventUnsubscribeCommand",
+  "type": "object"
+}
+```
+
+**Example:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "u-3b",
+  "method": "event.unsubscribe",
+  "params": {
+    "subscription_id": "sub-abc123"
+  }
+}
+```
+
+### EventUnsubscribeResult
+
+| Field | Type | Required |
+|---|---|---|
+| `removed` | `boolean` | yes |
+
+```json
+{
+  "properties": {
+    "removed": {
+      "title": "Removed",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "removed"
+  ],
+  "title": "EventUnsubscribeResult",
+  "type": "object"
+}
+```
+
+**Example:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "u-3b",
+  "result": {
+    "removed": true
   }
 }
 ```
@@ -606,6 +742,12 @@ Events pushed from daemon to subscribed clients over the same TCP connection.
 | Field | Type | Required |
 |---|---|---|
 | `kind` | `string` | no |
+| `subscription_id` | `string | null` | no |
+| `delivery` | `string | null` | no |
+| `event_id` | `string | null` | no |
+| `stream_id` | `string | null` | no |
+| `seq` | `integer | null` | no |
+| `daemon_instance_id` | `string` | yes |
 | `event` | `object` | yes |
 
 ```json
@@ -617,6 +759,74 @@ Events pushed from daemon to subscribed clients over the same TCP connection.
       "title": "Kind",
       "type": "string"
     },
+    "subscription_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Subscription Id"
+    },
+    "delivery": {
+      "anyOf": [
+        {
+          "enum": [
+            "replay",
+            "live"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Delivery"
+    },
+    "event_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Event Id"
+    },
+    "stream_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Stream Id"
+    },
+    "seq": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Seq"
+    },
+    "daemon_instance_id": {
+      "title": "Daemon Instance Id",
+      "type": "string"
+    },
     "event": {
       "additionalProperties": true,
       "title": "Event",
@@ -624,6 +834,7 @@ Events pushed from daemon to subscribed clients over the same TCP connection.
     }
   },
   "required": [
+    "daemon_instance_id",
     "event"
   ],
   "title": "EventPushEnvelope",
@@ -636,6 +847,12 @@ Events pushed from daemon to subscribed clients over the same TCP connection.
 ```json
 {
   "kind": "event",
+  "subscription_id": "sub-abc123",
+  "delivery": "live",
+  "event_id": "evt-abc123",
+  "stream_id": "run:20260516-100000-abc123",
+  "seq": 1,
+  "daemon_instance_id": "daemon-abc123def456",
   "event": {
     "type": "step.started",
     "run_id": "20260516-100000-abc123",

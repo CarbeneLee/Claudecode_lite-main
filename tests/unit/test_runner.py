@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import BaseModel
 
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.events.bus import EventBus
+from kama_claude.core.events.writer import EventWriter
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
+from kama_claude.core.loop import AgentLoop
 from kama_claude.core.runner import AgentRunner
+from kama_claude.core.subagent.tool import SpawnAgentTool
 from kama_claude.core.task.manager import TaskManager
 from kama_claude.core.tools.builtin.bash import BashTool
 from kama_claude.core.tools.builtin.list_dir import ListDirTool
@@ -281,25 +287,26 @@ async def test_run_finished_event_published_on_max_steps(tmp_path: Path) -> None
     assert finished.reason == "exceeded_max_steps"  # type: ignore[attr-defined]
 
 
-# 功能：验证 events.jsonl 第一行为 run.started、最后一行为 run.finished
-# 设计：从 tmp_path 递归查找 events.jsonl 并按行解析，因为 events.jsonl 是 S1 的核心产物，首尾事件是完整性的最低要求
+# 功能：验证 events.v2.jsonl 第一条 domain event 为 run.started、最后一条为 run.finished
+# 设计：解析真实 v2 wrapper 的 event 字段，证明 runner 已脱离 legacy writer 且 terminal barrier 完成
 async def test_events_jsonl_created_with_started_and_finished(tmp_path: Path) -> None:
     await _run(tmp_path=tmp_path)
-    jsonl_files = list(tmp_path.rglob("events.jsonl"))
+    jsonl_files = list(tmp_path.rglob("events.v2.jsonl"))
     assert len(jsonl_files) == 1
     lines = [json.loads(ln) for ln in jsonl_files[0].read_text().splitlines() if ln]
-    event_types = [e["type"] for e in lines]
+    event_types = [row["event"]["type"] for row in lines]
     assert event_types[0] == "run.started"
     assert event_types[-1] == "run.finished"
 
 
-# 功能：验证 runner 在 runs_dir 下创建以 run_id 命名的子目录并写入 events.jsonl
-# 设计：检查 tmp_path 下只有一个子目录且该目录包含 events.jsonl，确认目录结构约定（runs/<run_id>/events.jsonl）
+# 功能：验证 runner 在 runs_dir 下创建 run 子目录并写入唯一 events.v2.jsonl
+# 设计：检查目录结构与 v2 文件名，防止生产路径继续双写 legacy events.jsonl
 async def test_run_creates_run_subdirectory(tmp_path: Path) -> None:
     await _run(tmp_path=tmp_path)
     subdirs = [p for p in tmp_path.iterdir() if p.is_dir()]
     assert len(subdirs) == 1
-    assert (subdirs[0] / "events.jsonl").exists()
+    assert (subdirs[0] / "events.v2.jsonl").exists()
+    assert not (subdirs[0] / "events.jsonl").exists()
 
 
 # 功能：验证通过 extra_handlers 注入的回调能收到所有事件
@@ -401,7 +408,7 @@ async def test_session_history_and_notes_injected(tmp_path: Path) -> None:
     assert provider.messages == [{"role": "user", "content": "remember python"}]
     assert provider.system is not None
     assert "Python 3.12" in provider.system
-    assert (store.runs_dir("sess-1") / "run-new" / "events.jsonl").exists()
+    assert (store.runs_dir("sess-1") / "run-new" / "events.v2.jsonl").exists()
     assert not (tmp_path / "runs" / "run-new").exists()
 
 
@@ -519,3 +526,131 @@ async def test_project_context_isolated_between_runners(tmp_path: Path) -> None:
     assert "context-b" not in provider_a.system
     assert "context-b" in provider_b.system
     assert "context-a" not in provider_b.system
+
+
+class _CancellationProvider:
+    # 初始化 provider entered gate 与捕获的 cancellation 引用
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.cancelled: asyncio.CancelledError | None = None
+
+    # 阻塞 LLM 调用直到 runner task 被取消并保存同一异常对象
+    async def chat(
+        self,
+        messages: list[dict[str, object]],
+        tool_schemas: list[dict[str, object]],
+        bus: EventBus,
+        run_id: str,
+        *,
+        step: int = 0,
+        system: str | None = None,
+    ) -> LlmResponse:
+        self.entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as exc:
+            self.cancelled = exc
+            raise
+        raise AssertionError("unreachable")
+
+
+# 功能：验证 terminal journal failure 不覆盖 runner 原始 cancellation identity
+# 设计：先 flush run.started，再让仅含 run.finished 的 batch 失败，比较 provider 与调用方捕获对象 is 相同
+async def test_cancellation_identity_survives_terminal_journal_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _CancellationProvider()
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        provider=provider,
+        runs_dir=tmp_path / "runs",
+    )
+    task = asyncio.create_task(runner.run("cancel me", run_id="run-cancel"))
+    await provider.entered.wait()
+    await runner._journal.flush_all()
+    original = EventWriter.append_and_flush
+
+    # 只让 terminal batch 失败，保留 run.started 的既有 durable prefix
+    def fail_terminal(writer: EventWriter, rows: Iterable[bytes]) -> None:
+        materialized = tuple(rows)
+        if any(b'"type":"run.finished"' in row for row in materialized):
+            raise OSError("terminal-disk-secret")
+        original(writer, materialized)
+
+    monkeypatch.setattr(EventWriter, "append_and_flush", fail_terminal)
+    task.cancel("primary-run-cancel")
+
+    try:
+        await task
+    except asyncio.CancelledError as caught:
+        observed = caught
+    else:
+        raise AssertionError("runner cancellation did not propagate")
+
+    assert provider.cancelled is observed
+
+
+# 读取 v2 wrappers 中的 domain event 字段供 lifecycle 顺序断言
+def _read_v2_events(path: Path) -> list[dict[str, Any]]:
+    return [
+        json.loads(line)["event"]
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+# 功能：验证 parent run terminal 前会 cancel/join 所有 background child 并先持久化 child finished
+# 设计：让 parent loop 启动真实 background SpawnAgentTool 后立即成功、child 永久等待，比较 task 终态和 parent journal 顺序
+async def test_parent_run_joins_background_child_before_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child_entered = asyncio.Event()
+    never_release = asyncio.Event()
+
+    # parent 真实调用 spawn_agent；child 只在可取消 gate 上等待
+    async def controlled_run(loop: AgentLoop, context: Any) -> None:
+        if context.run_id == "run-parent":
+            tool = loop._registry.get("spawn_agent")
+            assert isinstance(tool, SpawnAgentTool)
+            await tool.invoke(
+                {
+                    "description": "background child",
+                    "prompt": "wait for parent cleanup",
+                    "run_in_background": True,
+                }
+            )
+            context.mark_success()
+            return
+        child_entered.set()
+        await never_release.wait()
+
+    monkeypatch.setattr(AgentLoop, "run", controlled_run)
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        provider=_EndTurnProvider(),
+        runs_dir=tmp_path / "runs",
+    )
+    await runner.run("parent", run_id="run-parent")
+    await child_entered.wait()
+    entries = runner._task_registry.all()
+    assert len(entries) == 1
+    child_task, child_context = entries[0]
+    try:
+        assert child_task.done()
+        assert child_context.reason == "cancelled"
+        child_rows = _read_v2_events(
+            tmp_path / "runs" / child_context.run_id / "events.v2.jsonl"
+        )
+        parent_rows = _read_v2_events(
+            tmp_path / "runs" / "run-parent" / "events.v2.jsonl"
+        )
+        assert child_rows[-1]["type"] == "subagent.finished"
+        parent_types = [event["type"] for event in parent_rows]
+        assert parent_types.index("subagent.finished") < parent_types.index("run.finished")
+    finally:
+        if not child_task.done():
+            child_task.cancel()
+        await asyncio.gather(child_task, return_exceptions=True)

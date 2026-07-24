@@ -14,6 +14,12 @@ class JsonRpcRequest(BaseModel):
 
 class EventPushEnvelope(BaseModel):
     kind: Literal["event"] = "event"
+    subscription_id: str | None = None
+    delivery: Literal["replay", "live"] | None = None
+    event_id: str | None = None
+    stream_id: str | None = None
+    seq: int | None = None
+    daemon_instance_id: str
     event: dict[str, Any]  # Event.model_dump() 的序列化结果
 
 

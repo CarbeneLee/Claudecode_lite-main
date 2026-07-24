@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Discriminator
+from pydantic import BaseModel, Discriminator, Field
 
 from kama_claude.core.session.model import SessionMode, SessionStatus
 
@@ -44,11 +44,25 @@ class EventSubscribeCommand(BaseModel):
     topics: list[str]          # fnmatch 模式，如 ["step.*", "tool.*"]
     scope: str = "global"      # "global" | "run:<run_id>"
     replay_from_run: str | None = None  # 设置则先从 events.jsonl 回放历史再接实时流
+    after_seq: int | None = Field(default=None, ge=0)
 
 
 class EventSubscribeResult(BaseModel):
     subscription_id: str
+    daemon_instance_id: str
     replayed_count: int = 0
+    stream_id: str | None = None
+    accepted_after_seq: int | None = None
+    high_watermark_seq: int | None = None
+
+
+class EventUnsubscribeCommand(BaseModel):
+    type: Literal["event.unsubscribe"] = "event.unsubscribe"
+    subscription_id: str
+
+
+class EventUnsubscribeResult(BaseModel):
+    removed: bool
 
 
 class SessionCreateCommand(BaseModel):
@@ -119,6 +133,7 @@ Command = Annotated[
     | EchoCommand
     | AgentRunCommand
     | EventSubscribeCommand
+    | EventUnsubscribeCommand
     | SessionCreateCommand
     | SessionSendMessageCommand
     | SessionGetHistoryCommand

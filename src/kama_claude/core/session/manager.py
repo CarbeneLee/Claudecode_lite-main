@@ -23,6 +23,7 @@ from kama_claude.core.session.store import SessionStore
 from kama_claude.core.skills.loader import SkillLoader
 
 if TYPE_CHECKING:
+    from kama_claude.core.events.journal import EventJournalCoordinator
     from kama_claude.core.llm.base import LLMProvider
     from kama_claude.core.runner import AgentRunner
 
@@ -44,13 +45,21 @@ class SessionManager:
         runner_factory: Callable[[Path], AgentRunner],
         bus: EventBus,
         provider: LLMProvider | None = None,
+        journal: EventJournalCoordinator | None = None,
     ) -> None:
         self._store = store
         self._runner_factory = runner_factory
         self._bus = bus
         self._provider = provider
+        self._journal = journal
         self._sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+
+    # 在 daemon wiring 完成且任何 session 创建前注入 shared journal coordinator
+    def attach_journal(self, journal: EventJournalCoordinator) -> None:
+        if self._sessions:
+            raise RuntimeError("journal must be attached before session creation")
+        self._journal = journal
 
     # 创建新 session 并写入 meta.json
     async def create(
@@ -72,6 +81,9 @@ class SessionManager:
             workspace_root=workspace_root,
             run_ids=[],
         )
+        session_path = self._store.ensure_session_dir(sid)
+        if self._journal is not None:
+            await self._journal.register_session(sid, session_path)
         self._sessions[sid] = session
         self._locks[sid] = asyncio.Lock()
         self._store.write_meta(session)
@@ -79,7 +91,14 @@ class SessionManager:
         return session
 
     # 处理用户消息，追加 thread 并启动一次 agent run
-    async def send_message(self, sid: str, content: str, *, run_id: str | None = None) -> str:
+    async def send_message(
+        self,
+        sid: str,
+        content: str,
+        *,
+        run_id: str | None = None,
+        run_registered: asyncio.Event | None = None,
+    ) -> str:
         session = self._get_session(sid)
         lock = self._locks[sid]
         if lock.locked():
@@ -101,6 +120,16 @@ class SessionManager:
                 session.title = content[:40]
 
             run_id = run_id or new_run_id()
+            run_path = self._store.runs_dir(sid) / run_id
+            run_path.mkdir(parents=True, exist_ok=True)
+            if self._journal is not None:
+                await self._journal.register_run(
+                    run_id,
+                    run_path,
+                    session_id=sid,
+                )
+            if run_registered is not None:
+                run_registered.set()
             session.run_ids.append(run_id)
             session.updated_at = _now()
             self._store.write_meta(session)
