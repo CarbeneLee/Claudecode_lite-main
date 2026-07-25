@@ -1,0 +1,15 @@
+{
+  "criteria": [
+    {
+      "id": "greeting-exists",
+      "kind": "file_exists",
+      "path": "greeting.txt"
+    },
+    {
+      "id": "greeting-content",
+      "kind": "file_contains",
+      "path": "greeting.txt",
+      "text": "hello evaluation"
+    }
+  ]
+}
