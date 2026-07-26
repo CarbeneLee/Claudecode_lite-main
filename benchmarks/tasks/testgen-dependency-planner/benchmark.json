@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "task_id": "testgen-dependency-planner",
+  "task_version": 1,
+  "category": "test_generation",
+  "criterion_groups": {
+    "generated_tests": ["generated-tests"],
+    "regression": ["regression-tests"],
+    "coverage": ["coverage-threshold"]
+  }
+}

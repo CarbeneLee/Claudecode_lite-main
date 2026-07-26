@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "task_id": "testgen-normalize-username",
+  "review_status": "author_validated_pending_external_review",
+  "difficulty": {
+    "level": "easy",
+    "axes": {
+      "localization": 0,
+      "change_breadth": 0,
+      "contract_complexity": 1,
+      "oracle_depth": 1,
+      "issue_abstraction": 0
+    },
+    "total": 2
+  },
+  "requirement_test_matrix": [
+    {
+      "requirement_id": "generated-behavior-tests",
+      "public_contract": "add passing tests for empty input, internal spaces, and underscore normalization without changing production source",
+      "criterion_ids": [
+        "generated-tests"
+      ],
+      "hidden_evidence": [
+        "hidden_tests/validate_generated_tests.py",
+        "hidden_tests/mutants/allows_empty.py",
+        "hidden_tests/mutants/allows_internal_spaces.py",
+        "hidden_tests/mutants/preserves_underscores.py"
+      ],
+      "out_of_scope": "test style and exact assertion syntax"
+    },
+    {
+      "requirement_id": "existing-suite",
+      "public_contract": "all repository tests pass",
+      "criterion_ids": [
+        "regression-tests"
+      ],
+      "hidden_evidence": [
+        "hidden_tests/expected_text_utils.py"
+      ],
+      "out_of_scope": "production implementation changes"
+    },
+    {
+      "requirement_id": "coverage-growth",
+      "public_contract": "new tests exercise previously uncovered branches",
+      "criterion_ids": [
+        "coverage-threshold"
+      ],
+      "hidden_evidence": [
+        "hidden_tests/validate_coverage.py"
+      ],
+      "out_of_scope": "project-wide coverage reporting"
+    }
+  ],
+  "alternative_patch": "authoring/alternative.patch",
+  "wrong_patch_probes": [
+    {
+      "id": "wrong-misses-underscore",
+      "patch": "authoring/wrong-misses-underscore.patch",
+      "expected_failing_groups": [
+        "generated_tests"
+      ]
+    },
+    {
+      "id": "wrong-misses-internal-space",
+      "patch": "authoring/wrong-misses-internal-space.patch",
+      "expected_failing_groups": [
+        "generated_tests"
+      ]
+    }
+  ],
+  "forbidden_public_markers": [
+    "test_normalize_username_rejects_empty_input",
+    "test_normalize_username_rejects_internal_spaces",
+    "test_normalize_username_replaces_underscores",
+    "allows_internal_spaces.py",
+    "preserves_underscores.py"
+  ],
+  "forbidden_issue_markers": [
+    "validate_generated_tests.py",
+    "expected_text_utils.py",
+    "wrong-misses-underscore",
+    "wrong-misses-internal-space"
+  ],
+  "environment_file": "environment.json",
+  "determinism_runs": 3,
+  "security": {
+    "trusted_fixture": true,
+    "offline": true,
+    "data_flow_isolation_only": true,
+    "process_isolation_is_sandbox": false
+  }
+}

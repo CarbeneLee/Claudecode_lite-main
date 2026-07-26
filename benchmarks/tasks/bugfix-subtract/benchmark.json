@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "task_id": "bugfix-subtract",
+  "task_version": 1,
+  "category": "bug_fixing",
+  "criterion_groups": {
+    "target_behavior": [
+      "target-tests"
+    ],
+    "regression": [
+      "regression-tests"
+    ]
+  }
+}

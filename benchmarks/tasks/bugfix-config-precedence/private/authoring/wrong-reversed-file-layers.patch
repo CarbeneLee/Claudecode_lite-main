@@ -1,0 +1,23 @@
+diff --git a/configkit/merge.py b/configkit/merge.py
+--- a/configkit/merge.py
++++ b/configkit/merge.py
+@@ -8,6 +8,6 @@ def merge_layers(
+     resolved = dict(defaults)
+     for layer in overrides:
+         for key, value in layer.items():
+-            if value:
++            if value is not None:
+                 resolved[key] = value
+     return resolved
+diff --git a/configkit/resolver.py b/configkit/resolver.py
+--- a/configkit/resolver.py
++++ b/configkit/resolver.py
+@@ -12,7 +12,7 @@ def resolve_settings(
+ ) -> dict[str, object]:
+     return merge_layers(
+         DEFAULT_SETTINGS,
+-        normalize_mapping(user or {}),
+         normalize_mapping(project or {}),
++        normalize_mapping(user or {}),
+         normalize_environment(environ or {}),
+     )

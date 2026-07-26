@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "task_id": "feature-atomic-bulk-import",
+  "review_status": "author_validated_pending_external_review",
+  "difficulty": {
+    "level": "medium",
+    "axes": {
+      "localization": 1,
+      "change_breadth": 1,
+      "contract_complexity": 2,
+      "oracle_depth": 1,
+      "issue_abstraction": 1
+    },
+    "total": 6
+  },
+  "requirement_test_matrix": [
+    {
+      "requirement_id": "valid-and-empty-import",
+      "public_contract": "valid rows commit in input order and empty input returns an empty summary",
+      "criterion_ids": [
+        "target-tests"
+      ],
+      "hidden_evidence": [
+        "hidden_tests/test_target.py::test_valid_and_empty_batches_return_stable_summaries"
+      ],
+      "out_of_scope": "sorting imported IDs"
+    },
+    {
+      "requirement_id": "row-validation-and-duplicate-atomicity",
+      "public_contract": "invalid rows and duplicate IDs fail without partial mutation",
+      "criterion_ids": [
+        "target-tests"
+      ],
+      "hidden_evidence": [
+        "hidden_tests/test_target.py::test_row_failure_rolls_back_the_entire_batch",
+        "hidden_tests/test_target.py::test_existing_duplicate_and_capacity_failure_leave_store_unchanged"
+      ],
+      "out_of_scope": "custom error messages"
+    },
+    {
+      "requirement_id": "store-write-rollback",
+      "public_contract": "store write failure leaves the complete prior store unchanged",
+      "criterion_ids": [
+        "target-tests"
+      ],
+      "hidden_evidence": [
+        "hidden_tests/test_target.py::test_existing_duplicate_and_capacity_failure_leave_store_unchanged"
+      ],
+      "out_of_scope": "database transactions or concurrent writers"
+    },
+    {
+      "requirement_id": "single-order-regression",
+      "public_contract": "existing create, read, validation, and capacity behavior remains available",
+      "criterion_ids": [
+        "regression-tests"
+      ],
+      "hidden_evidence": [
+        "hidden_tests/test_regression.py::test_single_order_create_read_and_validation_remain_available"
+      ],
+      "out_of_scope": "changing single-order return types"
+    }
+  ],
+  "alternative_patch": "authoring/alternative.patch",
+  "wrong_patch_probes": [
+    {
+      "id": "wrong-partial-write",
+      "patch": "authoring/wrong-partial-write.patch",
+      "expected_failing_groups": [
+        "target_behavior"
+      ]
+    },
+    {
+      "id": "wrong-drops-existing",
+      "patch": "authoring/wrong-drops-existing.patch",
+      "expected_failing_groups": [
+        "target_behavior"
+      ]
+    },
+    {
+      "id": "wrong-silent-duplicates",
+      "patch": "authoring/wrong-silent-duplicates.patch",
+      "expected_failing_groups": [
+        "target_behavior"
+      ]
+    }
+  ],
+  "forbidden_public_markers": [
+    "store.replace_all((*existing, *parsed))",
+    "except Exception:",
+    "wrong-partial-write",
+    "wrong-drops-existing",
+    "wrong-silent-duplicates"
+  ],
+  "forbidden_issue_markers": [
+    "replace_all",
+    "all_orders",
+    "orders/service.py"
+  ],
+  "environment_file": "environment.json",
+  "determinism_runs": 3,
+  "security": {
+    "trusted_fixture": true,
+    "offline": true,
+    "data_flow_isolation_only": true,
+    "process_isolation_is_sandbox": false
+  }
+}

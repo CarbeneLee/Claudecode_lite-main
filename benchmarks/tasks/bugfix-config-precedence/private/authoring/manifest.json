@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "task_id": "bugfix-config-precedence",
+  "review_status": "author_validated_pending_external_review",
+  "difficulty": {
+    "level": "medium",
+    "axes": {
+      "localization": 1,
+      "change_breadth": 1,
+      "contract_complexity": 1,
+      "oracle_depth": 2,
+      "issue_abstraction": 1
+    },
+    "total": 6
+  },
+  "requirement_test_matrix": [
+    {
+      "requirement_id": "precedence-and-falsey-overrides",
+      "public_contract": "defaults < user < project < environment and falsey valid values remain explicit",
+      "criterion_ids": [
+        "target-tests"
+      ],
+      "hidden_evidence": [
+        "hidden_tests/test_target.py::test_falsey_values_are_explicit_at_each_precedence_layer"
+      ],
+      "out_of_scope": "new settings or configuration file parsing"
+    },
+    {
+      "requirement_id": "missing-value-inheritance",
+      "public_contract": "absent keys and None inherit the lower-precedence value",
+      "criterion_ids": [
+        "target-tests"
+      ],
+      "hidden_evidence": [
+        "hidden_tests/test_target.py::test_missing_and_none_values_inherit_lower_precedence"
+      ],
+      "out_of_scope": "empty profile string validation"
+    },
+    {
+      "requirement_id": "existing-validation-and-truthy-behavior",
+      "public_contract": "defaults, truthy overrides, and validation remain stable",
+      "criterion_ids": [
+        "regression-tests"
+      ],
+      "hidden_evidence": [
+        "hidden_tests/test_regression.py::test_defaults_and_truthy_environment_precedence_remain_stable",
+        "hidden_tests/test_regression.py::test_validation_remains_active"
+      ],
+      "out_of_scope": "changing exception messages"
+    }
+  ],
+  "alternative_patch": "authoring/alternative.patch",
+  "wrong_patch_probes": [
+    {
+      "id": "wrong-reversed-file-layers",
+      "patch": "authoring/wrong-reversed-file-layers.patch",
+      "expected_failing_groups": [
+        "target_behavior"
+      ]
+    },
+    {
+      "id": "wrong-timeout-only",
+      "patch": "authoring/wrong-timeout-only.patch",
+      "expected_failing_groups": [
+        "target_behavior"
+      ]
+    },
+    {
+      "id": "wrong-none-overwrites",
+      "patch": "authoring/wrong-none-overwrites.patch",
+      "expected_failing_groups": [
+        "target_behavior"
+      ]
+    }
+  ],
+  "forbidden_public_markers": [
+    "if value is not None",
+    "wrong-reversed-file-layers",
+    "wrong-timeout-only",
+    "wrong-none-overwrites"
+  ],
+  "forbidden_issue_markers": [
+    "merge_layers",
+    "configkit/merge.py",
+    "if value"
+  ],
+  "environment_file": "environment.json",
+  "determinism_runs": 3,
+  "security": {
+    "trusted_fixture": true,
+    "offline": true,
+    "data_flow_isolation_only": true,
+    "process_isolation_is_sandbox": false
+  }
+}

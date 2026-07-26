@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "task_id": "testgen-quoted-query-parser",
+  "review_status": "author_validated_pending_external_review",
+  "difficulty": {
+    "level": "medium",
+    "axes": {
+      "localization": 1,
+      "change_breadth": 1,
+      "contract_complexity": 1,
+      "oracle_depth": 2,
+      "issue_abstraction": 1
+    },
+    "total": 6
+  },
+  "requirement_test_matrix": [
+    {
+      "requirement_id": "source-integrity-and-correct-tests",
+      "public_contract": "production querylang files remain byte-identical and candidate tests pass on correct source",
+      "criterion_ids": [
+        "generated-tests"
+      ],
+      "hidden_evidence": [
+        "hidden_tests/validate_generated_tests.py",
+        "hidden_tests/expected_source/querylang/parser.py",
+        "hidden_tests/expected_source/querylang/tokenizer.py"
+      ],
+      "out_of_scope": "exact test names or assertion style"
+    },
+    {
+      "requirement_id": "quoted-and-error-behavior-sensitivity",
+      "public_contract": "tests distinguish quoted delimiters, escapes, empty quoted values, and unclosed quotes",
+      "criterion_ids": [
+        "generated-tests"
+      ],
+      "hidden_evidence": [
+        "hidden_tests/mutants/splits_quoted_delimiter/tokenizer.py",
+        "hidden_tests/mutants/preserves_escapes/parser.py",
+        "hidden_tests/mutants/drops_empty_quoted/parser.py",
+        "hidden_tests/mutants/accepts_unclosed_quote/tokenizer.py"
+      ],
+      "out_of_scope": "general mutation score"
+    },
+    {
+      "requirement_id": "existing-test-regression",
+      "public_contract": "all repository tests continue to pass",
+      "criterion_ids": [
+        "regression-tests"
+      ],
+      "hidden_evidence": [
+        "hidden_tests/expected_source/querylang/__init__.py"
+      ],
+      "out_of_scope": "changing production behavior"
+    },
+    {
+      "requirement_id": "boundary-and-error-coverage",
+      "public_contract": "new tests increase parser/tokenizer boundary and error coverage",
+      "criterion_ids": [
+        "coverage-threshold"
+      ],
+      "hidden_evidence": [
+        "hidden_tests/validate_coverage.py"
+      ],
+      "out_of_scope": "project-wide coverage percentage"
+    }
+  ],
+  "alternative_patch": "authoring/alternative.patch",
+  "wrong_patch_probes": [
+    {
+      "id": "wrong-misses-escape-semantics",
+      "patch": "authoring/wrong-misses-escape-semantics.patch",
+      "expected_failing_groups": [
+        "generated_tests"
+      ]
+    },
+    {
+      "id": "wrong-misses-empty-quoted",
+      "patch": "authoring/wrong-misses-empty-quoted.patch",
+      "expected_failing_groups": [
+        "generated_tests"
+      ]
+    },
+    {
+      "id": "wrong-misses-unclosed-error",
+      "patch": "authoring/wrong-misses-unclosed-error.patch",
+      "expected_failing_groups": [
+        "generated_tests"
+      ]
+    }
+  ],
+  "forbidden_public_markers": [
+    "KAMA_BENCH_METRICS_V1",
+    "splits_quoted_delimiter",
+    "preserves_escapes",
+    "drops_empty_quoted",
+    "accepts_unclosed_quote",
+    "test_escape_input_is_only_counted_not_decoded"
+  ],
+  "forbidden_issue_markers": [
+    "validate_generated_tests.py",
+    "validate_coverage.py",
+    "wrong-misses-escape-semantics",
+    "wrong-misses-empty-quoted",
+    "wrong-misses-unclosed-error"
+  ],
+  "environment_file": "environment.json",
+  "determinism_runs": 3,
+  "security": {
+    "trusted_fixture": true,
+    "offline": true,
+    "data_flow_isolation_only": true,
+    "process_isolation_is_sandbox": false
+  }
+}

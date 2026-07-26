@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "task_id": "feature-low-stock",
+  "review_status": "author_validated_pending_external_review",
+  "difficulty": {
+    "level": "easy",
+    "axes": {
+      "localization": 0,
+      "change_breadth": 1,
+      "contract_complexity": 1,
+      "oracle_depth": 1,
+      "issue_abstraction": 0
+    },
+    "total": 3
+  },
+  "requirement_test_matrix": [
+    {
+      "requirement_id": "feature-contract",
+      "public_contract": "filter strictly below threshold, sort names, reject negative thresholds, and export the function",
+      "criterion_ids": [
+        "feature-tests"
+      ],
+      "hidden_evidence": [
+        "hidden_tests/test_feature.py::test_low_stock_names_is_sorted_and_uses_strict_threshold",
+        "hidden_tests/test_feature.py::test_low_stock_names_rejects_negative_threshold"
+      ],
+      "out_of_scope": "inventory persistence and duplicate-name normalization"
+    },
+    {
+      "requirement_id": "existing-api",
+      "public_contract": "Product and total_units remain available",
+      "criterion_ids": [
+        "regression-tests"
+      ],
+      "hidden_evidence": [
+        "hidden_tests/test_regression.py::test_total_units_and_product_remain_available"
+      ],
+      "out_of_scope": "changes to Product validation"
+    }
+  ],
+  "alternative_patch": "authoring/alternative.patch",
+  "wrong_patch_probes": [
+    {
+      "id": "wrong-inclusive-threshold",
+      "patch": "authoring/wrong-inclusive-threshold.patch",
+      "expected_failing_groups": [
+        "target_behavior"
+      ]
+    },
+    {
+      "id": "wrong-preserve-input-order",
+      "patch": "authoring/wrong-preserve-input-order.patch",
+      "expected_failing_groups": [
+        "target_behavior"
+      ]
+    }
+  ],
+  "forbidden_public_markers": [
+    "return sorted(product.name",
+    "names.sort()",
+    "product.quantity <= threshold",
+    "test_low_stock_names_is_sorted_and_uses_strict_threshold"
+  ],
+  "forbidden_issue_markers": [
+    "wrong-inclusive-threshold",
+    "wrong-preserve-input-order",
+    "Product(\"pencil\", 1)"
+  ],
+  "environment_file": "environment.json",
+  "determinism_runs": 3,
+  "security": {
+    "trusted_fixture": true,
+    "offline": true,
+    "data_flow_isolation_only": true,
+    "process_isolation_is_sandbox": false
+  }
+}

@@ -1,0 +1,12 @@
+diff --git a/configkit/merge.py b/configkit/merge.py
+--- a/configkit/merge.py
++++ b/configkit/merge.py
+@@ -7,7 +7,5 @@ def merge_layers(
+ ) -> dict[str, object]:
+     resolved = dict(defaults)
+     for layer in overrides:
+-        for key, value in layer.items():
+-            if value:
+-                resolved[key] = value
++        resolved.update(layer)
+     return resolved

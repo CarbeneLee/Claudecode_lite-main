@@ -1,0 +1,12 @@
+diff --git a/calculator.py b/calculator.py
+--- a/calculator.py
++++ b/calculator.py
+@@ -4,7 +4,7 @@ def add(left: int, right: int) -> int:
+ 
+ 
+ def subtract(left: int, right: int) -> int:
+-    return left + right
++    return left + (-right)
+ 
+ 
+ def multiply(left: int, right: int) -> int:

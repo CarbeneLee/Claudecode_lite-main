@@ -1,0 +1,25 @@
+diff --git a/tests/test_text_utils.py b/tests/test_text_utils.py
+--- a/tests/test_text_utils.py
++++ b/tests/test_text_utils.py
+@@ -1,5 +1,21 @@
++import pytest
++
+ from text_utils import normalize_username
+ 
+ 
+ def test_normalize_username_trims_and_lowercases() -> None:
+     assert normalize_username(" Alice ") == "alice"
++
++
++def test_normalize_username_rejects_empty_input() -> None:
++    with pytest.raises(ValueError):
++        normalize_username("   ")
++
++
++def test_normalize_username_rejects_internal_spaces() -> None:
++    with pytest.raises(ValueError):
++        normalize_username("alice smith")
++
++
++def test_normalize_username_replaces_underscores() -> None:
++    assert normalize_username("Alice_Smith") == "alice-smith"

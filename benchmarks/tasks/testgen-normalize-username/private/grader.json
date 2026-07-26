@@ -1,0 +1,37 @@
+{
+  "criteria": [
+    {
+      "id": "generated-tests",
+      "kind": "command_exit",
+      "argv": [
+        "python",
+        "hidden_tests/validate_generated_tests.py"
+      ],
+      "expected_exit_code": 0,
+      "timeout_s": 30.0
+    },
+    {
+      "id": "regression-tests",
+      "kind": "command_exit",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests"
+      ],
+      "expected_exit_code": 0,
+      "timeout_s": 30.0
+    },
+    {
+      "id": "coverage-threshold",
+      "kind": "command_exit",
+      "argv": [
+        "python",
+        "hidden_tests/validate_coverage.py"
+      ],
+      "expected_exit_code": 0,
+      "timeout_s": 30.0
+    }
+  ]
+}

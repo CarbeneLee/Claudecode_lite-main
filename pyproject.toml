@@ -24,6 +24,7 @@ kama = "kama_claude.cli.main:main"
 kama-core = "kama_claude.core.app:run"
 kama-tui = "kama_claude.tui.__main__:main"
 kama-eval = "kama_claude.eval.cli:main"
+kama-bench = "kama_claude.benchmark.cli:main"
 
 # ---- Hatch：打 wheel 时从 src 布局收录包 ----
 [tool.hatch.build.targets.wheel]

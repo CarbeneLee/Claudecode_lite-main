@@ -1,0 +1,6 @@
+{
+  "id": "feature-low-stock",
+  "goal": "Implement inventory.service.low_stock_names(products, threshold). Return product names whose quantity is strictly below threshold, sorted alphabetically. Reject a negative threshold with ValueError and export the function from inventory.",
+  "workspace_fixture": "public/workspace",
+  "timeout_s": 120.0
+}

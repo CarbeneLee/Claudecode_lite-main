@@ -1,0 +1,43 @@
+diff --git a/tests/test_dependency_planner_contract.py b/tests/test_dependency_planner_contract.py
+new file mode 100644
+index 0000000..3812c9d
+--- /dev/null
++++ b/tests/test_dependency_planner_contract.py
+@@ -0,0 +1,37 @@
++import pytest
++
++from dependency_planner import (
++    DependencyCycleError,
++    DuplicateTaskError,
++    Task,
++    plan,
++)
++
++
++# 功能：验证顺序、独立节点和输入不变性
++# 设计：保留广泛 happy path 但有意遗漏 unknown contract
++def test_order_disconnected_and_immutability() -> None:
++    tasks = [
++        Task("zeta"),
++        Task("compile"),
++        Task("package", ("compile",)),
++        Task("alpha"),
++    ]
++    before = list(tasks)
++
++    assert plan(tasks) == ["zeta", "compile", "package", "alpha"]
++    assert tasks == before
++
++
++# 功能：验证重复名称被拒绝
++# 设计：使用最小重复输入隔离错误类型
++def test_duplicates_are_rejected() -> None:
++    with pytest.raises(DuplicateTaskError):
++        plan([Task("build"), Task("build")])
++
++
++# 功能：验证依赖环被拒绝
++# 设计：使用两个互相依赖的节点触发 no-progress
++def test_cycles_are_rejected() -> None:
++    with pytest.raises(DependencyCycleError):
++        plan([Task("alpha", ("beta",)), Task("beta", ("alpha",))])

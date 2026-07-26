@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "task_id": "feature-atomic-bulk-import",
+  "task_version": 1,
+  "category": "feature_implementation",
+  "criterion_groups": {
+    "target_behavior": [
+      "target-tests"
+    ],
+    "regression": [
+      "regression-tests"
+    ]
+  }
+}

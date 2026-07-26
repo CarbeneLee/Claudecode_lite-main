@@ -1,0 +1,21 @@
+diff --git a/tests/test_text_utils.py b/tests/test_text_utils.py
+--- a/tests/test_text_utils.py
++++ b/tests/test_text_utils.py
+@@ -1,5 +1,17 @@
++import pytest
++
+ from text_utils import normalize_username
+ 
+ 
+ def test_normalize_username_trims_and_lowercases() -> None:
+     assert normalize_username(" Alice ") == "alice"
++
++
++@pytest.mark.parametrize("value", ["", "   ", "first last"])
++def test_normalize_username_rejects_invalid_values(value: str) -> None:
++    with pytest.raises(ValueError):
++        normalize_username(value)
++
++
++def test_normalize_username_converts_word_separator() -> None:
++    assert normalize_username("First_Last") == "first-last"
