@@ -24,7 +24,7 @@ _SUITE_PATH = _REPOSITORY_ROOT / "benchmarks" / "suites" / "kama-coding-mvp-v1.j
 _TASKS_ROOT = _REPOSITORY_ROOT / "benchmarks" / "tasks"
 
 
-# 加载仓库内首批三任务 suite
+# 加载仓库内冻结的九任务 MVP suite
 def _suite() -> object:
     return load_suite(_SUITE_PATH, _TASKS_ROOT)
 
@@ -136,15 +136,21 @@ async def _reference_evaluator(
     )
 
 
-# 功能：验证 MVP suite 恰好包含批准的三个 task 与三个 category
-# 设计：断言稳定顺序和完整集合，防止提前加入 refactor/understanding 或遗漏 vertical slice
-def test_mvp_suite_contains_exactly_three_approved_tasks() -> None:
+# 功能：验证 MVP suite 恰好包含批准的九个 task 与三个 category
+# 设计：断言 Batch 0 至 2 的稳定顺序和完整集合，防止遗漏或混入未冻结 task
+def test_mvp_suite_contains_exactly_nine_approved_tasks() -> None:
     suite = _suite()
 
     assert [task.metadata.task_id for task in suite.tasks] == [
         "bugfix-subtract",
         "feature-low-stock",
         "testgen-normalize-username",
+        "bugfix-config-precedence",
+        "feature-atomic-bulk-import",
+        "testgen-quoted-query-parser",
+        "bugfix-retry-state-idempotency",
+        "feature-inventory-reservation-lifecycle",
+        "testgen-dependency-planner",
     ]
     assert {task.metadata.category for task in suite.tasks} == {
         "bug_fixing",
@@ -179,7 +185,7 @@ async def test_pristine_tasks_fail_targets_but_keep_regressions(
         assert any(not by_id[criterion_id] for criterion_id in target_ids)
 
 
-# 功能：验证 private reference patch 能使三个 task 的全部 Phase 8A criteria 通过
+# 功能：验证 private reference patch 能使九个 task 的全部 Phase 8A criteria 通过
 # 设计：只在 tmp copy 应用 patch 后运行真实 grader，证明 task 可解且不污染 public fixture
 @pytest.mark.asyncio
 async def test_reference_patches_satisfy_all_private_graders(tmp_path: Path) -> None:
@@ -207,10 +213,10 @@ async def test_reference_patches_satisfy_all_private_graders(tmp_path: Path) -> 
             assert '"coverage_delta":' in outputs
 
 
-# 功能：验证三个 reference tasks 贯通 Phase 8A evaluator、analyzer 与 internal baseline report
+# 功能：验证九个 reference tasks 贯通 Phase 8A evaluator、analyzer 与 internal baseline report
 # 设计：只替换 Agent execution 为 private reference patch，其余使用完整生产 observer pipeline
 @pytest.mark.asyncio
-async def test_three_task_reference_pipeline_validates_framework(
+async def test_nine_task_reference_pipeline_validates_framework(
     tmp_path: Path,
 ) -> None:
     output = tmp_path / "reference-framework-validation"
@@ -232,8 +238,8 @@ async def test_three_task_reference_pipeline_validates_framework(
     payload = json.loads((output / "baseline.json").read_text(encoding="utf-8"))
     assert exit_code == 0
     assert payload["scope"] == "fixed_task_internal_benchmark"
-    assert payload["metrics"]["overall"]["scheduled_attempts"] == 3
-    assert payload["metrics"]["overall"]["successful_attempts"] == 3
+    assert payload["metrics"]["overall"]["scheduled_attempts"] == 9
+    assert payload["metrics"]["overall"]["successful_attempts"] == 9
     assert set(payload["metrics"]["categories"]) == {
         "bug_fixing",
         "feature_implementation",

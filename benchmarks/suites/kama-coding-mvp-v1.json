@@ -5,6 +5,12 @@
   "task_ids": [
     "bugfix-subtract",
     "feature-low-stock",
-    "testgen-normalize-username"
+    "testgen-normalize-username",
+    "bugfix-config-precedence",
+    "feature-atomic-bulk-import",
+    "testgen-quoted-query-parser",
+    "bugfix-retry-state-idempotency",
+    "feature-inventory-reservation-lifecycle",
+    "testgen-dependency-planner"
   ]
 }

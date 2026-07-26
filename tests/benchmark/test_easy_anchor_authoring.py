@@ -20,6 +20,11 @@ from kama_claude.eval.graders import grade_rules
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _SUITE_PATH = _REPOSITORY_ROOT / "benchmarks" / "suites" / "kama-coding-mvp-v1.json"
 _TASKS_ROOT = _REPOSITORY_ROOT / "benchmarks" / "tasks"
+_EASY_TASK_IDS = {
+    "bugfix-subtract",
+    "feature-low-stock",
+    "testgen-normalize-username",
+}
 _DIFFICULTY_AXES = {
     "localization",
     "change_breadth",
@@ -88,9 +93,20 @@ class _GradeSnapshot:
     numeric_metrics: tuple[str, ...]
 
 
-# 加载当前三个 easy anchors 的固定 MVP suite
+# 加载包含三个 easy anchors 的冻结 MVP suite
 def _suite() -> LoadedBenchmarkSuite:
     return load_suite(_SUITE_PATH, _TASKS_ROOT)
+
+
+# 从冻结 suite 中选择 Batch 0 的三个 easy anchors
+def _easy_tasks() -> tuple[LoadedBenchmarkTask, ...]:
+    tasks = tuple(
+        task
+        for task in _suite().tasks
+        if task.metadata.task_id in _EASY_TASK_IDS
+    )
+    assert {task.metadata.task_id for task in tasks} == _EASY_TASK_IDS
+    return tasks
 
 
 # 读取单个 task 的结构化 authoring review evidence
@@ -170,7 +186,7 @@ def _groups(snapshot: _GradeSnapshot) -> dict[str, bool]:
 # 功能：验证每个 easy anchor 都提供完整、可执行的 authoring evidence contract
 # 设计：解析 private 结构化 manifest 并解析其真实文件引用，避免只靠人类 prose 声称已审计
 def test_easy_anchor_authoring_evidence_is_complete() -> None:
-    for task in _suite().tasks:
+    for task in _easy_tasks():
         manifest = _authoring_manifest(task)
         grader_ids = {
             criterion.id for criterion in task.evaluation_task.private.criteria
@@ -214,7 +230,7 @@ def test_easy_anchor_authoring_evidence_is_complete() -> None:
 # 功能：验证 easy anchors 的 public bundle 没有 private leakage、root-cause hint 或 metadata junk
 # 设计：扫描真实 task tree 与结构化 forbidden markers，同时解析公开环境合同而非比较 prose
 def test_easy_anchor_public_bundle_is_hygienic_and_leak_free() -> None:
-    for task in _suite().tasks:
+    for task in _easy_tasks():
         manifest = _authoring_manifest(task)
         for path in task.task_dir.rglob("*"):
             assert path.name not in _JUNK_NAMES
@@ -258,7 +274,7 @@ def test_easy_anchor_public_bundle_is_hygienic_and_leak_free() -> None:
 async def test_easy_anchor_validation_matrix_is_correct_and_deterministic(
     tmp_path: Path,
 ) -> None:
-    for task in _suite().tasks:
+    for task in _easy_tasks():
         manifest = _authoring_manifest(task)
         states: list[
             tuple[str, Path | None, tuple[str, ...], bool]
