@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 from pathlib import Path
@@ -130,6 +131,97 @@ def _attempt() -> AttemptAnalysis:
     )
 
 
+# 构造 report-facing verified experiment identity，复用真实 suite/task hash 但不调用模型
+def _verified_identity(
+    report_module: ModuleType,
+    suite: object,
+    *,
+    repeats: int,
+) -> object:
+    legacy = report_module.capture_experiment_identity(
+        suite,
+        repeats=repeats,
+        model_id="deepseek-v4-pro",
+        repository=report_module.RepositoryState(commit="b" * 40, dirty=False),
+    )
+    provider = {
+        "service_provider": "deepseek",
+        "wire_protocol": "anthropic_messages",
+        "endpoint_id": "deepseek-anthropic-compatible",
+        "endpoint": "https://api.deepseek.com/anthropic",
+        "model_id": "deepseek-v4-pro",
+        "sdk_distribution": "anthropic",
+        "sdk_version": "0.111.0",
+    }
+    runtime = {
+        "max_steps": 20,
+        "router": "static",
+        "compaction_threshold": 0.0,
+        "tool_result_limit": 8000,
+        "tool_result_keep": 4000,
+        "mcp_enabled": False,
+        "trace_enabled": True,
+        "include_llm_payload": True,
+    }
+    experiment = importlib.import_module("kama_claude.benchmark.experiment")
+    declared = experiment.DeclaredExperimentIdentity(
+        profile_id="baseline-profile",
+        profile_hash="1" * 64,
+        git={"commit": "b" * 40, "dirty": False},
+        suite={
+            "suite_id": legacy.suite_id,
+            "suite_version": legacy.suite_version,
+            "suite_hash": legacy.suite_hash,
+            "task_hashes": legacy.task_hashes,
+            "grader_hashes": {task_id: "2" * 64 for task_id in legacy.task_hashes},
+        },
+        provider=provider,
+        prompt_hash="3" * 64,
+        tool_schema_hash="4" * 64,
+        runtime=runtime,
+        runtime_config_hash=experiment.canonical_hash(runtime),
+        dependency={
+            "pyproject_hash": "5" * 64,
+            "uv_lock_hash": "6" * 64,
+            "dependency_hash": "7" * 64,
+        },
+        host={
+            "python_version": "3.12.13",
+            "os": "Darwin",
+            "os_release": "test",
+            "architecture": "arm64",
+        },
+        schedule={
+            "repeats": repeats,
+            "execution_order": "suite_task_then_repeat_ascending",
+        },
+        artifacts={
+            "output_root_must_be_new": True,
+            "output_root_must_be_outside_repository": True,
+            "retain_all_attempts": True,
+            "raw_trace_visibility": "private",
+        },
+    )
+    return experiment.VerifiedExperimentIdentity(
+        declared=declared,
+        observed={
+            "provider": provider,
+            "prompt_hash": "3" * 64,
+            "tool_schema_hash": "4" * 64,
+            "runtime": runtime,
+            "runtime_config_hash": experiment.canonical_hash(runtime),
+            "attempts": repeats,
+            "api_calls": repeats,
+            "model_event_ids": ["deepseek-v4-pro"],
+        },
+        verification={
+            "status": "match",
+            "verified_attempts": repeats,
+            "mismatches": [],
+        },
+    )
+
+
 # 功能：验证 experiment identity 对 suite/task 内容、commit、model 和环境做可比较指纹
 # 设计：使用注入的 repository state 避免依赖当前 Git，再修改 fixture 证明 task hash 会变化
 def test_capture_experiment_identity_hashes_fixed_inputs(tmp_path: Path) -> None:
@@ -188,15 +280,7 @@ def test_write_baseline_report_is_canonical_and_discloses_limits(
 ) -> None:
     report_module = _report_module()
     suite = _loaded_suite(tmp_path)
-    identity = report_module.capture_experiment_identity(
-        suite,
-        repeats=1,
-        model_id="claude-fixed-model",
-        repository=report_module.RepositoryState(
-            commit="b" * 40,
-            dirty=False,
-        ),
-    )
+    identity = _verified_identity(report_module, suite, repeats=1)
     attempts = [_attempt()]
     report = report_module.build_baseline_report(
         identity,
@@ -211,6 +295,20 @@ def test_write_baseline_report_is_canonical_and_discloses_limits(
     markdown = (output / "baseline.md").read_text(encoding="utf-8")
     payload = json.loads(json_text)
     assert payload == report.model_dump(mode="json")
+    assert payload["artifact_version"] == 2
+    assert payload["experiment"]["status"] == "valid"
+    assert payload["experiment"]["declared"]["provider"]["service_provider"] == "deepseek"
+    assert payload["experiment"]["declared"]["provider"]["wire_protocol"] == (
+        "anthropic_messages"
+    )
+    assert payload["experiment"]["declared"]["provider"]["endpoint_id"] == (
+        "deepseek-anthropic-compatible"
+    )
+    assert payload["experiment"]["declared"]["provider"]["model_id"] == "deepseek-v4-pro"
+    assert payload["experiment"]["declared"]["prompt_hash"] == "3" * 64
+    assert payload["experiment"]["declared"]["tool_schema_hash"] == "4" * 64
+    assert payload["experiment"]["declared"]["runtime"]["max_steps"] == 20
+    assert payload["experiment"]["verification"]["status"] == "match"
     assert payload["scope"] == "fixed_task_internal_benchmark"
     assert payload["security_boundary"] == "process_isolation_not_security_sandbox"
     assert payload["statistical_claim"] == "descriptive_not_statistically_significant"
@@ -219,6 +317,13 @@ def test_write_baseline_report_is_canonical_and_discloses_limits(
     assert "not a security sandbox" in markdown
     assert "not statistically significant" in markdown
     assert "not SWE-bench" in markdown
+    assert "deepseek" in markdown
+    assert "anthropic_messages" in markdown
+    assert "deepseek-v4-pro" in markdown
+    assert "Prompt hash" in markdown
+    assert "Tool schema hash" in markdown
+    assert "Max steps" in markdown
+    assert "Runtime config hash" in markdown
     assert "bugfix-001" in markdown
     assert "PRIVATE_EXPECTED_VALUE" not in json_text
     assert "PRIVATE_EXPECTED_VALUE" not in markdown
@@ -231,15 +336,7 @@ def test_build_baseline_report_rejects_incomplete_attempt_matrix(
 ) -> None:
     report_module = _report_module()
     suite = _loaded_suite(tmp_path)
-    identity = report_module.capture_experiment_identity(
-        suite,
-        repeats=3,
-        model_id="claude-fixed-model",
-        repository=report_module.RepositoryState(
-            commit="c" * 40,
-            dirty=True,
-        ),
-    )
+    identity = _verified_identity(report_module, suite, repeats=3)
 
     with pytest.raises(ValueError, match="attempt matrix"):
         report_module.build_baseline_report(
@@ -256,7 +353,7 @@ def test_build_baseline_report_rejects_incomplete_attempt_matrix(
 
 
 # 功能：验证 kama-bench CLI 只暴露固定 suite run 参数而没有 runtime 或 comparison 配置
-# 设计：解析合法 run 后逐一拒绝 provider、model、prompt、compare 和 dashboard 参数
+# 设计：解析 profile-driven run 后逐一拒绝 ad-hoc suite、repeat、provider、model 和 dashboard 参数
 def test_benchmark_cli_exposes_only_fixed_suite_run() -> None:
     try:
         cli = importlib.import_module("kama_claude.benchmark.cli")
@@ -266,38 +363,46 @@ def test_benchmark_cli_exposes_only_fixed_suite_run() -> None:
     args = cli._parse_args(
         [
             "run",
-            "--suite",
-            "suite.json",
-            "--tasks-root",
-            "tasks",
+            "--experiment",
+            "experiment.json",
             "--output",
             "artifacts",
-            "--repeats",
-            "3",
         ]
     )
 
     assert vars(args) == {
         "command": "run",
-        "suite": "suite.json",
-        "tasks_root": "tasks",
+        "experiment": "experiment.json",
         "output": "artifacts",
-        "repeats": 3,
     }
     for forbidden in (
         ["compare"],
         [
             "run",
-            "--suite",
-            "suite.json",
-            "--tasks-root",
-            "tasks",
+            "--experiment",
+            "experiment.json",
+            "--output",
+            "out",
+            "--provider",
+            "scripted",
+        ],
+        [
+            "run",
+            "--experiment",
+            "experiment.json",
+            "--output",
+            "out",
+            "--model",
+            "other",
+        ],
+        [
+            "run",
+            "--experiment",
+            "experiment.json",
             "--output",
             "out",
             "--repeats",
             "1",
-            "--provider",
-            "scripted",
         ],
         [
             "run",
@@ -307,10 +412,6 @@ def test_benchmark_cli_exposes_only_fixed_suite_run() -> None:
             "tasks",
             "--output",
             "out",
-            "--repeats",
-            "1",
-            "--model",
-            "other",
         ],
         ["dashboard"],
     ):
@@ -318,10 +419,14 @@ def test_benchmark_cli_exposes_only_fixed_suite_run() -> None:
             cli._parse_args(forbidden)
 
 
-# 写入一次 fake Phase 8A evaluator 的 canonical artifact 与公开 report
+# 写入一次带 matching runtime identity evidence 的 fake Phase 8A artifact 与公开 report
 def _write_fake_evaluation(
     task_dir: Path | str,
     output: Path | str,
+    *,
+    prompt: str,
+    tools: list[dict[str, object]],
+    max_steps: int = 20,
 ) -> EvaluationReport:
     task_id = Path(task_dir).name
     attempt_id = "attempt-cli"
@@ -339,13 +444,66 @@ def _write_fake_evaluation(
     for name in ("initial-workspace.json", "final-workspace.json"):
         (runtime / name).write_text(json.dumps(manifest), encoding="utf-8")
     (runtime / "workspace.diff").write_text("", encoding="utf-8")
+    runtime_identity = {
+        "provider": {
+            "service_provider": "deepseek",
+            "wire_protocol": "anthropic_messages",
+            "endpoint_id": "deepseek-anthropic-compatible",
+            "endpoint": "https://api.deepseek.com/anthropic",
+            "model_id": "deepseek-v4-pro",
+            "sdk_distribution": "anthropic",
+            "sdk_version": "0.111.0",
+        },
+        "runtime": {
+            "max_steps": max_steps,
+            "router": "static",
+            "compaction_threshold": 0.0,
+            "tool_result_limit": 8000,
+            "tool_result_keep": 4000,
+            "mcp_enabled": False,
+            "trace_enabled": True,
+            "include_llm_payload": True,
+        },
+    }
+    trace_records = [
+        {
+            "ts": "2026-07-26T00:00:00+00:00",
+            "direction": "CORE",
+            "layer": "event",
+            "kind": "runtime_identity",
+            "run_id": "run-cli",
+            "data": runtime_identity,
+        },
+        {
+            "ts": "2026-07-26T00:00:01+00:00",
+            "direction": "CORE→LLM",
+            "layer": "llm",
+            "kind": "api_call",
+            "run_id": "run-cli",
+            "step": 1,
+            "data": {
+                "messages": [{"role": "user", "content": "private"}],
+                "tool_schemas": tools,
+                "system": prompt,
+            },
+        },
+    ]
+    (runtime / "trace.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in trace_records),
+        encoding="utf-8",
+    )
     (runtime / "events.v2.jsonl").write_text(
         json.dumps(
             {
                 "event_id": "event-1",
-                "stream_id": "run:test",
+                "stream_id": "run:run-cli",
                 "seq": 1,
-                "event": {"type": "run.started"},
+                "event": {
+                    "type": "llm.model_selected",
+                    "run_id": "run-cli",
+                    "model": "deepseek-v4-pro",
+                    "strategy": "static",
+                },
             }
         )
         + "\n",
@@ -381,46 +539,229 @@ def _write_fake_evaluation(
     )
 
 
+# 为 CLI vertical test 写入 strict profile、freeze manifest 与 dependency inputs
+def _write_cli_experiment_profile(
+    tmp_path: Path,
+    report_module: ModuleType,
+    suite: object,
+    *,
+    prompt: str,
+    tools: list[dict[str, object]],
+) -> Path:
+    experiment = importlib.import_module("kama_claude.benchmark.experiment")
+    experiments = tmp_path / "experiments"
+    experiments.mkdir()
+    legacy = report_module.capture_experiment_identity(
+        suite,
+        repeats=1,
+        model_id="deepseek-v4-pro",
+        repository=report_module.RepositoryState(commit="d" * 40, dirty=False),
+    )
+    task = suite.tasks[0]
+    grader_path = task.task_dir / "private" / "grader.json"
+    grader_digest = hashlib.sha256()
+    grader_digest.update(
+        grader_path.relative_to(task.task_dir).as_posix().encode("utf-8")
+    )
+    grader_digest.update(b"\0")
+    grader_digest.update(grader_path.read_bytes())
+    grader_digest.update(b"\0")
+    freeze = {
+        "schema_version": 1,
+        "suite_id": legacy.suite_id,
+        "suite_version": legacy.suite_version,
+        "suite_hash": legacy.suite_hash,
+        "tasks": [
+            {
+                "task_id": task.metadata.task_id,
+                "task_hash": legacy.task_hashes[task.metadata.task_id],
+                "grader_hash": grader_digest.hexdigest(),
+                "reference_hash": "9" * 64,
+            }
+        ],
+    }
+    (tmp_path / "freeze.json").write_text(json.dumps(freeze), encoding="utf-8")
+    profile = {
+        "schema_version": 1,
+        "profile_id": "cli-baseline-profile",
+        "suite": {
+            "manifest": "../suite.json",
+            "freeze_manifest": "../freeze.json",
+            "tasks_root": "../tasks",
+            "expected_suite_hash": legacy.suite_hash,
+        },
+        "provider": {
+            "service_provider": "deepseek",
+            "wire_protocol": "anthropic_messages",
+            "endpoint_id": "deepseek-anthropic-compatible",
+            "endpoint": "https://api.deepseek.com/anthropic",
+            "model_id": "deepseek-v4-pro",
+            "sdk_distribution": "anthropic",
+            "sdk_version": "0.111.0",
+            "credential_env": "ANTHROPIC_API_KEY",
+        },
+        "runtime": {
+            "max_steps": 20,
+            "router": "static",
+            "compaction_threshold": 0.0,
+            "tool_result_limit": 8000,
+            "tool_result_keep": 4000,
+            "mcp_enabled": False,
+            "trace_enabled": True,
+            "include_llm_payload": True,
+        },
+        "schedule": {
+            "repeats": 1,
+            "execution_order": "suite_task_then_repeat_ascending",
+        },
+        "artifacts": {
+            "output_root_must_be_new": True,
+            "output_root_must_be_outside_repository": True,
+            "retain_all_attempts": True,
+            "raw_trace_visibility": "private",
+        },
+        "expected_identity": {
+            "prompt_hash": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "tool_schema_hash": experiment.canonical_hash(tools),
+        },
+    }
+    profile_path = experiments / "profile.json"
+    profile_path.write_text(json.dumps(profile), encoding="utf-8")
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "pyproject.toml").write_text(
+        "[project]\nname='test'\n",
+        encoding="utf-8",
+    )
+    (repository / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    return profile_path
+
+
 # 功能：验证 CLI execution 贯通真实 suite、orchestrator、analyzer 与 baseline writer
-# 设计：只替换整个 Phase 8A evaluator 边界并写 canonical artifacts，避免 mock 内部聚合函数
+# 设计：只替换 Phase 8A evaluator，并提供 matching trace/journal，验证 declaration 到 report 全链路
 @pytest.mark.asyncio
-async def test_execute_benchmark_wires_real_observer_pipeline(tmp_path: Path) -> None:
+async def test_execute_benchmark_wires_real_observer_pipeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     try:
         cli = importlib.import_module("kama_claude.benchmark.cli")
     except ModuleNotFoundError:
         pytest.fail("benchmark CLI module is missing")
-    _loaded_suite(tmp_path)
+    suite = _loaded_suite(tmp_path)
+    prompt = "effective prompt"
+    tools = [{"name": "read_file", "input_schema": {"type": "object"}}]
+    profile_path = _write_cli_experiment_profile(
+        tmp_path,
+        _report_module(),
+        suite,
+        prompt=prompt,
+        tools=tools,
+    )
     output = tmp_path / "benchmark-output"
     args = cli._parse_args(
         [
             "run",
-            "--suite",
-            str(tmp_path / "suite.json"),
-            "--tasks-root",
-            str(tmp_path / "tasks"),
+            "--experiment",
+            str(profile_path),
             "--output",
             str(output),
-            "--repeats",
-            "1",
         ]
     )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-credential-not-an-api-call")
 
     # 保持 async evaluator 合同，同时复用 helper 写真实 artifact layout
     async def fake_evaluator(
         task_dir: Path | str,
         evaluation_output: Path | str,
     ) -> EvaluationReport:
-        return _write_fake_evaluation(task_dir, evaluation_output)
+        return _write_fake_evaluation(
+            task_dir,
+            evaluation_output,
+            prompt=prompt,
+            tools=tools,
+        )
 
-    exit_code = await cli.execute_benchmark(
+    exit_code = await cli.execute_experiment(
         args,
         evaluator=fake_evaluator,
         repository=cli.RepositoryState(commit="d" * 40, dirty=False),
-        model_id="claude-fixed-model",
+        repository_root=tmp_path / "repository",
+        installed_sdk_version="0.111.0",
     )
 
     assert exit_code == 0
+    declared = json.loads(
+        (output / "declared-experiment.json").read_text(encoding="utf-8")
+    )
     payload = json.loads((output / "baseline.json").read_text(encoding="utf-8"))
+    assert declared["provider"]["model_id"] == "deepseek-v4-pro"
+    assert payload["artifact_version"] == 2
+    assert payload["experiment"]["status"] == "valid"
+    assert payload["experiment"]["verification"]["status"] == "match"
     assert payload["metrics"]["overall"]["successful_attempts"] == 1
     assert payload["attempts"][0]["task_id"] == "bugfix-001"
     assert (output / "baseline.md").is_file()
+
+
+# 功能：验证 behavior identity mismatch 写 invalid receipt、退出 2 且绝不生成 baseline score
+# 设计：只让 observed max_steps 偏离 declaration，保留完整 artifact shape 以隔离 identity 分支
+@pytest.mark.asyncio
+async def test_execute_experiment_identity_mismatch_is_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = importlib.import_module("kama_claude.benchmark.cli")
+    suite = _loaded_suite(tmp_path)
+    prompt = "effective prompt"
+    tools = [{"name": "read_file", "input_schema": {"type": "object"}}]
+    profile_path = _write_cli_experiment_profile(
+        tmp_path,
+        _report_module(),
+        suite,
+        prompt=prompt,
+        tools=tools,
+    )
+    output = tmp_path / "invalid-output"
+    args = cli._parse_args(
+        [
+            "run",
+            "--experiment",
+            str(profile_path),
+            "--output",
+            str(output),
+        ]
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-be-serialized")
+
+    # 生成合法 Phase 8A report，但 runtime identity 故意声明错误 max_steps
+    async def mismatched_evaluator(
+        task_dir: Path | str,
+        evaluation_output: Path | str,
+    ) -> EvaluationReport:
+        return _write_fake_evaluation(
+            task_dir,
+            evaluation_output,
+            prompt=prompt,
+            tools=tools,
+            max_steps=99,
+        )
+
+    exit_code = await cli.execute_experiment(
+        args,
+        evaluator=mismatched_evaluator,
+        repository=cli.RepositoryState(commit="d" * 40, dirty=False),
+        repository_root=tmp_path / "repository",
+        installed_sdk_version="0.111.0",
+    )
+
+    invalid_text = (output / "experiment-invalid.json").read_text(encoding="utf-8")
+    assert exit_code == 2
+    assert (output / "declared-experiment.json").is_file()
+    assert json.loads(invalid_text)["mismatches"] == [
+        "runtime",
+        "runtime_config_hash",
+    ]
+    assert not (output / "baseline.json").exists()
+    assert not (output / "baseline.md").exists()
+    assert "must-not-be-serialized" not in invalid_text

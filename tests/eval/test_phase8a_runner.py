@@ -153,6 +153,62 @@ async def test_worker_uses_existing_runner_without_behavior_overrides(tmp_path: 
     assert "permission_manager" not in _FakeRunner.seen_init
 
 
+# 功能：验证 worker 在 AgentRunner 前记录脱敏 provider/runtime identity 且不改变 runner 调用
+# 设计：注入真实 KamaConfig 与 fake runner，解析落盘 trace 而不调用模型或断言 mock 内部行为
+@pytest.mark.asyncio
+async def test_worker_records_sanitized_runtime_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = KamaConfig()
+    config.agent.max_steps = 20
+    config.llm.default_model = "deepseek-v4-pro"
+    config.llm.router = "static"
+    config.trace.enabled = True
+    config.trace.include_llm_payload = True
+    config.compaction.auto_threshold = 0.0
+    config.compaction.tool_result_limit = 8000
+    config.compaction.tool_result_keep = 4000
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-appear-in-trace")
+    request = _request(tmp_path)
+
+    result = await execute_request(
+        request,
+        runner_factory=_FakeRunner,
+        config_loader=lambda: config,
+    )
+
+    records = [
+        json.loads(line)
+        for line in Path(request.trace_path).read_text(encoding="utf-8").splitlines()
+    ]
+    identities = [record for record in records if record["kind"] == "runtime_identity"]
+    assert result.runtime_status == "success"
+    assert len(identities) == 1
+    data = identities[0]["data"]
+    assert data["provider"] == {
+        "service_provider": "deepseek",
+        "wire_protocol": "anthropic_messages",
+        "endpoint_id": "deepseek-anthropic-compatible",
+        "endpoint": "https://api.deepseek.com/anthropic",
+        "model_id": "deepseek-v4-pro",
+        "sdk_distribution": "anthropic",
+        "sdk_version": "0.111.0",
+    }
+    assert data["runtime"] == {
+        "max_steps": 20,
+        "router": "static",
+        "compaction_threshold": 0.0,
+        "tool_result_limit": 8000,
+        "tool_result_keep": 4000,
+        "mcp_enabled": False,
+        "trace_enabled": True,
+        "include_llm_payload": True,
+    }
+    assert "must-not-appear-in-trace" not in json.dumps(records)
+
+
 # 写入一个能按 worker CLI 协议返回成功结果的测试脚本
 def _write_success_worker(path: Path) -> None:
     path.write_text(

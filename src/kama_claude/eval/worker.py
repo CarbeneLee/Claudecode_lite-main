@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 from collections.abc import Callable
+from datetime import UTC, datetime
+from importlib.metadata import version
 from pathlib import Path
 from typing import Protocol
 
@@ -10,6 +13,7 @@ from kama_claude.core.config import KamaConfig, get_config
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.events.journal import EventJournalCoordinator
 from kama_claude.core.runner import AgentRunner, RunOutcome
+from kama_claude.core.trace.record import TraceRecord
 from kama_claude.core.trace.writer import TraceWriter
 from kama_claude.eval.models import WorkerRequest, WorkerResult
 
@@ -21,6 +25,41 @@ class _RunnerLike(Protocol):
 
 RunnerFactory = Callable[..., _RunnerLike]
 ConfigLoader = Callable[[], KamaConfig]
+
+
+# 将 worker 实际使用的 provider 与行为配置投影为不含 credential 的 trace evidence
+def _runtime_identity(config: KamaConfig) -> dict[str, object]:
+    endpoint = os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/")
+    service_provider = (
+        "deepseek"
+        if endpoint == "https://api.deepseek.com/anthropic"
+        else "unknown"
+    )
+    return {
+        "provider": {
+            "service_provider": service_provider,
+            "wire_protocol": "anthropic_messages",
+            "endpoint_id": (
+                "deepseek-anthropic-compatible"
+                if service_provider == "deepseek"
+                else "unknown"
+            ),
+            "endpoint": endpoint,
+            "model_id": config.llm.default_model,
+            "sdk_distribution": "anthropic",
+            "sdk_version": version("anthropic"),
+        },
+        "runtime": {
+            "max_steps": config.agent.max_steps,
+            "router": config.llm.router,
+            "compaction_threshold": config.compaction.auto_threshold,
+            "tool_result_limit": config.compaction.tool_result_limit,
+            "tool_result_keep": config.compaction.tool_result_keep,
+            "mcp_enabled": False,
+            "trace_enabled": config.trace.enabled,
+            "include_llm_payload": config.trace.include_llm_payload,
+        },
+    }
 
 
 # 执行单个公开 worker request，并用现有 AgentRunner wiring 生成 runtime 证据
@@ -36,8 +75,19 @@ async def execute_request(
     trace = TraceWriter(Path(request.trace_path))
     await trace.start()
     try:
+        config = config_loader()
+        trace.emit(
+            TraceRecord(
+                ts=datetime.now(UTC).isoformat(),
+                direction="CORE",
+                layer="event",
+                kind="runtime_identity",
+                run_id=request.run_id,
+                data=_runtime_identity(config),
+            )
+        )
         runner = runner_factory(
-            config_loader(),
+            config,
             workspace_root=Path(request.workspace),
             bus=bus,
             runs_dir=Path(request.runs_dir),

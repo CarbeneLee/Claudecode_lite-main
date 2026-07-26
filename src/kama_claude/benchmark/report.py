@@ -13,6 +13,7 @@ from kama_claude.benchmark.analyzers import (
     AttemptAnalysis,
     BenchmarkMetrics,
 )
+from kama_claude.benchmark.experiment import VerifiedExperimentIdentity
 from kama_claude.benchmark.schema import LoadedBenchmarkSuite
 
 
@@ -39,7 +40,7 @@ class ExperimentIdentity(_StrictModel):
 
 
 class BaselineReport(_StrictModel):
-    artifact_version: Literal[1] = 1
+    artifact_version: Literal[2] = 2
     scope: Literal["fixed_task_internal_benchmark"] = "fixed_task_internal_benchmark"
     security_boundary: Literal[
         "process_isolation_not_security_sandbox"
@@ -50,7 +51,7 @@ class BaselineReport(_StrictModel):
     external_benchmark_claim: Literal[
         "not_swe_bench_or_general_coding_ability"
     ] = "not_swe_bench_or_general_coding_ability"
-    experiment: ExperimentIdentity
+    experiment: VerifiedExperimentIdentity
     metrics: BenchmarkMetrics
     attempts: list[AttemptAnalysis]
 
@@ -140,14 +141,14 @@ def capture_experiment_identity(
 
 # 构建完整且无重复的 task × repeat baseline report
 def build_baseline_report(
-    identity: ExperimentIdentity,
+    identity: VerifiedExperimentIdentity,
     attempts: list[AttemptAnalysis],
     metrics: BenchmarkMetrics,
 ) -> BaselineReport:
     expected = {
         (task_id, repeat)
-        for task_id in identity.task_hashes
-        for repeat in range(1, identity.repeats + 1)
+        for task_id in identity.declared.suite.task_hashes
+        for repeat in range(1, identity.declared.schedule.repeats + 1)
     }
     observed = {(attempt.task_id, attempt.repeat) for attempt in attempts}
     if (
@@ -155,6 +156,8 @@ def build_baseline_report(
         or len(observed) != len(attempts)
         or observed != expected
         or metrics.overall.scheduled_attempts != len(attempts)
+        or identity.observed.attempts != len(attempts)
+        or identity.verification.verified_attempts != len(attempts)
     ):
         raise ValueError("baseline attempt matrix is incomplete or inconsistent")
     return BaselineReport(
@@ -175,6 +178,8 @@ def render_json(report: BaselineReport) -> str:
 # 从同一个 canonical report 模型渲染带明确 claim boundary 的 Markdown
 def render_markdown(report: BaselineReport) -> str:
     overall = report.metrics.overall
+    declared = report.experiment.declared
+    observed = report.experiment.observed
     rows = [
         "# KamaClaude Fixed-task Internal Benchmark",
         "",
@@ -184,14 +189,26 @@ def render_markdown(report: BaselineReport) -> str:
         "",
         "## Experiment",
         "",
-        f"- Suite: `{report.experiment.suite_id}@{report.experiment.suite_version}`",
-        f"- Suite hash: `{report.experiment.suite_hash}`",
-        f"- Model: `{report.experiment.model_id}`",
-        f"- Git commit: `{report.experiment.git_commit}`",
-        f"- Git dirty: `{str(report.experiment.git_dirty).lower()}`",
-        f"- Repeats: {report.experiment.repeats}",
-        f"- Python: `{report.experiment.python_version}`",
-        f"- Platform: `{report.experiment.platform}`",
+        f"- Identity status: `{report.experiment.status}`",
+        f"- Verification: `{report.experiment.verification.status}`",
+        f"- Suite: `{declared.suite.suite_id}@{declared.suite.suite_version}`",
+        f"- Suite hash: `{declared.suite.suite_hash}`",
+        f"- Provider: `{declared.provider.service_provider}`",
+        f"- Protocol: `{declared.provider.wire_protocol}`",
+        f"- Endpoint ID: `{declared.provider.endpoint_id}`",
+        f"- Endpoint: `{declared.provider.endpoint}`",
+        f"- Model: `{declared.provider.model_id}`",
+        f"- SDK: `{declared.provider.sdk_distribution}=={declared.provider.sdk_version}`",
+        f"- Prompt hash: `{declared.prompt_hash}`",
+        f"- Tool schema hash: `{declared.tool_schema_hash}`",
+        f"- Max steps: {declared.runtime.max_steps}",
+        f"- Runtime config hash: `{declared.runtime_config_hash}`",
+        f"- Git commit: `{declared.git.commit}`",
+        f"- Git dirty: `{str(declared.git.dirty).lower()}`",
+        f"- Repeats: {declared.schedule.repeats}",
+        f"- Python: `{declared.host.python_version}`",
+        f"- Platform: `{declared.host.os}-{declared.host.architecture}`",
+        f"- Verified attempts/API calls: {observed.attempts}/{observed.api_calls}",
         "",
         "## Overall metrics",
         "",

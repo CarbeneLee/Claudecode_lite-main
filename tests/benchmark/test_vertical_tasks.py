@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import json
 import shutil
 import subprocess
@@ -8,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from kama_claude.benchmark.cli import execute_benchmark
-from kama_claude.benchmark.report import RepositoryState
+from kama_claude.benchmark.analyzers import aggregate_attempts, analyze_attempt
+from kama_claude.benchmark.orchestrator import run_suite
 from kama_claude.benchmark.schema import LoadedBenchmarkTask, load_suite
 from kama_claude.eval.evaluator import evaluate_task
 from kama_claude.eval.failure import FailureCategory
@@ -213,38 +212,32 @@ async def test_reference_patches_satisfy_all_private_graders(tmp_path: Path) -> 
             assert '"coverage_delta":' in outputs
 
 
-# 功能：验证九个 reference tasks 贯通 Phase 8A evaluator、analyzer 与 internal baseline report
-# 设计：只替换 Agent execution 为 private reference patch，其余使用完整生产 observer pipeline
+# 功能：验证九个 reference tasks 贯通 Phase 8A evaluator、orchestrator 与 analyzer
+# 设计：只替换 Agent execution 为 private reference patch，identity/report 全链路由独立测试覆盖
 @pytest.mark.asyncio
 async def test_nine_task_reference_pipeline_validates_framework(
     tmp_path: Path,
 ) -> None:
     output = tmp_path / "reference-framework-validation"
-    args = argparse.Namespace(
-        command="run",
-        suite=str(_SUITE_PATH),
-        tasks_root=str(_TASKS_ROOT),
-        output=str(output),
+    suite = _suite()
+
+    run = await run_suite(
+        suite,
+        output,
         repeats=1,
-    )
-
-    exit_code = await execute_benchmark(
-        args,
         evaluator=_reference_evaluator,
-        repository=RepositoryState(commit="e" * 40, dirty=False),
-        model_id="reference-patch-framework-validation",
     )
+    metadata = {task.metadata.task_id: task.metadata for task in suite.tasks}
+    attempts = [
+        analyze_attempt(attempt, metadata[attempt.task_id])
+        for attempt in run.attempts
+    ]
+    metrics = aggregate_attempts(attempts)
 
-    payload = json.loads((output / "baseline.json").read_text(encoding="utf-8"))
-    assert exit_code == 0
-    assert payload["scope"] == "fixed_task_internal_benchmark"
-    assert payload["metrics"]["overall"]["scheduled_attempts"] == 9
-    assert payload["metrics"]["overall"]["successful_attempts"] == 9
-    assert set(payload["metrics"]["categories"]) == {
+    assert metrics.overall.scheduled_attempts == 9
+    assert metrics.overall.successful_attempts == 9
+    assert set(metrics.categories) == {
         "bug_fixing",
         "feature_implementation",
         "test_generation",
     }
-    assert payload["external_benchmark_claim"] == (
-        "not_swe_bench_or_general_coding_ability"
-    )
