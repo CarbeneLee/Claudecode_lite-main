@@ -7,6 +7,7 @@ import platform as platform_module
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
@@ -15,6 +16,10 @@ from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from kama_claude.benchmark.schema import LoadedBenchmarkSuite, load_suite
+from kama_claude.eval.graders import (
+    grade_timeout_trace_prefix,
+    grade_trace,
+)
 
 
 class _StrictModel(BaseModel):
@@ -23,6 +28,11 @@ class _StrictModel(BaseModel):
 
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 SafeIdentifier = Annotated[str, Field(min_length=1, pattern=r"^[A-Za-z0-9._-]+$")]
+
+
+class EvidenceMode(StrEnum):
+    COMPLETE = "complete"
+    TIMEOUT_PARTIAL = "timeout_partial"
 
 
 class SuiteProfile(_StrictModel):
@@ -541,23 +551,22 @@ def _api_call_identity(
     return prompt_hashes.pop(), tool_hashes.pop(), len(calls)
 
 
-# 从 run journal 提取同一 run 的全部 model-selected identity
+# 从已验证 journal events 提取同一 run 的全部 model-selected identity
 def _model_event_identity(
-    frames: list[dict[str, object]],
+    events: list[dict[str, object]],
     run_id: str,
 ) -> list[str]:
     models: list[str] = []
-    for frame in frames:
-        event = frame.get("event")
-        if not isinstance(event, dict) or event.get("type") != "llm.model_selected":
+    for event in events:
+        if event.get("type") != "llm.model_selected":
             continue
+        model = event.get("model")
         if (
-            frame.get("stream_id") != f"run:{run_id}"
-            or event.get("run_id") != run_id
-            or not isinstance(event.get("model"), str)
+            event.get("run_id") != run_id
+            or not isinstance(model, str)
         ):
             raise ValueError("observed identity evidence is invalid")
-        models.append(event["model"])
+        models.append(model)
     if not models:
         raise ValueError("observed identity evidence is invalid")
     return models
@@ -566,6 +575,8 @@ def _model_event_identity(
 # 从单 attempt 已落盘 trace/journal 机械收集 provider、runtime、prompt、tools 与 model identity
 def collect_observed_identity(
     attempt_root: Path | str,
+    *,
+    evidence_mode: EvidenceMode = EvidenceMode.COMPLETE,
 ) -> ObservedExperimentIdentity:
     runtime_dir = Path(attempt_root) / "runtime"
     trace_records = _read_jsonl(runtime_dir / "trace.jsonl")
@@ -591,10 +602,15 @@ def collect_observed_identity(
         trace_records,
         run_id,
     )
-    models = _model_event_identity(
-        _read_jsonl(runtime_dir / "events.v2.jsonl"),
-        run_id,
+    journal_path = runtime_dir / "events.v2.jsonl"
+    journal = (
+        grade_timeout_trace_prefix(journal_path, expected_run_id=run_id)
+        if evidence_mode is EvidenceMode.TIMEOUT_PARTIAL
+        else grade_trace(journal_path, expected_run_id=run_id)
     )
+    if not journal.passed:
+        raise ValueError("observed identity evidence is invalid")
+    models = _model_event_identity(journal.events, run_id)
     return ObservedExperimentIdentity(
         run_id=run_id,
         provider=provider,

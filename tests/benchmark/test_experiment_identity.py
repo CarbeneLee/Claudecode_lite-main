@@ -456,6 +456,7 @@ def _write_observed_identity_artifacts(
     tools: list[dict[str, object]],
     model_id: str = "deepseek-v4-pro",
     max_steps: int = 20,
+    timeout_partial: bool = False,
 ) -> None:
     runtime_dir = attempt_root / "runtime"
     runtime_dir.mkdir(parents=True)
@@ -505,20 +506,58 @@ def _write_observed_identity_artifacts(
         "".join(json.dumps(record) + "\n" for record in trace_records),
         encoding="utf-8",
     )
-    event = {
-        "event_id": "event-a",
-        "stream_id": "run:run-a",
-        "seq": 1,
-        "event": {
+    events: list[dict[str, object]] = [
+        {
+            "type": "run.started",
+            "run_id": "run-a",
+            "goal": "Observed identity contract.",
+            "ts": "2026-07-26T00:00:00+00:00",
+        },
+        {
+            "type": "step.started",
+            "run_id": "run-a",
+            "step": 1,
+            "ts": "2026-07-26T00:00:00.500000+00:00",
+        },
+        {
             "type": "llm.model_selected",
             "run_id": "run-a",
             "model": model_id,
             "strategy": "static",
             "ts": "2026-07-26T00:00:01+00:00",
         },
-    }
+    ]
+    if not timeout_partial:
+        events.extend(
+            [
+                {
+                    "type": "step.finished",
+                    "run_id": "run-a",
+                    "step": 1,
+                    "ts": "2026-07-26T00:00:02+00:00",
+                },
+                {
+                    "type": "run.finished",
+                    "run_id": "run-a",
+                    "status": "success",
+                    "reason": None,
+                    "steps": 1,
+                    "ts": "2026-07-26T00:00:03+00:00",
+                },
+            ]
+        )
+    rows = [
+        {
+            "schema_version": 2,
+            "event_id": f"event-{index}",
+            "stream_id": "run:run-a",
+            "seq": index,
+            "event": event,
+        }
+        for index, event in enumerate(events, 1)
+    ]
     (runtime_dir / "events.v2.jsonl").write_text(
-        json.dumps(event) + "\n",
+        "".join(json.dumps(row) + "\n" for row in rows),
         encoding="utf-8",
     )
 
@@ -551,6 +590,117 @@ def test_collect_observed_identity_matches_declaration_without_payload_leak(
     assert prompt not in serialized
     assert "private task input" not in serialized
     experiment.require_identity_match(declared, observed)
+
+
+# 功能：验证 timeout_partial 模式可从严格 prefix、runtime、API 与 model 证据收集 identity
+# 设计：journal 以 run.started 开头但没有 terminal，模拟被 parent timeout 截断的真实前缀
+def test_collect_timeout_partial_identity_from_complete_evidence(
+    tmp_path: Path,
+) -> None:
+    experiment = _experiment_module()
+    prompt = "timeout effective prompt"
+    tools = [{"name": "read_file", "input_schema": {"type": "object"}}]
+    attempt_root = tmp_path / "timeout-attempt"
+    _write_observed_identity_artifacts(
+        attempt_root,
+        prompt=prompt,
+        tools=tools,
+        timeout_partial=True,
+    )
+
+    assert hasattr(experiment, "EvidenceMode")
+    observed = experiment.collect_observed_identity(
+        attempt_root,
+        evidence_mode=experiment.EvidenceMode.TIMEOUT_PARTIAL,
+    )
+
+    assert observed.run_id == "run-a"
+    assert observed.api_call_count == 1
+    assert observed.model_event_ids == ["deepseek-v4-pro"]
+
+
+# 功能：验证 timeout_partial 缺任一 identity 证据或 journal prefix 非法时全部 fail closed
+# 设计：每次只破坏 schema/sequence/lifecycle/runtime/API/model 中一个条件，避免混淆失败归属
+@pytest.mark.parametrize(
+    "case",
+    (
+        "wrong_version",
+        "sequence_gap",
+        "missing_start",
+        "terminal_event",
+        "missing_runtime",
+        "missing_api",
+        "missing_model",
+    ),
+)
+def test_collect_timeout_partial_identity_rejects_incomplete_or_invalid_evidence(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    experiment = _experiment_module()
+    attempt_root = tmp_path / case
+    _write_observed_identity_artifacts(
+        attempt_root,
+        prompt="timeout prompt",
+        tools=[{"name": "read_file", "input_schema": {"type": "object"}}],
+        timeout_partial=True,
+    )
+    runtime_dir = attempt_root / "runtime"
+    trace_path = runtime_dir / "trace.jsonl"
+    journal_path = runtime_dir / "events.v2.jsonl"
+    trace = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    rows = [
+        json.loads(line)
+        for line in journal_path.read_text(encoding="utf-8").splitlines()
+    ]
+    if case == "wrong_version":
+        rows[0]["schema_version"] = 3
+    elif case == "sequence_gap":
+        rows[2]["seq"] = 4
+    elif case == "missing_start":
+        rows = rows[1:]
+        for index, row in enumerate(rows, 1):
+            row["seq"] = index
+    elif case == "terminal_event":
+        rows.append(
+            {
+                "schema_version": 2,
+                "event_id": "event-terminal",
+                "stream_id": "run:run-a",
+                "seq": 4,
+                "event": {
+                    "type": "run.finished",
+                    "run_id": "run-a",
+                    "status": "failed",
+                    "reason": "cancelled",
+                    "steps": 1,
+                    "ts": "2026-07-26T00:00:02+00:00",
+                },
+            }
+        )
+    elif case == "missing_runtime":
+        trace = [record for record in trace if record["kind"] != "runtime_identity"]
+    elif case == "missing_api":
+        trace = [record for record in trace if record["kind"] != "api_call"]
+    else:
+        rows = rows[:2]
+    trace_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in trace),
+        encoding="utf-8",
+    )
+    journal_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="identity evidence"):
+        experiment.collect_observed_identity(
+            attempt_root,
+            evidence_mode=experiment.EvidenceMode.TIMEOUT_PARTIAL,
+        )
 
 
 # 功能：验证 model、prompt 或 runtime 任一 behavior mismatch 都使 experiment identity invalid

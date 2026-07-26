@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from kama_claude.core.bus.events import RunFinishedEvent, RunStartedEvent
+from kama_claude.core.events.journal import EventJournalCoordinator
 from kama_claude.eval.graders import GraderExecutionError, grade_rules, grade_trace
 from kama_claude.eval.task import load_task
 
@@ -80,6 +82,7 @@ def _task_dir(tmp_path: Path) -> Path:
 # 构建一个 canonical v2 journal wrapper
 def _record(seq: int, event: dict[str, object], run_id: str = "run-a") -> dict[str, object]:
     return {
+        "schema_version": 2,
         "event_id": f"evt-{seq}",
         "stream_id": f"run:{run_id}",
         "seq": seq,
@@ -138,6 +141,31 @@ def _valid_events() -> list[dict[str, object]]:
             "ts": "t7",
         },
     ]
+
+
+# 用真实 coordinator 写出最小完整 run journal
+async def _write_real_journal(path: Path, run_id: str) -> Path:
+    coordinator = EventJournalCoordinator()
+    await coordinator.register_run(run_id, path, session_id=None)
+    await coordinator.handle(
+        RunStartedEvent(
+            run_id=run_id,
+            goal="Verify the journal observer contract.",
+            ts="2026-07-26T00:00:00Z",
+        )
+    )
+    await coordinator.handle(
+        RunFinishedEvent(
+            run_id=run_id,
+            status="success",
+            reason=None,
+            steps=0,
+            ts="2026-07-26T00:00:01Z",
+        )
+    )
+    await coordinator.flush_all()
+    await coordinator.close()
+    return path / "events.v2.jsonl"
 
 
 # 功能：验证 filesystem 与 hidden command grader 全部在 private grading copy 上得到客观结果
@@ -309,6 +337,56 @@ def test_trace_grader_accepts_valid_lifecycle(tmp_path: Path) -> None:
 
     assert grade.passed is True
     assert grade.errors == []
+
+
+# 功能：验证真实 EventJournalCoordinator 写出的 v2 journal 可被 trace grader 直接接受
+# 设计：贯通 production writer 与 observer，不用手写 wrapper，锁定两端 schema contract
+@pytest.mark.asyncio
+async def test_trace_grader_accepts_real_journal_writer_output(tmp_path: Path) -> None:
+    run_id = "producer-contract"
+    run_path = tmp_path / run_id
+    journal_path = await _write_real_journal(run_path, run_id)
+
+    grade = grade_trace(
+        journal_path,
+        expected_run_id=run_id,
+        expected_terminal_status="success",
+    )
+
+    assert grade.passed is True
+    assert grade.errors == []
+
+
+# 功能：验证 observer 严格拒绝缺失、旧版、未来版及非整数 v2 schema_version
+# 设计：仅变异合法 wrapper 的版本字段，证明 fail-closed 不依赖 event lifecycle 错误
+@pytest.mark.parametrize(
+    "schema_version",
+    (None, 1, 3, "2", True),
+)
+@pytest.mark.asyncio
+async def test_trace_grader_rejects_unknown_or_malformed_schema_version(
+    tmp_path: Path,
+    schema_version: object,
+) -> None:
+    run_id = "version-contract"
+    journal = await _write_real_journal(tmp_path / run_id, run_id)
+    rows = [
+        json.loads(line)
+        for line in journal.read_text(encoding="utf-8").splitlines()
+    ]
+    if schema_version is None:
+        rows[0].pop("schema_version")
+    else:
+        rows[0]["schema_version"] = schema_version
+    journal.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    grade = grade_trace(journal, expected_run_id=run_id)
+
+    assert grade.passed is False
+    assert grade.errors == ["invalid journal schema"]
 
 
 # 功能：验证 trace grader 拒绝 sequence gap、无 start 的 finish、非法 retry 与 terminal 后事件

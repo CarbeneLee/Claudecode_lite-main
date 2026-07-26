@@ -179,6 +179,7 @@ def _execution(tmp_path: Path, *, task_passes: bool) -> AttemptExecution:
     ]
     rows = [
         {
+            "schema_version": 2,
             "event_id": f"evt-{index}",
             "stream_id": f"run:{prepared.request.run_id}",
             "seq": index,
@@ -200,6 +201,41 @@ def _execution(tmp_path: Path, *, task_passes: bool) -> AttemptExecution:
         ),
         failure_category=FailureCategory.NONE,
         wall_latency_ms=15.0,
+    )
+
+
+# 构造保留 journal prefix 与 trace 的 timeout attempt
+def _timeout_execution(tmp_path: Path) -> AttemptExecution:
+    loaded = load_task(_task_dir(tmp_path))
+    prepared = prepare_attempt(loaded, tmp_path / "output")
+    run_dir = prepared.runs_dir / prepared.request.run_id
+    run_dir.mkdir()
+    row = {
+        "schema_version": 2,
+        "event_id": "evt-timeout-1",
+        "stream_id": f"run:{prepared.request.run_id}",
+        "seq": 1,
+        "event": {
+            "type": "run.started",
+            "run_id": prepared.request.run_id,
+            "goal": loaded.public.goal,
+            "ts": "t1",
+        },
+    }
+    (run_dir / "events.v2.jsonl").write_text(
+        json.dumps(row) + "\n",
+        encoding="utf-8",
+    )
+    prepared.trace_path.write_text(
+        json.dumps({"kind": "runtime_identity", "run_id": prepared.request.run_id})
+        + "\n",
+        encoding="utf-8",
+    )
+    return AttemptExecution(
+        prepared=prepared,
+        worker_result=None,
+        failure_category=FailureCategory.TIMEOUT,
+        wall_latency_ms=30_000.0,
     )
 
 
@@ -250,6 +286,42 @@ async def test_evaluator_separates_runtime_success_from_task_success(tmp_path: P
     assert report.runtime_success is True
     assert report.task_success is False
     assert report.failure_category is FailureCategory.TASK_FAILED
+
+
+# 功能：验证 timeout attempt 仅保留 identity 所需 runtime prefix，不进入 grader 或正式轨迹指标
+# 设计：提供真实 attempt 目录中的部分 journal/trace，断言 canonical copy 与 timeout 语义同时成立
+@pytest.mark.asyncio
+async def test_evaluator_preserves_timeout_partial_identity_evidence(
+    tmp_path: Path,
+) -> None:
+    execution = _timeout_execution(tmp_path)
+
+    async def fake_attempt(_task: object, _output: object) -> AttemptExecution:
+        return execution
+
+    report = await evaluate_task(
+        _task_dir(tmp_path / "second"),
+        tmp_path / "output",
+        attempt_runner=fake_attempt,
+    )
+    attempt = execution.prepared.attempt_dir
+
+    assert report.failure_category is FailureCategory.TIMEOUT
+    assert report.runtime_success is False
+    assert report.task_success is False
+    assert report.trace_sanity_passed is False
+    assert report.criteria == []
+    assert report.metrics.step_count == 0
+    assert report.metrics.tool_count == 0
+    assert report.metrics.retry_count == 0
+    assert report.metrics.token_usage.input_tokens == 0
+    assert (attempt / "runtime" / "events.v2.jsonl").is_file()
+    assert (attempt / "runtime" / "trace.jsonl").is_file()
+    assert not (attempt / "runtime" / "initial-workspace.json").exists()
+    assert not (attempt / "runtime" / "final-workspace.json").exists()
+    assert not (attempt / "runtime" / "workspace.diff").exists()
+    assert not (attempt / "private" / "grades.json").exists()
+    assert not (attempt / "private" / "command-results.json").exists()
 
 
 # 功能：验证无法启动 private grader command 时仍生成集中分类的公开报告
@@ -338,6 +410,7 @@ events = [
 ]
 rows = [
     {
+        "schema_version": 2,
         "event_id": f"evt-{index}",
         "stream_id": f"run:{request['run_id']}",
         "seq": index,

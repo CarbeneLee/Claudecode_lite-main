@@ -10,6 +10,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from kama_claude.eval.failure import FailureCategory
 from kama_claude.eval.runner import AttemptExecution
 
 MAX_WORKSPACE_FILES = 10_000
@@ -48,6 +49,12 @@ class CollectedArtifacts:
     initial_manifest: WorkspaceManifest
     final_manifest: WorkspaceManifest
     workspace_diff: str
+
+
+@dataclass(frozen=True)
+class TimeoutPartialArtifacts:
+    journal_path: Path | None
+    trace_path: Path | None
 
 
 # 以固定块大小流式计算文件哈希，避免按文件大小分配内存
@@ -247,4 +254,37 @@ def collect_artifacts(
         initial_manifest=initial,
         final_manifest=final,
         workspace_diff=workspace_diff,
+    )
+
+
+# 为 timeout attempt 尽力保存 identity observer 所需的 journal prefix 与 trace
+def preserve_timeout_partial_evidence(
+    execution: AttemptExecution,
+) -> TimeoutPartialArtifacts:
+    if (
+        execution.failure_category is not FailureCategory.TIMEOUT
+        or execution.worker_result is not None
+    ):
+        raise ArtifactCollectionError("partial evidence requires a timeout attempt")
+    prepared = execution.prepared
+    source_journal = (
+        prepared.runs_dir / prepared.request.run_id / "events.v2.jsonl"
+    )
+    journal_path: Path | None = None
+    if source_journal.is_file() and not source_journal.is_symlink():
+        candidate = prepared.attempt_dir / "runtime" / "events.v2.jsonl"
+        try:
+            shutil.copyfile(source_journal, candidate)
+        except OSError:
+            pass
+        else:
+            journal_path = candidate
+    trace_path = (
+        prepared.trace_path
+        if prepared.trace_path.is_file() and not prepared.trace_path.is_symlink()
+        else None
+    )
+    return TimeoutPartialArtifacts(
+        journal_path=journal_path,
+        trace_path=trace_path,
     )

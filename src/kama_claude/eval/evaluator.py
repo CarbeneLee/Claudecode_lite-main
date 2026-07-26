@@ -4,7 +4,11 @@ import json
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-from kama_claude.eval.collector import ArtifactCollectionError, collect_artifacts
+from kama_claude.eval.collector import (
+    ArtifactCollectionError,
+    collect_artifacts,
+    preserve_timeout_partial_evidence,
+)
 from kama_claude.eval.failure import FailureCategory, select_failure_category
 from kama_claude.eval.graders import (
     GraderExecutionError,
@@ -56,6 +60,8 @@ async def evaluate_task(
     task = load_task(task_dir)
     execution = await attempt_runner(task, output_root)
     categories = {execution.failure_category}
+    if execution.failure_category is FailureCategory.TIMEOUT:
+        preserve_timeout_partial_evidence(execution)
     runtime_success = (
         execution.worker_result is not None
         and execution.worker_result.runtime_status == "success"

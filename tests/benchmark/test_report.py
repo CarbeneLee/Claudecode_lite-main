@@ -493,20 +493,56 @@ def _write_fake_evaluation(
         encoding="utf-8",
     )
     (runtime / "events.v2.jsonl").write_text(
-        json.dumps(
-            {
-                "event_id": "event-1",
-                "stream_id": "run:run-cli",
-                "seq": 1,
-                "event": {
-                    "type": "llm.model_selected",
-                    "run_id": "run-cli",
-                    "model": "deepseek-v4-pro",
-                    "strategy": "static",
-                },
-            }
-        )
-        + "\n",
+        "".join(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "event_id": f"event-{index}",
+                    "stream_id": "run:run-cli",
+                    "seq": index,
+                    "event": event,
+                }
+            )
+            + "\n"
+            for index, event in enumerate(
+                [
+                    {
+                        "type": "run.started",
+                        "run_id": "run-cli",
+                        "goal": "CLI identity contract.",
+                        "ts": "2026-07-26T00:00:00+00:00",
+                    },
+                    {
+                        "type": "step.started",
+                        "run_id": "run-cli",
+                        "step": 1,
+                        "ts": "2026-07-26T00:00:00.500000+00:00",
+                    },
+                    {
+                        "type": "llm.model_selected",
+                        "run_id": "run-cli",
+                        "model": "deepseek-v4-pro",
+                        "strategy": "static",
+                        "ts": "2026-07-26T00:00:01+00:00",
+                    },
+                    {
+                        "type": "step.finished",
+                        "run_id": "run-cli",
+                        "step": 1,
+                        "ts": "2026-07-26T00:00:02+00:00",
+                    },
+                    {
+                        "type": "run.finished",
+                        "run_id": "run-cli",
+                        "status": "success",
+                        "reason": None,
+                        "steps": 1,
+                        "ts": "2026-07-26T00:00:03+00:00",
+                    },
+                ],
+                1,
+            )
+        ),
         encoding="utf-8",
     )
     (private / "command-results.json").write_text("[]\n", encoding="utf-8")
@@ -535,6 +571,67 @@ def _write_fake_evaluation(
                 cache_tokens=0,
             ),
             failure_category=FailureCategory.NONE,
+        ),
+    )
+
+
+# 将完整 fake evaluation 收敛为只含 identity evidence 的 timeout partial attempt
+def _write_timeout_partial_evaluation(
+    task_dir: Path | str,
+    output: Path | str,
+    *,
+    prompt: str,
+    tools: list[dict[str, object]],
+    model_id: str = "deepseek-v4-pro",
+    runtime_success: bool = False,
+) -> EvaluationReport:
+    complete = _write_fake_evaluation(
+        task_dir,
+        output,
+        prompt=prompt,
+        tools=tools,
+    )
+    root = (
+        Path(output)
+        / "attempts"
+        / complete.task_id
+        / complete.attempt_id
+    )
+    runtime = root / "runtime"
+    journal_path = runtime / "events.v2.jsonl"
+    rows = [
+        json.loads(line)
+        for line in journal_path.read_text(encoding="utf-8").splitlines()
+    ][:3]
+    rows[-1]["event"]["model"] = model_id
+    journal_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    for name in ("initial-workspace.json", "final-workspace.json", "workspace.diff"):
+        (runtime / name).unlink()
+    (root / "private" / "command-results.json").unlink()
+    return EvaluationReport(
+        task_id=complete.task_id,
+        attempt_id=complete.attempt_id,
+        task_success=False,
+        runtime_success=runtime_success,
+        trace_sanity_passed=False,
+        failure_category=FailureCategory.TIMEOUT,
+        criteria=[],
+        metrics=BasicMetrics(
+            task_success=False,
+            runtime_success=runtime_success,
+            step_count=0,
+            tool_count=0,
+            retry_count=0,
+            wall_latency_ms=120_000.0,
+            token_usage=TokenUsage(
+                input_tokens=0,
+                output_tokens=0,
+                cache_tokens=0,
+            ),
+            failure_category=FailureCategory.TIMEOUT,
         ),
     )
 
@@ -765,3 +862,157 @@ async def test_execute_experiment_identity_mismatch_is_invalid(
     assert not (output / "baseline.json").exists()
     assert not (output / "baseline.md").exists()
     assert "must-not-be-serialized" not in invalid_text
+
+
+# 功能：验证证据完整的 timeout_partial attempt 可继续实验但仍按 timeout 计为任务失败
+# 设计：只保留 strict journal prefix 与 identity trace，断言 baseline 可生成且退出码保持非成功
+@pytest.mark.asyncio
+async def test_execute_experiment_accepts_verified_timeout_partial_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = importlib.import_module("kama_claude.benchmark.cli")
+    suite = _loaded_suite(tmp_path)
+    prompt = "effective prompt"
+    tools = [{"name": "read_file", "input_schema": {"type": "object"}}]
+    profile_path = _write_cli_experiment_profile(
+        tmp_path,
+        _report_module(),
+        suite,
+        prompt=prompt,
+        tools=tools,
+    )
+    output = tmp_path / "timeout-output"
+    args = cli._parse_args(
+        ["run", "--experiment", str(profile_path), "--output", str(output)]
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-timeout-credential")
+
+    async def timeout_evaluator(
+        task_dir: Path | str,
+        evaluation_output: Path | str,
+    ) -> EvaluationReport:
+        return _write_timeout_partial_evaluation(
+            task_dir,
+            evaluation_output,
+            prompt=prompt,
+            tools=tools,
+        )
+
+    exit_code = await cli.execute_experiment(
+        args,
+        evaluator=timeout_evaluator,
+        repository=cli.RepositoryState(commit="d" * 40, dirty=False),
+        repository_root=tmp_path / "repository",
+        installed_sdk_version="0.111.0",
+    )
+
+    payload = json.loads((output / "baseline.json").read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert payload["experiment"]["status"] == "valid"
+    assert payload["attempts"][0]["failure_category"] == "timeout"
+    assert not (output / "experiment-invalid.json").exists()
+
+
+# 功能：验证 timeout_partial 的 model mismatch 仍使整个 experiment fail closed
+# 设计：保留其余四类证据完整，仅改变 journal model event，锁定 mismatch 不能降级成普通 timeout
+@pytest.mark.asyncio
+async def test_execute_experiment_rejects_timeout_partial_identity_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = importlib.import_module("kama_claude.benchmark.cli")
+    suite = _loaded_suite(tmp_path)
+    prompt = "effective prompt"
+    tools = [{"name": "read_file", "input_schema": {"type": "object"}}]
+    profile_path = _write_cli_experiment_profile(
+        tmp_path,
+        _report_module(),
+        suite,
+        prompt=prompt,
+        tools=tools,
+    )
+    output = tmp_path / "timeout-mismatch-output"
+    args = cli._parse_args(
+        ["run", "--experiment", str(profile_path), "--output", str(output)]
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-timeout-credential")
+
+    async def mismatched_timeout_evaluator(
+        task_dir: Path | str,
+        evaluation_output: Path | str,
+    ) -> EvaluationReport:
+        return _write_timeout_partial_evaluation(
+            task_dir,
+            evaluation_output,
+            prompt=prompt,
+            tools=tools,
+            model_id="deepseek-v4-flash",
+        )
+
+    exit_code = await cli.execute_experiment(
+        args,
+        evaluator=mismatched_timeout_evaluator,
+        repository=cli.RepositoryState(commit="d" * 40, dirty=False),
+        repository_root=tmp_path / "repository",
+        installed_sdk_version="0.111.0",
+    )
+
+    invalid = json.loads(
+        (output / "experiment-invalid.json").read_text(encoding="utf-8")
+    )
+    assert exit_code == 2
+    assert invalid["mismatches"] == ["model_events"]
+    assert not (output / "baseline.json").exists()
+
+
+# 功能：验证 timeout_partial 模式拒绝与 timeout category 矛盾的 runtime success report
+# 设计：identity artifacts 保持完整，只制造 report 状态矛盾，确保 observer 不靠类别字符串放行
+@pytest.mark.asyncio
+async def test_execute_experiment_rejects_contradictory_timeout_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = importlib.import_module("kama_claude.benchmark.cli")
+    suite = _loaded_suite(tmp_path)
+    prompt = "effective prompt"
+    tools = [{"name": "read_file", "input_schema": {"type": "object"}}]
+    profile_path = _write_cli_experiment_profile(
+        tmp_path,
+        _report_module(),
+        suite,
+        prompt=prompt,
+        tools=tools,
+    )
+    output = tmp_path / "contradictory-timeout-output"
+    args = cli._parse_args(
+        ["run", "--experiment", str(profile_path), "--output", str(output)]
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-timeout-credential")
+
+    async def contradictory_timeout_evaluator(
+        task_dir: Path | str,
+        evaluation_output: Path | str,
+    ) -> EvaluationReport:
+        return _write_timeout_partial_evaluation(
+            task_dir,
+            evaluation_output,
+            prompt=prompt,
+            tools=tools,
+            runtime_success=True,
+        )
+
+    exit_code = await cli.execute_experiment(
+        args,
+        evaluator=contradictory_timeout_evaluator,
+        repository=cli.RepositoryState(commit="d" * 40, dirty=False),
+        repository_root=tmp_path / "repository",
+        installed_sdk_version="0.111.0",
+    )
+
+    invalid = json.loads(
+        (output / "experiment-invalid.json").read_text(encoding="utf-8")
+    )
+    assert exit_code == 2
+    assert invalid["mismatches"] == ["identity_evidence"]
+    assert not (output / "baseline.json").exists()

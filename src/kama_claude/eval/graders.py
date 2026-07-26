@@ -6,7 +6,7 @@ import shutil
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
@@ -63,6 +63,7 @@ class TraceGrade:
 class _JournalRow(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
+    schema_version: Literal[2]
     event_id: str = Field(min_length=1)
     stream_id: str = Field(min_length=1)
     seq: int = Field(gt=0)
@@ -254,12 +255,11 @@ def _trace_error(errors: list[str], message: str) -> None:
     errors.append(message)
 
 
-# 验证 canonical journal 的 schema、sequence 和 run/step/tool/subagent lifecycle
-def grade_trace(
+# 严格解析 canonical v2 wrapper，并验证 sequence、stream identity 与 event schema
+def validate_journal_evidence(
     journal_path: Path,
     *,
     expected_run_id: str,
-    expected_terminal_status: str | None = None,
 ) -> TraceGrade:
     errors: list[str] = []
     events: list[dict[str, Any]] = []
@@ -289,9 +289,132 @@ def grade_trace(
         except ValidationError:
             _trace_error(errors, "unknown or invalid event schema")
 
-    if errors:
-        return TraceGrade(passed=False, errors=errors, events=events)
+    return TraceGrade(passed=not errors, errors=errors, events=events)
 
+
+# 验证 timeout 截断前缀不存在已发生的非法 lifecycle transition
+def grade_timeout_trace_prefix(
+    journal_path: Path,
+    *,
+    expected_run_id: str,
+) -> TraceGrade:
+    parsed = validate_journal_evidence(
+        journal_path,
+        expected_run_id=expected_run_id,
+    )
+    if not parsed.passed:
+        return parsed
+    errors: list[str] = []
+    current_step: int | None = None
+    completed_steps = 0
+    tools: dict[str, dict[str, int | bool | str]] = {}
+    open_subagents: set[str] = set()
+    for index, event in enumerate(parsed.events):
+        event_type = str(event["type"])
+        event_run_id = event.get("run_id")
+        if event_type == "run.started":
+            if index != 0 or event_run_id != expected_run_id:
+                _trace_error(errors, "invalid run start transition")
+            continue
+        if index == 0:
+            _trace_error(errors, "event appears before run start")
+        if event_type == "run.finished":
+            _trace_error(errors, "timeout prefix contains terminal run event")
+            continue
+        if event_type.startswith("subagent."):
+            if event.get("parent_run_id") != expected_run_id:
+                _trace_error(errors, "subagent parent identity mismatch")
+        elif event_run_id is not None and event_run_id != expected_run_id:
+            _trace_error(errors, "event run identity mismatch")
+
+        if event_type == "step.started":
+            step = int(event["step"])
+            if current_step is not None:
+                _trace_error(errors, "overlapping step start")
+            else:
+                if step != completed_steps + 1:
+                    _trace_error(errors, "step sequence is not contiguous")
+                current_step = step
+        elif event_type == "step.finished":
+            step = int(event["step"])
+            if current_step != step:
+                _trace_error(errors, "step finish without start")
+            elif any(not bool(state["finished"]) for state in tools.values()):
+                _trace_error(errors, "step finished with active tool")
+            else:
+                current_step = None
+                completed_steps += 1
+        elif event_type == "tool.call_started":
+            if current_step is None:
+                _trace_error(errors, "tool event appears outside an open step")
+            tool_id = str(event["tool_use_id"])
+            if tool_id in tools:
+                _trace_error(errors, "duplicate tool start")
+            tools[tool_id] = {
+                "name": str(event["tool_name"]),
+                "attempt": 0,
+                "finished": False,
+            }
+        elif event_type == "tool.call_failed":
+            if current_step is None:
+                _trace_error(errors, "tool event appears outside an open step")
+            tool_id = str(event["tool_use_id"])
+            state = tools.get(tool_id)
+            if state is None or bool(state["finished"]):
+                _trace_error(errors, "tool failure without active start")
+                continue
+            if str(event["tool_name"]) != str(state["name"]):
+                _trace_error(errors, "tool lifecycle name mismatch")
+            attempt = int(event["attempt"])
+            if attempt != int(state["attempt"]) + 1:
+                _trace_error(errors, "tool retry attempt is not contiguous")
+            state["attempt"] = attempt
+        elif event_type == "tool.call_finished":
+            if current_step is None:
+                _trace_error(errors, "tool event appears outside an open step")
+            tool_id = str(event["tool_use_id"])
+            state = tools.get(tool_id)
+            if state is None or bool(state["finished"]):
+                _trace_error(errors, "tool finish without active start")
+                continue
+            if str(event["tool_name"]) != str(state["name"]):
+                _trace_error(errors, "tool lifecycle name mismatch")
+            state["finished"] = True
+        elif event_type == "subagent.started":
+            child_run_id = str(event["child_run_id"])
+            if child_run_id in open_subagents:
+                _trace_error(errors, "duplicate subagent start")
+            open_subagents.add(child_run_id)
+        elif event_type == "subagent.finished":
+            child_run_id = str(event["child_run_id"])
+            if child_run_id not in open_subagents:
+                _trace_error(errors, "subagent finish without start")
+            else:
+                open_subagents.remove(child_run_id)
+    if not parsed.events or parsed.events[0].get("type") != "run.started":
+        _trace_error(errors, "missing run start")
+    return TraceGrade(
+        passed=not errors,
+        errors=errors,
+        events=parsed.events,
+    )
+
+
+# 验证 canonical journal 的 schema、sequence 和 run/step/tool/subagent lifecycle
+def grade_trace(
+    journal_path: Path,
+    *,
+    expected_run_id: str,
+    expected_terminal_status: str | None = None,
+) -> TraceGrade:
+    parsed = validate_journal_evidence(
+        journal_path,
+        expected_run_id=expected_run_id,
+    )
+    if not parsed.passed:
+        return parsed
+    errors: list[str] = []
+    events = parsed.events
     run_started = False
     run_finished = False
     current_step: int | None = None

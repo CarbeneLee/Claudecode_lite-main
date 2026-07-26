@@ -76,6 +76,7 @@ def _write_runtime_evidence(execution: AttemptExecution, goal: str) -> None:
     ]
     rows = [
         {
+            "schema_version": 2,
             "event_id": f"event-{index}",
             "stream_id": f"run:{prepared.request.run_id}",
             "seq": index,

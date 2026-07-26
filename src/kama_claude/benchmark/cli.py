@@ -9,6 +9,7 @@ from pathlib import Path
 
 from kama_claude.benchmark.analyzers import aggregate_attempts, analyze_attempt
 from kama_claude.benchmark.experiment import (
+    EvidenceMode,
     ExperimentIdentityMismatch,
     ObservedExperimentIdentity,
     RepositoryIdentity,
@@ -32,6 +33,7 @@ from kama_claude.benchmark.report import (
 )
 from kama_claude.benchmark.schema import load_suite
 from kama_claude.eval.evaluator import evaluate_task
+from kama_claude.eval.failure import FailureCategory
 from kama_claude.eval.report import EvaluationReport
 
 
@@ -43,6 +45,31 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run.add_argument("--experiment", required=True)
     run.add_argument("--output", required=True)
     return parser.parse_args(argv)
+
+
+# 仅为语义自洽的 timeout report 选择 partial identity evidence 模式
+def _identity_evidence_mode(report: EvaluationReport) -> EvidenceMode:
+    metrics = report.metrics
+    tokens = metrics.token_usage
+    if report.failure_category is not FailureCategory.TIMEOUT:
+        return EvidenceMode.COMPLETE
+    if (
+        report.runtime_success
+        or report.task_success
+        or report.trace_sanity_passed
+        or report.criteria
+        or metrics.runtime_success
+        or metrics.task_success
+        or metrics.failure_category is not FailureCategory.TIMEOUT
+        or metrics.step_count != 0
+        or metrics.tool_count != 0
+        or metrics.retry_count != 0
+        or tokens.input_tokens != 0
+        or tokens.output_tokens != 0
+        or tokens.cache_tokens != 0
+    ):
+        raise ValueError("timeout report is inconsistent with partial evidence")
+    return EvidenceMode.TIMEOUT_PARTIAL
 
 
 # 运行 versioned experiment、逐 attempt 验证身份并只为 valid matrix 写 baseline
@@ -97,7 +124,10 @@ async def execute_experiment(
             / report.attempt_id
         )
         try:
-            observed = collect_observed_identity(attempt_root)
+            observed = collect_observed_identity(
+                attempt_root,
+                evidence_mode=_identity_evidence_mode(report),
+            )
             require_identity_match(declared, observed)
         except ExperimentIdentityMismatch:
             raise
