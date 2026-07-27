@@ -4,9 +4,10 @@ import asyncio
 import json
 import shutil
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
@@ -292,6 +293,193 @@ def validate_journal_evidence(
     return TraceGrade(passed=not errors, errors=errors, events=events)
 
 
+class _CompletionPolicy(StrEnum):
+    COMPLETE = "complete"
+    TIMEOUT_PREFIX = "timeout_prefix"
+
+
+@dataclass
+class _ToolLifecycle:
+    step: int
+    tool_use_id: str
+    name: str
+    last_failure_attempt: int = 0
+    has_failed_outcome: bool = False
+    success: bool = False
+
+
+@dataclass
+class _LifecycleState:
+    run_started: bool = False
+    run_finished: bool = False
+    current_step: int | None = None
+    completed_steps: int = 0
+    tools: dict[tuple[int, str], _ToolLifecycle] = field(default_factory=dict)
+    open_subagents: set[str] = field(default_factory=set)
+
+
+class _LifecycleViolation(RuntimeError):
+    pass
+
+
+# 以首个稳定错误终止 lifecycle reduction，避免残留状态产生级联诊断
+def _lifecycle_violation(message: str) -> NoReturn:
+    raise _LifecycleViolation(message)
+
+
+# 返回当前 step 拥有的指定 tool state，不把 tool ID解释为 run-wide唯一
+def _current_tool(
+    state: _LifecycleState,
+    event: dict[str, Any],
+    *,
+    missing_message: str,
+) -> _ToolLifecycle:
+    if state.current_step is None:
+        _lifecycle_violation("tool event appears outside an open step")
+    tool_id = str(event["tool_use_id"])
+    tool = state.tools.get((state.current_step, tool_id))
+    if tool is None:
+        _lifecycle_violation(missing_message)
+    return tool
+
+
+# 用共享状态机验证完整 run 或 timeout prefix 的全部 lifecycle transition
+def _reduce_lifecycle(
+    events: list[dict[str, Any]],
+    *,
+    expected_run_id: str,
+    policy: _CompletionPolicy,
+    expected_terminal_status: str | None,
+) -> list[str]:
+    state = _LifecycleState()
+    try:
+        for index, event in enumerate(events):
+            event_type = str(event["type"])
+            event_run_id = event.get("run_id")
+            if state.run_finished:
+                _lifecycle_violation("event appears after terminal run event")
+            if event_type == "run.started":
+                if (
+                    index != 0
+                    or state.run_started
+                    or event_run_id != expected_run_id
+                ):
+                    _lifecycle_violation("invalid run start transition")
+                state.run_started = True
+                continue
+            if not state.run_started:
+                _lifecycle_violation("event appears before run start")
+            if event_type.startswith("subagent."):
+                if event.get("parent_run_id") != expected_run_id:
+                    _lifecycle_violation("subagent parent identity mismatch")
+            elif event_run_id is not None and event_run_id != expected_run_id:
+                _lifecycle_violation("event run identity mismatch")
+
+            if event_type == "run.finished":
+                if policy is _CompletionPolicy.TIMEOUT_PREFIX:
+                    _lifecycle_violation(
+                        "timeout prefix contains terminal run event"
+                    )
+                if state.current_step is not None:
+                    _lifecycle_violation("run finished with open step")
+                if int(event["steps"]) != state.completed_steps:
+                    _lifecycle_violation("run terminal step count mismatch")
+                if (
+                    expected_terminal_status is not None
+                    and str(event["status"]) != expected_terminal_status
+                ):
+                    _lifecycle_violation("run terminal status mismatch")
+                if state.open_subagents:
+                    _lifecycle_violation("run finished with open subagent")
+                state.run_finished = True
+            elif event_type == "step.started":
+                step = int(event["step"])
+                if state.current_step is not None:
+                    _lifecycle_violation("overlapping step start")
+                if step != state.completed_steps + 1:
+                    _lifecycle_violation("step sequence is not contiguous")
+                state.current_step = step
+            elif event_type == "step.finished":
+                step = int(event["step"])
+                if state.current_step != step:
+                    _lifecycle_violation("step finish without start")
+                if any(
+                    not tool.success and not tool.has_failed_outcome
+                    for tool in state.tools.values()
+                ):
+                    _lifecycle_violation("step finished with active tool")
+                state.tools.clear()
+                state.current_step = None
+                state.completed_steps += 1
+            elif event_type == "tool.call_started":
+                if state.current_step is None:
+                    _lifecycle_violation(
+                        "tool event appears outside an open step"
+                    )
+                tool_id = str(event["tool_use_id"])
+                key = (state.current_step, tool_id)
+                if key in state.tools:
+                    _lifecycle_violation("duplicate tool start")
+                state.tools[key] = _ToolLifecycle(
+                    step=state.current_step,
+                    tool_use_id=tool_id,
+                    name=str(event["tool_name"]),
+                )
+            elif event_type == "tool.call_failed":
+                tool = _current_tool(
+                    state,
+                    event,
+                    missing_message="tool failure without active start",
+                )
+                if tool.success:
+                    _lifecycle_violation("tool failure without active start")
+                if str(event["tool_name"]) != tool.name:
+                    _lifecycle_violation("tool lifecycle name mismatch")
+                attempt = int(event["attempt"])
+                if (
+                    attempt <= 0
+                    or attempt != tool.last_failure_attempt + 1
+                ):
+                    _lifecycle_violation(
+                        "tool retry attempt is not contiguous"
+                    )
+                tool.last_failure_attempt = attempt
+                tool.has_failed_outcome = True
+            elif event_type == "tool.call_finished":
+                tool = _current_tool(
+                    state,
+                    event,
+                    missing_message="tool finish without active start",
+                )
+                if tool.success:
+                    _lifecycle_violation("tool finish without active start")
+                if str(event["tool_name"]) != tool.name:
+                    _lifecycle_violation("tool lifecycle name mismatch")
+                tool.success = True
+            elif event_type == "subagent.started":
+                child_run_id = str(event["run_id"])
+                if child_run_id in state.open_subagents:
+                    _lifecycle_violation("duplicate subagent start")
+                state.open_subagents.add(child_run_id)
+            elif event_type == "subagent.finished":
+                child_run_id = str(event["run_id"])
+                if child_run_id not in state.open_subagents:
+                    _lifecycle_violation("subagent finish without start")
+                state.open_subagents.remove(child_run_id)
+    except _LifecycleViolation as exc:
+        return [str(exc)]
+
+    if not state.run_started:
+        return [
+            "missing run start"
+            if policy is _CompletionPolicy.TIMEOUT_PREFIX
+            else "run start is missing"
+        ]
+    if policy is _CompletionPolicy.COMPLETE and not state.run_finished:
+        return ["run terminal event is missing"]
+    return []
+
+
 # 验证 timeout 截断前缀不存在已发生的非法 lifecycle transition
 def grade_timeout_trace_prefix(
     journal_path: Path,
@@ -304,95 +492,12 @@ def grade_timeout_trace_prefix(
     )
     if not parsed.passed:
         return parsed
-    errors: list[str] = []
-    current_step: int | None = None
-    completed_steps = 0
-    tools: dict[str, dict[str, int | bool | str]] = {}
-    open_subagents: set[str] = set()
-    for index, event in enumerate(parsed.events):
-        event_type = str(event["type"])
-        event_run_id = event.get("run_id")
-        if event_type == "run.started":
-            if index != 0 or event_run_id != expected_run_id:
-                _trace_error(errors, "invalid run start transition")
-            continue
-        if index == 0:
-            _trace_error(errors, "event appears before run start")
-        if event_type == "run.finished":
-            _trace_error(errors, "timeout prefix contains terminal run event")
-            continue
-        if event_type.startswith("subagent."):
-            if event.get("parent_run_id") != expected_run_id:
-                _trace_error(errors, "subagent parent identity mismatch")
-        elif event_run_id is not None and event_run_id != expected_run_id:
-            _trace_error(errors, "event run identity mismatch")
-
-        if event_type == "step.started":
-            step = int(event["step"])
-            if current_step is not None:
-                _trace_error(errors, "overlapping step start")
-            else:
-                if step != completed_steps + 1:
-                    _trace_error(errors, "step sequence is not contiguous")
-                current_step = step
-        elif event_type == "step.finished":
-            step = int(event["step"])
-            if current_step != step:
-                _trace_error(errors, "step finish without start")
-            elif any(not bool(state["finished"]) for state in tools.values()):
-                _trace_error(errors, "step finished with active tool")
-            else:
-                current_step = None
-                completed_steps += 1
-        elif event_type == "tool.call_started":
-            if current_step is None:
-                _trace_error(errors, "tool event appears outside an open step")
-            tool_id = str(event["tool_use_id"])
-            if tool_id in tools:
-                _trace_error(errors, "duplicate tool start")
-            tools[tool_id] = {
-                "name": str(event["tool_name"]),
-                "attempt": 0,
-                "finished": False,
-            }
-        elif event_type == "tool.call_failed":
-            if current_step is None:
-                _trace_error(errors, "tool event appears outside an open step")
-            tool_id = str(event["tool_use_id"])
-            state = tools.get(tool_id)
-            if state is None or bool(state["finished"]):
-                _trace_error(errors, "tool failure without active start")
-                continue
-            if str(event["tool_name"]) != str(state["name"]):
-                _trace_error(errors, "tool lifecycle name mismatch")
-            attempt = int(event["attempt"])
-            if attempt != int(state["attempt"]) + 1:
-                _trace_error(errors, "tool retry attempt is not contiguous")
-            state["attempt"] = attempt
-        elif event_type == "tool.call_finished":
-            if current_step is None:
-                _trace_error(errors, "tool event appears outside an open step")
-            tool_id = str(event["tool_use_id"])
-            state = tools.get(tool_id)
-            if state is None or bool(state["finished"]):
-                _trace_error(errors, "tool finish without active start")
-                continue
-            if str(event["tool_name"]) != str(state["name"]):
-                _trace_error(errors, "tool lifecycle name mismatch")
-            state["finished"] = True
-        elif event_type == "subagent.started":
-            child_run_id = str(event["child_run_id"])
-            if child_run_id in open_subagents:
-                _trace_error(errors, "duplicate subagent start")
-            open_subagents.add(child_run_id)
-        elif event_type == "subagent.finished":
-            child_run_id = str(event["child_run_id"])
-            if child_run_id not in open_subagents:
-                _trace_error(errors, "subagent finish without start")
-            else:
-                open_subagents.remove(child_run_id)
-    if not parsed.events or parsed.events[0].get("type") != "run.started":
-        _trace_error(errors, "missing run start")
+    errors = _reduce_lifecycle(
+        parsed.events,
+        expected_run_id=expected_run_id,
+        policy=_CompletionPolicy.TIMEOUT_PREFIX,
+        expected_terminal_status=None,
+    )
     return TraceGrade(
         passed=not errors,
         errors=errors,
@@ -413,117 +518,10 @@ def grade_trace(
     )
     if not parsed.passed:
         return parsed
-    errors: list[str] = []
-    events = parsed.events
-    run_started = False
-    run_finished = False
-    current_step: int | None = None
-    completed_steps = 0
-    tools: dict[str, dict[str, int | bool | str]] = {}
-    open_subagents: set[str] = set()
-    for index, event in enumerate(events):
-        event_type = str(event["type"])
-        event_run_id = event.get("run_id")
-        if run_finished:
-            _trace_error(errors, "event appears after terminal run event")
-            continue
-        if event_type == "run.started":
-            if index != 0 or run_started or event_run_id != expected_run_id:
-                _trace_error(errors, "invalid run start transition")
-            run_started = True
-            continue
-        if not run_started:
-            _trace_error(errors, "event appears before run start")
-        if event_type.startswith("subagent."):
-            if event.get("parent_run_id") != expected_run_id:
-                _trace_error(errors, "subagent parent identity mismatch")
-        elif event_run_id is not None and event_run_id != expected_run_id:
-            _trace_error(errors, "event run identity mismatch")
-
-        if event_type == "step.started":
-            step = int(event["step"])
-            if current_step is not None:
-                _trace_error(errors, "overlapping step start")
-            else:
-                if step != completed_steps + 1:
-                    _trace_error(errors, "step sequence is not contiguous")
-                current_step = step
-        elif event_type == "step.finished":
-            step = int(event["step"])
-            if current_step != step:
-                _trace_error(errors, "step finish without start")
-            else:
-                current_step = None
-                completed_steps += 1
-        elif event_type == "tool.call_started":
-            if current_step is None:
-                _trace_error(errors, "tool event appears outside an open step")
-            tool_id = str(event["tool_use_id"])
-            if tool_id in tools:
-                _trace_error(errors, "duplicate tool start")
-            tools[tool_id] = {
-                "name": str(event["tool_name"]),
-                "attempt": 0,
-                "outcome": False,
-                "finished": False,
-            }
-        elif event_type == "tool.call_failed":
-            if current_step is None:
-                _trace_error(errors, "tool event appears outside an open step")
-            tool_id = str(event["tool_use_id"])
-            state = tools.get(tool_id)
-            if state is None or bool(state["finished"]):
-                _trace_error(errors, "tool failure without active start")
-                continue
-            if str(event["tool_name"]) != str(state["name"]):
-                _trace_error(errors, "tool lifecycle name mismatch")
-            attempt = int(event["attempt"])
-            if attempt != int(state["attempt"]) + 1:
-                _trace_error(errors, "tool retry attempt is not contiguous")
-            state["attempt"] = attempt
-            state["outcome"] = True
-        elif event_type == "tool.call_finished":
-            if current_step is None:
-                _trace_error(errors, "tool event appears outside an open step")
-            tool_id = str(event["tool_use_id"])
-            state = tools.get(tool_id)
-            if state is None or bool(state["finished"]):
-                _trace_error(errors, "tool finish without active start")
-                continue
-            if str(event["tool_name"]) != str(state["name"]):
-                _trace_error(errors, "tool lifecycle name mismatch")
-            state["outcome"] = True
-            state["finished"] = True
-        elif event_type == "subagent.started":
-            child_id = str(event["run_id"])
-            if child_id in open_subagents:
-                _trace_error(errors, "duplicate subagent start")
-            open_subagents.add(child_id)
-        elif event_type == "subagent.finished":
-            child_id = str(event["run_id"])
-            if child_id not in open_subagents:
-                _trace_error(errors, "subagent finish without start")
-            open_subagents.discard(child_id)
-        elif event_type == "run.finished":
-            if event_run_id != expected_run_id:
-                _trace_error(errors, "run finish identity mismatch")
-            if current_step is not None:
-                _trace_error(errors, "run finished with open step")
-            if int(event["steps"]) != completed_steps:
-                _trace_error(errors, "run terminal step count mismatch")
-            if (
-                expected_terminal_status is not None
-                and str(event["status"]) != expected_terminal_status
-            ):
-                _trace_error(errors, "run terminal status mismatch")
-            if any(not bool(state["outcome"]) for state in tools.values()):
-                _trace_error(errors, "run finished with open tool call")
-            if open_subagents:
-                _trace_error(errors, "run finished with open subagent")
-            run_finished = True
-
-    if not run_started:
-        _trace_error(errors, "run start is missing")
-    if not run_finished:
-        _trace_error(errors, "run terminal event is missing")
-    return TraceGrade(passed=not errors, errors=errors, events=events)
+    errors = _reduce_lifecycle(
+        parsed.events,
+        expected_run_id=expected_run_id,
+        policy=_CompletionPolicy.COMPLETE,
+        expected_terminal_status=expected_terminal_status,
+    )
+    return TraceGrade(passed=not errors, errors=errors, events=parsed.events)

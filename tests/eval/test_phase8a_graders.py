@@ -9,7 +9,12 @@ import pytest
 
 from kama_claude.core.bus.events import RunFinishedEvent, RunStartedEvent
 from kama_claude.core.events.journal import EventJournalCoordinator
-from kama_claude.eval.graders import GraderExecutionError, grade_rules, grade_trace
+from kama_claude.eval.graders import (
+    GraderExecutionError,
+    grade_rules,
+    grade_timeout_trace_prefix,
+    grade_trace,
+)
 from kama_claude.eval.task import load_task
 
 
@@ -141,6 +146,101 @@ def _valid_events() -> list[dict[str, object]]:
             "ts": "t7",
         },
     ]
+
+
+# 构造不含 terminal 的最小 run prefix
+def _run_prefix() -> list[dict[str, object]]:
+    return [
+        {"type": "run.started", "run_id": "run-a", "goal": "goal", "ts": "t1"},
+    ]
+
+
+# 构造指定 step 的 started 事件
+def _step_started(step: int, ts: str) -> dict[str, object]:
+    return {
+        "type": "step.started",
+        "run_id": "run-a",
+        "step": step,
+        "ts": ts,
+    }
+
+
+# 构造指定 step 的 finished 事件
+def _step_finished(step: int, ts: str) -> dict[str, object]:
+    return {
+        "type": "step.finished",
+        "run_id": "run-a",
+        "step": step,
+        "ts": ts,
+    }
+
+
+# 构造不泄露真实参数的 tool started 事件
+def _tool_started(
+    tool_id: str,
+    ts: str,
+    *,
+    name: str = "fake_tool",
+) -> dict[str, object]:
+    return {
+        "type": "tool.call_started",
+        "run_id": "run-a",
+        "tool_use_id": tool_id,
+        "tool_name": name,
+        "params": {},
+        "ts": ts,
+    }
+
+
+# 构造指定连续 attempt 的 tool failed 事件
+def _tool_failed(
+    tool_id: str,
+    attempt: int,
+    ts: str,
+    *,
+    name: str = "fake_tool",
+) -> dict[str, object]:
+    return {
+        "type": "tool.call_failed",
+        "run_id": "run-a",
+        "tool_use_id": tool_id,
+        "tool_name": name,
+        "error_class": "command_failed",
+        "error_message": "expected failure",
+        "elapsed_ms": attempt,
+        "attempt": attempt,
+        "ts": ts,
+    }
+
+
+# 构造不含虚构 attempt 字段的 tool finished 事件
+def _tool_finished(
+    tool_id: str,
+    ts: str,
+    *,
+    name: str = "fake_tool",
+) -> dict[str, object]:
+    return {
+        "type": "tool.call_finished",
+        "run_id": "run-a",
+        "tool_use_id": tool_id,
+        "tool_name": name,
+        "elapsed_ms": 1,
+        "output": "ok",
+        "ts": ts,
+    }
+
+
+# 构造 complete policy 所需的唯一 run terminal 事件
+def _run_finished(steps: int, ts: str) -> dict[str, object]:
+    return {
+        "type": "run.finished",
+        "run_id": "run-a",
+        "status": "success",
+        "reason": None,
+        "steps": steps,
+        "ts": ts,
+    }
 
 
 # 用真实 coordinator 写出最小完整 run journal
@@ -517,3 +617,279 @@ def test_trace_grader_rejects_structural_contradictions(
 
     assert grade.passed is False
     assert grade.errors
+
+
+# 功能：验证 final tool failure 可在 step barrier 关闭并允许进入后续 step
+# 设计：复现真实 baseline 的 failed→step.finished→next step 前缀，直接锁定 timeout observer 根因
+def test_timeout_trace_accepts_final_failure_then_later_step(tmp_path: Path) -> None:
+    journal = tmp_path / "final-failure-later-step.jsonl"
+    events = [
+        *_run_prefix(),
+        _step_started(1, "t2"),
+        _tool_started("tool-a", "t3"),
+        _tool_failed("tool-a", 1, "t4"),
+        _step_finished(1, "t5"),
+        _step_started(2, "t6"),
+    ]
+    _write_journal(journal, events)
+
+    grade = grade_timeout_trace_prefix(journal, expected_run_id="run-a")
+
+    assert grade.passed is True
+    assert grade.errors == []
+
+
+# 功能：验证连续多次 failure 在 step barrier 处可收敛为 final failure
+# 设计：使用 attempts 1、2、3 且没有 success finish，区分 retry 记录与最终 barrier outcome
+def test_timeout_trace_accepts_multiple_failures_at_step_barrier(tmp_path: Path) -> None:
+    journal = tmp_path / "multiple-failures.jsonl"
+    events = [
+        *_run_prefix(),
+        _step_started(1, "t2"),
+        _tool_started("tool-a", "t3"),
+        _tool_failed("tool-a", 1, "t4"),
+        _tool_failed("tool-a", 2, "t5"),
+        _tool_failed("tool-a", 3, "t6"),
+        _step_finished(1, "t7"),
+    ]
+    _write_journal(journal, events)
+
+    grade = grade_timeout_trace_prefix(journal, expected_run_id="run-a")
+
+    assert grade.passed is True
+    assert grade.errors == []
+
+
+@pytest.mark.parametrize("retry_succeeds", (False, True))
+# 功能：验证同一步多个 tool 可以交错，且 failure 与 success outcome 独立归属
+# 设计：A/B 都先 started，再交错 A failed 与 B finished；参数化 A 最终失败或随后成功两条合法路径
+def test_timeout_trace_accepts_same_step_interleaved_tools(
+    tmp_path: Path,
+    retry_succeeds: bool,
+) -> None:
+    journal = tmp_path / f"interleaved-{retry_succeeds}.jsonl"
+    events = [
+        *_run_prefix(),
+        _step_started(1, "t2"),
+        _tool_started("tool-a", "t3", name="tool_a"),
+        _tool_started("tool-b", "t4", name="tool_b"),
+        _tool_failed("tool-a", 1, "t5", name="tool_a"),
+        _tool_finished("tool-b", "t6", name="tool_b"),
+    ]
+    if retry_succeeds:
+        events.append(_tool_finished("tool-a", "t7", name="tool_a"))
+    events.append(_step_finished(1, "t8"))
+    _write_journal(journal, events)
+
+    grade = grade_timeout_trace_prefix(journal, expected_run_id="run-a")
+
+    assert grade.passed is True
+    assert grade.errors == []
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "missing_outcome",
+        "overlapping_step",
+        "event_after_barrier",
+        "finished_before_start",
+        "failed_before_start",
+        "failure_after_finish",
+    ),
+)
+# 功能：验证共享 lifecycle reducer 继续拒绝真实不可能 transition
+# 设计：每个 case 只破坏一条 ownership/barrier 规则，防止 final-failure 修复放宽整体 strictness
+def test_timeout_trace_rejects_invalid_tool_and_step_transitions(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    journal = tmp_path / f"invalid-{case}.jsonl"
+    events = [*_run_prefix(), _step_started(1, "t2")]
+    if case == "missing_outcome":
+        events.extend((_tool_started("tool-a", "t3"), _step_finished(1, "t4")))
+    elif case == "overlapping_step":
+        events.append(_step_started(2, "t3"))
+    elif case == "event_after_barrier":
+        events.extend(
+            (
+                _tool_started("tool-a", "t3"),
+                _tool_finished("tool-a", "t4"),
+                _step_finished(1, "t5"),
+                _tool_finished("tool-a", "t6"),
+            )
+        )
+    elif case == "finished_before_start":
+        events.append(_tool_finished("tool-a", "t3"))
+    elif case == "failed_before_start":
+        events.append(_tool_failed("tool-a", 1, "t3"))
+    else:
+        events.extend(
+            (
+                _tool_started("tool-a", "t3"),
+                _tool_finished("tool-a", "t4"),
+                _tool_failed("tool-a", 1, "t5"),
+            )
+        )
+    _write_journal(journal, events)
+
+    grade = grade_timeout_trace_prefix(journal, expected_run_id="run-a")
+
+    assert grade.passed is False
+    assert grade.errors
+
+
+@pytest.mark.parametrize(
+    "attempts",
+    (
+        (0,),
+        (1, 1),
+        (1, 3),
+        (1, 2, 1),
+    ),
+)
+# 功能：验证 failure attempt 必须从1开始并严格连续递增
+# 设计：覆盖零值、重复、跳号与回退，直接杀死使用非严格比较或仅检查正数的实现
+def test_timeout_trace_rejects_invalid_failure_attempt_sequence(
+    tmp_path: Path,
+    attempts: tuple[int, ...],
+) -> None:
+    journal = tmp_path / f"attempts-{'-'.join(map(str, attempts))}.jsonl"
+    events = [
+        *_run_prefix(),
+        _step_started(1, "t2"),
+        _tool_started("tool-a", "t3"),
+        *[
+            _tool_failed("tool-a", attempt, f"t{index + 4}")
+            for index, attempt in enumerate(attempts)
+        ],
+    ]
+    _write_journal(journal, events)
+
+    grade = grade_timeout_trace_prefix(journal, expected_run_id="run-a")
+
+    assert grade.passed is False
+    assert grade.errors
+
+
+@pytest.mark.parametrize("open_tool", (False, True))
+# 功能：验证 timeout EOF 可停在 open step 或尚无 outcome 的 open tool
+# 设计：只改变是否发布 tool.started，证明 partial policy不把截断时刻误当作已完成 barrier
+def test_timeout_trace_allows_open_lifecycle_at_eof(
+    tmp_path: Path,
+    open_tool: bool,
+) -> None:
+    journal = tmp_path / f"open-eof-{open_tool}.jsonl"
+    events = [*_run_prefix(), _step_started(1, "t2")]
+    if open_tool:
+        events.append(_tool_started("tool-a", "t3"))
+    _write_journal(journal, events)
+
+    grade = grade_timeout_trace_prefix(journal, expected_run_id="run-a")
+
+    assert grade.passed is True
+    assert grade.errors == []
+
+
+# 功能：验证 complete 与 timeout 对共享合法 prefix 使用相同 transition 语义
+# 设计：prefix含 final failure barrier；timeout直接评分，complete仅追加 terminal，二者都必须通过
+def test_complete_and_timeout_graders_share_lifecycle_semantics(tmp_path: Path) -> None:
+    prefix = [
+        *_run_prefix(),
+        _step_started(1, "t2"),
+        _tool_started("tool-a", "t3"),
+        _tool_failed("tool-a", 1, "t4"),
+        _step_finished(1, "t5"),
+    ]
+    timeout_journal = tmp_path / "shared-timeout.jsonl"
+    complete_journal = tmp_path / "shared-complete.jsonl"
+    _write_journal(timeout_journal, prefix)
+    _write_journal(complete_journal, [*prefix, _run_finished(1, "t6")])
+
+    timeout_grade = grade_timeout_trace_prefix(
+        timeout_journal,
+        expected_run_id="run-a",
+    )
+    complete_grade = grade_trace(
+        complete_journal,
+        expected_run_id="run-a",
+        expected_terminal_status="success",
+    )
+
+    assert timeout_grade.passed is True
+    assert timeout_grade.errors == []
+    assert complete_grade.passed is True
+    assert complete_grade.errors == []
+
+
+# 功能：验证 complete 缺 terminal 与 timeout 包含 terminal 都继续 fail closed
+# 设计：对同一零 step run分别遗漏和注入 run.finished，锁定两种 completion policy 的唯一差异
+def test_completion_policies_enforce_terminal_contract(tmp_path: Path) -> None:
+    prefix = _run_prefix()
+    complete_journal = tmp_path / "complete-missing-terminal.jsonl"
+    timeout_journal = tmp_path / "timeout-with-terminal.jsonl"
+    _write_journal(complete_journal, prefix)
+    _write_journal(timeout_journal, [*prefix, _run_finished(0, "t2")])
+
+    complete_grade = grade_trace(complete_journal, expected_run_id="run-a")
+    timeout_grade = grade_timeout_trace_prefix(
+        timeout_journal,
+        expected_run_id="run-a",
+    )
+
+    assert complete_grade.passed is False
+    assert "run terminal event is missing" in complete_grade.errors
+    assert timeout_grade.passed is False
+    assert "timeout prefix contains terminal run event" in timeout_grade.errors
+
+
+# 功能：验证 timeout subagent lifecycle 使用真实事件合同中的 run_id 作为 child identity
+# 设计：写入合法 parent_run_id与child run_id配对，防止 observer继续读取不存在的child_run_id字段
+def test_timeout_trace_uses_subagent_run_id_as_child_identity(tmp_path: Path) -> None:
+    journal = tmp_path / "subagent-prefix.jsonl"
+    events = [
+        *_run_prefix(),
+        {
+            "type": "subagent.started",
+            "run_id": "child-a",
+            "parent_run_id": "run-a",
+            "description": "trusted child",
+            "ts": "t2",
+        },
+        {
+            "type": "subagent.finished",
+            "run_id": "child-a",
+            "parent_run_id": "run-a",
+            "status": "success",
+            "ts": "t3",
+        },
+    ]
+    _write_journal(journal, events)
+
+    grade = grade_timeout_trace_prefix(journal, expected_run_id="run-a")
+
+    assert grade.passed is True
+    assert grade.errors == []
+
+
+# 功能：验证相同 tool_use_id 可在不同 step重新开始而不依赖 run-wide唯一性
+# 设计：两个 step各自完整拥有同一ID，锁定 observer只按(step,tool_use_id)解释 ownership
+def test_trace_allows_tool_id_reuse_across_steps(tmp_path: Path) -> None:
+    events = [*_run_prefix()]
+    for step in (1, 2):
+        events.extend(
+            (
+                _step_started(step, f"s{step}"),
+                _tool_started("reused-tool", f"start{step}"),
+                _tool_finished("reused-tool", f"finish{step}"),
+                _step_finished(step, f"done{step}"),
+            )
+        )
+    events.append(_run_finished(2, "terminal"))
+    journal = tmp_path / "reuse-across-steps.jsonl"
+    _write_journal(journal, events)
+
+    grade = grade_trace(journal, expected_run_id="run-a")
+
+    assert grade.passed is True
+    assert grade.errors == []
