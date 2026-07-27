@@ -12,6 +12,24 @@ from kama_claude.core.loop import AgentLoop
 from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.tools.registry import ToolRegistry
 
+_DEFAULT_BASE_PROMPT = (
+    "You are a helpful AI assistant. "
+    "Use the available tools to complete the user's goal. "
+    "When the goal is fully achieved, respond with a final answer "
+    "and do not call any more tools."
+)
+_REQUIREMENT_CONTRACT = (
+    "Before changing the workspace, create a concise requirement contract from every "
+    "explicit acceptance criterion. For each item, record the required observable "
+    "behavior, relevant failure or invalid-input behavior, any side-effect or state "
+    "invariant, and the evidence you plan to use for verification. Keep this checklist "
+    "visible in the conversation as you work, and update each item as implemented, "
+    "verified, or unchecked. Before finishing, review every item. Do not assume unchecked "
+    "items are complete: verify them when possible, otherwise clearly report the "
+    "limitation. Keep the contract brief and auditable; do not expose private "
+    "chain-of-thought or force any particular tool."
+)
+
 # --- stubs -------------------------------------------------------------------
 
 
@@ -26,7 +44,10 @@ class _MockProvider:
         self._responses = iter(responses)
         self._exc = exc
         self.seen_messages: list[list[dict[str, object]]] = []
+        self.seen_systems: list[str | None] = []
+        self.seen_tool_schemas: list[list[dict[str, object]]] = []
 
+    # 捕获每次模型调用收到的消息、系统提示和有序工具 schema
     async def chat(
         self,
         messages: list[dict[str, object]],
@@ -38,6 +59,8 @@ class _MockProvider:
         system: str | None = None,
     ) -> LlmResponse:
         self.seen_messages.append([dict(message) for message in messages])
+        self.seen_systems.append(system)
+        self.seen_tool_schemas.append([dict(schema) for schema in tool_schemas])
         if self._exc is not None:
             raise self._exc
         return next(self._responses)
@@ -309,3 +332,82 @@ async def test_assistant_message_blocks_added_to_context() -> None:
     blocks = assistant_msg["content"]
     assert blocks[0]["type"] == "text"  # type: ignore[index]
     assert blocks[0]["text"] == "answer"  # type: ignore[index]
+
+
+# 功能：验证每次默认模型调用精确包含一次冻结的 requirement-contract 指导
+# 设计：使用两步 scripted provider 捕获完整 system，锁定字节级 base 拼接与每次调用的一次注入
+async def test_default_prompt_contains_requirement_contract_once_per_call() -> None:
+    provider = _MockProvider(
+        [
+            LlmResponse(stop_reason="tool_use", tool_calls=[_tc()]),
+            LlmResponse(stop_reason="end_turn", text="done"),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(_EchoTool())
+    loop, _ = _make_loop(provider, registry)
+
+    await loop.run(_ctx())
+
+    expected = _DEFAULT_BASE_PROMPT + "\n\n" + _REQUIREMENT_CONTRACT
+    assert provider.seen_systems == [expected, expected]
+    assert all(
+        system is not None and system.count(_REQUIREMENT_CONTRACT) == 1
+        for system in provider.seen_systems
+    )
+
+
+# 功能：验证新增 contract 不改写消息、上下文顺序、工具顺序、步数、停止状态或事件序列
+# 设计：联合真实工具调用与三层 context，比较 provider 捕获值和完整 step/tool lifecycle
+async def test_requirement_contract_preserves_runtime_inputs_and_lifecycle() -> None:
+    provider = _MockProvider(
+        [
+            LlmResponse(stop_reason="tool_use", tool_calls=[_tc()]),
+            LlmResponse(stop_reason="end_turn", text="done"),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(_EchoTool())
+    registry.register(_FailTool())
+    expected_tools = registry.tool_schemas()
+    bus = EventBus()
+    events = await _events(bus)
+    loop, _ = _make_loop(provider, registry, bus)
+    ctx = ExecutionContext(
+        run_id="r1",
+        goal="Implement behavior A and preserve invariant B.",
+        max_steps=5,
+        global_context="global-marker",
+        project_context="project-marker",
+        session_notes="session-marker",
+    )
+
+    await loop.run(ctx)
+
+    assert provider.seen_messages[0] == [
+        {"role": "user", "content": "Implement behavior A and preserve invariant B."}
+    ]
+    assert provider.seen_tool_schemas == [expected_tools, expected_tools]
+    assert ctx.max_steps == 5
+    assert ctx.step == 2
+    assert ctx.status == "success"
+    assert ctx.result == "done"
+    systems = provider.seen_systems
+    assert all(system is not None for system in systems)
+    for system in systems:
+        assert system is not None
+        assert system.count(_REQUIREMENT_CONTRACT) == 1
+        assert system.index(_REQUIREMENT_CONTRACT) < system.index("## Global Context")
+        assert system.index("## Global Context") < system.index("## Project Context")
+        assert system.index("## Project Context") < system.index("## Session Notes")
+        assert "global-marker" in system
+        assert "project-marker" in system
+        assert "session-marker" in system
+    assert [event.type for event in events] == [  # type: ignore[attr-defined]
+        "step.started",
+        "tool.call_started",
+        "tool.call_finished",
+        "step.finished",
+        "step.started",
+        "step.finished",
+    ]

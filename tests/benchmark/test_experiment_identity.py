@@ -4,12 +4,37 @@ import hashlib
 import importlib
 import json
 import os
+import shutil
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 
-from kama_claude.core.config import get_config
+from kama_claude.core.bus.events import LlmModelSelectedEvent
+from kama_claude.core.config import KamaConfig, get_config
+from kama_claude.core.events.bus import EventBus
+from kama_claude.core.llm.types import LlmResponse
+from kama_claude.core.runner import AgentRunner
+from kama_claude.eval.worker import WorkerRequest, execute_request
+
+_PHASE9B_PROFILE = (
+    "kama-coding-mvp-v1-deepseek-v4-pro-requirement-contract-v1.json"
+)
+_PHASE9B_PROMPT_HASH = (
+    "b248587ef77d172cefb5e7b777a1523cf50978d6d273b466a8b6eb37349621eb"
+)
+_FROZEN_TOOL_SCHEMA_HASH = (
+    "8ea67642a27db476c048575e9a532c41a044e39f63f729260428cdce0fd35f9f"
+)
+_FROZEN_RUNTIME_CONFIG_HASH = (
+    "bd7d46cf2e3139369704dcc67ade71c58a9d9e2247d7912abae1c378a7b35a64"
+)
+_FROZEN_DEPENDENCY_HASH = (
+    "dfdbce9b7ec2a3164390e373d13a2f547280db34e96d58f66d20255f5f436793"
+)
+_OLD_PROFILE_BYTES_HASH = (
+    "1b35206b1d0ef4449a3773cc17025c3149d797b49e9d022c707f9c9ee9fa4aa7"
+)
 
 
 # 加载待实现的 experiment identity 模块，并把缺失模块转换为明确的 RED 失败
@@ -18,6 +43,29 @@ def _experiment_module() -> ModuleType:
         return importlib.import_module("kama_claude.benchmark.experiment")
     except ModuleNotFoundError:
         pytest.fail("benchmark experiment identity module is missing")
+
+
+class _Phase9BScriptedProvider:
+    # 通过真实 AgentRunner wiring 返回稳定 end_turn，且不读取 credential 或访问网络
+    async def chat(
+        self,
+        messages: list[dict[str, object]],
+        tool_schemas: list[dict[str, object]],
+        bus: EventBus,
+        run_id: str,
+        *,
+        step: int = 0,
+        system: str | None = None,
+    ) -> LlmResponse:
+        await bus.publish(
+            LlmModelSelectedEvent(
+                run_id=run_id,
+                model="deepseek-v4-pro",
+                strategy="static",
+                ts="2026-07-27T00:00:00+00:00",
+            )
+        )
+        return LlmResponse(stop_reason="end_turn", text="done")
 
 
 # 创建只含冻结 baseline 行为与公开 identity hash 的合法 experiment profile
@@ -825,6 +873,114 @@ def test_tracked_first_baseline_profile_matches_frozen_repository() -> None:
     assert identity.provider.model_id == "deepseek-v4-pro"
     assert identity.runtime.max_steps == 20
     assert identity.schedule.repeats == 3
+
+
+# 功能：验证 Phase 9B profile 仅改变 profile ID 和 prompt hash，旧 profile bytes 保持冻结
+# 设计：比较真实 JSON 树并对旧文件做独立 bytes SHA-256，避免字段遗漏或历史身份被原地改写
+def test_requirement_contract_profile_changes_only_prompt_identity() -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    experiments = repository_root / "benchmarks" / "experiments"
+    old_path = experiments / "kama-coding-mvp-v1-deepseek-v4-pro.json"
+    new_path = experiments / _PHASE9B_PROFILE
+    old_payload = json.loads(old_path.read_text(encoding="utf-8"))
+    new_payload = json.loads(new_path.read_text(encoding="utf-8"))
+
+    assert hashlib.sha256(old_path.read_bytes()).hexdigest() == _OLD_PROFILE_BYTES_HASH
+    assert new_payload["profile_id"] == (
+        "kama-coding-mvp-v1-deepseek-v4-pro-requirement-contract-v1"
+    )
+    assert new_payload["expected_identity"]["prompt_hash"] == _PHASE9B_PROMPT_HASH
+    normalized = dict(new_payload)
+    normalized["profile_id"] = old_payload["profile_id"]
+    normalized["expected_identity"] = dict(new_payload["expected_identity"])
+    normalized["expected_identity"]["prompt_hash"] = old_payload["expected_identity"][
+        "prompt_hash"
+    ]
+    assert normalized == old_payload
+
+
+# 功能：验证真实本地 trace 的 effective prompt identity 与 Phase 9B declaration 完整匹配
+# 设计：穿过 AgentRunner、AgentLoop、TracingProvider 和真实 journal，再由 observer fail-closed 比较
+@pytest.mark.asyncio
+async def test_requirement_contract_profile_matches_real_traced_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment = _experiment_module()
+    repository_root = Path(__file__).resolve().parents[2]
+    profile_path = repository_root / "benchmarks" / "experiments" / _PHASE9B_PROFILE
+    loaded = experiment.load_experiment_profile(profile_path)
+    declared = experiment.capture_declared_identity(
+        loaded,
+        repository_root=repository_root,
+        repository=experiment.RepositoryIdentity(commit="b" * 40, dirty=False),
+        installed_sdk_version="0.111.0",
+    )
+    config = KamaConfig()
+    config.agent.max_steps = loaded.profile.runtime.max_steps
+    config.llm.default_model = loaded.profile.provider.model_id
+    config.llm.router = loaded.profile.runtime.router
+    config.trace.enabled = loaded.profile.runtime.trace_enabled
+    config.trace.include_llm_payload = loaded.profile.runtime.include_llm_payload
+    config.compaction.auto_threshold = loaded.profile.runtime.compaction_threshold
+    config.compaction.tool_result_limit = loaded.profile.runtime.tool_result_limit
+    config.compaction.tool_result_keep = loaded.profile.runtime.tool_result_keep
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", loaded.profile.provider.endpoint)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    attempt_root = tmp_path / "attempt"
+    runtime_dir = attempt_root / "runtime"
+    workspace = attempt_root / "workspace"
+    runtime_dir.mkdir(parents=True)
+    workspace.mkdir()
+    runs_dir = attempt_root / "runs"
+    request = WorkerRequest(
+        task_id="phase9b-identity",
+        run_id="phase9b-run",
+        goal="Implement behavior A and preserve invariant B.",
+        workspace=str(workspace.resolve()),
+        runs_dir=str(runs_dir.resolve()),
+        trace_path=str((runtime_dir / "trace.jsonl").resolve()),
+    )
+    provider = _Phase9BScriptedProvider()
+
+    # 将 production worker 的构造 seam 绑定到无网络 provider，保留其余真实 wiring
+    def runner_factory(config: KamaConfig, **kwargs: object) -> AgentRunner:
+        return AgentRunner(config, provider=provider, **kwargs)  # type: ignore[arg-type]
+
+    result = await execute_request(
+        request,
+        runner_factory=runner_factory,
+        config_loader=lambda: config,
+    )
+    assert result.runtime_status == "success"
+    shutil.copyfile(
+        runs_dir / request.run_id / "events.v2.jsonl",
+        runtime_dir / "events.v2.jsonl",
+    )
+
+    observed = experiment.collect_observed_identity(attempt_root)
+    verification = experiment.verify_declared_observed(declared, observed)
+
+    assert verification.valid is True
+    assert verification.mismatches == []
+    assert observed.prompt_hash == _PHASE9B_PROMPT_HASH
+    assert observed.tool_schema_hash == _FROZEN_TOOL_SCHEMA_HASH
+    assert observed.runtime_config_hash == _FROZEN_RUNTIME_CONFIG_HASH
+    assert declared.runtime_config_hash == _FROZEN_RUNTIME_CONFIG_HASH
+    assert declared.dependency.dependency_hash == _FROZEN_DEPENDENCY_HASH
+    assert declared.suite.suite_hash == loaded.profile.suite.expected_suite_hash
+    assert len(declared.suite.task_hashes) == 9
+    assert len(declared.suite.grader_hashes) == 9
+    experiment.require_identity_match(declared, observed)
+
+    mismatched = declared.model_copy(update={"prompt_hash": "0" * 64})
+    with pytest.raises(
+        experiment.ExperimentIdentityMismatch,
+        match="prompt_hash",
+    ):
+        experiment.require_identity_match(mismatched, observed)
 
 
 # 功能：验证 artifact policy 拒绝 repository 内路径与已存在输出，只接受全新的外部目录

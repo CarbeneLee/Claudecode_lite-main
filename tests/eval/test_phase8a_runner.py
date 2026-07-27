@@ -9,12 +9,28 @@ import pytest
 from pydantic import ValidationError
 
 import kama_claude.eval.runner as eval_runner
+from kama_claude.core.bus.events import LlmModelSelectedEvent
 from kama_claude.core.config import KamaConfig
-from kama_claude.core.runner import RunOutcome
+from kama_claude.core.events.bus import EventBus
+from kama_claude.core.events.journal import EventJournalCoordinator
+from kama_claude.core.llm.types import LlmResponse
+from kama_claude.core.runner import AgentRunner, RunOutcome
 from kama_claude.eval.failure import FailureCategory
 from kama_claude.eval.runner import prepare_attempt, run_attempt
 from kama_claude.eval.task import load_task
 from kama_claude.eval.worker import WorkerRequest, execute_request
+
+_REQUIREMENT_CONTRACT = (
+    "Before changing the workspace, create a concise requirement contract from every "
+    "explicit acceptance criterion. For each item, record the required observable "
+    "behavior, relevant failure or invalid-input behavior, any side-effect or state "
+    "invariant, and the evidence you plan to use for verification. Keep this checklist "
+    "visible in the conversation as you work, and update each item as implemented, "
+    "verified, or unchecked. Before finishing, review every item. Do not assume unchecked "
+    "items are complete: verify them when possible, otherwise clearly report the "
+    "limitation. Keep the contract brief and auditable; do not expose private "
+    "chain-of-thought or force any particular tool."
+)
 
 
 # 创建只含公开输入与空 private criterion 的最小任务目录
@@ -137,6 +153,38 @@ class _FakeRunner:
         return RunOutcome(status="success", result="done", reason=None)
 
 
+class _CapturingEndTurnProvider:
+    # 初始化无网络 provider 的调用观测容器
+    def __init__(self) -> None:
+        self.systems: list[str | None] = []
+        self.messages: list[list[dict[str, object]]] = []
+        self.tool_schemas: list[list[dict[str, object]]] = []
+
+    # 捕获真实 AgentLoop wiring 并返回稳定 end_turn
+    async def chat(
+        self,
+        messages: list[dict[str, object]],
+        tool_schemas: list[dict[str, object]],
+        bus: EventBus,
+        run_id: str,
+        *,
+        step: int = 0,
+        system: str | None = None,
+    ) -> LlmResponse:
+        self.systems.append(system)
+        self.messages.append([dict(message) for message in messages])
+        self.tool_schemas.append([dict(schema) for schema in tool_schemas])
+        await bus.publish(
+            LlmModelSelectedEvent(
+                run_id=run_id,
+                model="deepseek-v4-pro",
+                strategy="static",
+                ts="2026-07-27T00:00:00+00:00",
+            )
+        )
+        return LlmResponse(stop_reason="end_turn", text="done")
+
+
 # 功能：验证 production worker wiring 只调用现有 KamaConfig 与 AgentRunner one-shot 接口
 # 设计：用构造 seam 替代真实网络 provider，检查初始化和调用形状而不新增序列化 provider 配置
 @pytest.mark.asyncio
@@ -207,6 +255,72 @@ async def test_worker_records_sanitized_runtime_identity(
         "include_llm_payload": True,
     }
     assert "must-not-appear-in-trace" not in json.dumps(records)
+
+
+# 功能：验证 benchmark worker 与 direct AgentRunner 共享同一默认 requirement-contract source
+# 设计：两条路径都穿过真实 AgentRunner/AgentLoop，只注入无网络 provider 并比较 system 与公开 goal
+@pytest.mark.asyncio
+async def test_worker_and_direct_runner_share_requirement_contract_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    config = KamaConfig()
+    config.agent.max_steps = 20
+    config.llm.default_model = "deepseek-v4-pro"
+    config.llm.router = "static"
+    config.trace.enabled = True
+    config.trace.include_llm_payload = True
+    config.compaction.auto_threshold = 0.0
+    worker_provider = _CapturingEndTurnProvider()
+
+    # 为 production worker seam 构造真实 AgentRunner，仅替换网络 provider
+    def runner_factory(config: KamaConfig, **kwargs: object) -> AgentRunner:
+        return AgentRunner(config, provider=worker_provider, **kwargs)  # type: ignore[arg-type]
+
+    worker_root = tmp_path / "worker"
+    worker_root.mkdir()
+    request = _request(worker_root)
+    result = await execute_request(
+        request,
+        runner_factory=runner_factory,
+        config_loader=lambda: config,
+    )
+
+    direct_workspace = tmp_path / "direct-workspace"
+    direct_workspace.mkdir()
+    direct_provider = _CapturingEndTurnProvider()
+    direct_bus = EventBus()
+    direct_journal = EventJournalCoordinator()
+    direct_bus.subscribe(direct_journal.handle)
+    direct_runner = AgentRunner(
+        config,
+        workspace_root=direct_workspace,
+        provider=direct_provider,
+        bus=direct_bus,
+        journal=direct_journal,
+        runs_dir=tmp_path / "direct-runs",
+    )
+    try:
+        direct_outcome = await direct_runner.run_and_capture(
+            "Create result.txt.",
+            run_id="direct-run",
+        )
+        await direct_journal.flush_all()
+    finally:
+        await direct_journal.close()
+
+    assert result.runtime_status == "success"
+    assert direct_outcome.status == "success"
+    assert worker_provider.systems == direct_provider.systems
+    assert worker_provider.systems[0] is not None
+    assert worker_provider.systems[0].count(_REQUIREMENT_CONTRACT) == 1
+    assert worker_provider.messages[0] == direct_provider.messages[0] == [
+        {"role": "user", "content": "Create result.txt."}
+    ]
+    assert worker_provider.tool_schemas == direct_provider.tool_schemas
 
 
 # 写入一个能按 worker CLI 协议返回成功结果的测试脚本
