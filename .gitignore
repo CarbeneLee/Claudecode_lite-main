@@ -16,9 +16,13 @@ build/
 .DS_Store
 *.log
 /workspace/
-/docs/
 /doc/learning/devlog/
 requirements.txt
 kamaclaude key prompt.md.codegraph/
 .codex
 gpt-5.5-base-instructions.md
+
+# Local-only planning, devlogs, and external review handoffs.
+/docs/learning/devlog/
+/*-git-diff-review*.md
+/*-git-diff-review*.patch

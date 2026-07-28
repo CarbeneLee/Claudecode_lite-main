@@ -1057,6 +1057,13 @@ async def test_default_benchmark_worker_inherits_state_transition_protocol(
     assert len(declared.suite.grader_hashes) == 9
     experiment.require_identity_match(declared, observed)
 
+    mismatched = declared.model_copy(update={"prompt_hash": "0" * 64})
+    with pytest.raises(
+        experiment.ExperimentIdentityMismatch,
+        match="prompt_hash",
+    ):
+        experiment.require_identity_match(mismatched, observed)
+
 
 # 功能：验证 artifact policy 拒绝 repository 内路径与已存在输出，只接受全新的外部目录
 # 设计：对三个 concrete path 调用同一 preflight，防止 baseline artifacts 污染 Git identity
