@@ -1,0 +1,1391 @@
+diff --git a/src/kama_claude/core/loop.py b/src/kama_claude/core/loop.py
+index 4ab13563efac0205db4b8d039799c9fafb4fb690..5408ec27dd198d1a304630897636c502c6e28ef7 100644
+--- a/src/kama_claude/core/loop.py
++++ b/src/kama_claude/core/loop.py
+@@ -81,7 +81,14 @@ class AgentLoop:
+                         "finishing, review every item. Do not assume unchecked items are "
+                         "complete: verify them when possible, otherwise clearly report "
+                         "the limitation. Keep the contract brief and auditable; do not "
+-                        "expose private chain-of-thought or force any particular tool."
++                        "expose private chain-of-thought or force any particular tool.\n\n"
++                        "When a task changes persistent or shared state through multiple "
++                        "operations, briefly map the pre-state, each mutation point, every "
++                        "later operation that can fail, and the required post-state after "
++                        "success or failure. Before finishing, exercise at least one failure "
++                        "after an earlier mutation succeeds, and verify that rollback or "
++                        "compensation preserves the stated invariant. Do not apply this "
++                        "protocol to tasks without multi-step side effects."
+                     ),
+                 )
+             except asyncio.CancelledError: # 异常策略处理
+diff --git a/tests/benchmark/test_experiment_identity.py b/tests/benchmark/test_experiment_identity.py
+index 3af664a4405674350c660b4d800e28830ac4b878..c606289d4d7870bf2e53b8ad975817d72004137a 100644
+--- a/tests/benchmark/test_experiment_identity.py
++++ b/tests/benchmark/test_experiment_identity.py
+@@ -20,9 +20,15 @@ from kama_claude.eval.worker import WorkerRequest, execute_request
+ _PHASE9B_PROFILE = (
+     "kama-coding-mvp-v1-deepseek-v4-pro-requirement-contract-v1.json"
+ )
++_PHASE9C_PROFILE = (
++    "kama-coding-mvp-v1-deepseek-v4-pro-requirement-contract-v2.json"
++)
+ _PHASE9B_PROMPT_HASH = (
+     "b248587ef77d172cefb5e7b777a1523cf50978d6d273b466a8b6eb37349621eb"
+ )
++_PHASE9C_PROMPT_HASH = (
++    "bc9d1a2fbcc3458efb5b153f4ff539050c96e28a9c76f3fcd8823588933eb6c0"
++)
+ _FROZEN_TOOL_SCHEMA_HASH = (
+     "8ea67642a27db476c048575e9a532c41a044e39f63f729260428cdce0fd35f9f"
+ )
+@@ -35,6 +41,34 @@ _FROZEN_DEPENDENCY_HASH = (
+ _OLD_PROFILE_BYTES_HASH = (
+     "1b35206b1d0ef4449a3773cc17025c3149d797b49e9d022c707f9c9ee9fa4aa7"
+ )
++_PHASE9B_PROFILE_BYTES_HASH = (
++    "9346d813af69ea1d3bc3d16a5f7e9b5cecc2f601f69e40aa1c138799ed2e1da0"
++)
++_DEFAULT_BASE_PROMPT = (
++    "You are a helpful AI assistant. "
++    "Use the available tools to complete the user's goal. "
++    "When the goal is fully achieved, respond with a final answer "
++    "and do not call any more tools."
++)
++_REQUIREMENT_CONTRACT = (
++    "Before changing the workspace, create a concise requirement contract from every "
++    "explicit acceptance criterion. For each item, record the required observable "
++    "behavior, relevant failure or invalid-input behavior, any side-effect or state "
++    "invariant, and the evidence you plan to use for verification. Keep this checklist "
++    "visible in the conversation as you work, and update each item as implemented, "
++    "verified, or unchecked. Before finishing, review every item. Do not assume unchecked "
++    "items are complete: verify them when possible, otherwise clearly report the "
++    "limitation. Keep the contract brief and auditable; do not expose private "
++    "chain-of-thought or force any particular tool."
++)
++_STATE_TRANSITION_PROTOCOL = (
++    "When a task changes persistent or shared state through multiple operations, briefly "
++    "map the pre-state, each mutation point, every later operation that can fail, and the "
++    "required post-state after success or failure. Before finishing, exercise at least "
++    "one failure after an earlier mutation succeeds, and verify that rollback or "
++    "compensation preserves the stated invariant. Do not apply this protocol to tasks "
++    "without multi-step side effects."
++)
+ 
+ 
+ # 加载待实现的 experiment identity 模块，并把缺失模块转换为明确的 RED 失败
+@@ -46,6 +80,10 @@ def _experiment_module() -> ModuleType:
+ 
+ 
+ class _Phase9BScriptedProvider:
++    # 初始化真实 worker 调用收到的 system prompt 观测列表
++    def __init__(self) -> None:
++        self.seen_systems: list[str | None] = []
++
+     # 通过真实 AgentRunner wiring 返回稳定 end_turn，且不读取 credential 或访问网络
+     async def chat(
+         self,
+@@ -57,6 +95,7 @@ class _Phase9BScriptedProvider:
+         step: int = 0,
+         system: str | None = None,
+     ) -> LlmResponse:
++        self.seen_systems.append(system)
+         await bus.publish(
+             LlmModelSelectedEvent(
+                 run_id=run_id,
+@@ -899,16 +938,50 @@ def test_requirement_contract_profile_changes_only_prompt_identity() -> None:
+     assert normalized == old_payload
+ 
+ 
+-# 功能：验证真实本地 trace 的 effective prompt identity 与 Phase 9B declaration 完整匹配
+-# 设计：穿过 AgentRunner、AgentLoop、TracingProvider 和真实 journal，再由 observer fail-closed 比较
++# 功能：验证 Phase 9C profile 只改变 profile ID 与 trace-derived prompt hash
++# 设计：先以明确 missing RED 锁定新文件，再归一化完整 JSON tree 并冻结历史 Phase 9B bytes
++def test_state_transition_profile_changes_only_prompt_identity() -> None:
++    repository_root = Path(__file__).resolve().parents[2]
++    experiments = repository_root / "benchmarks" / "experiments"
++    old_path = experiments / _PHASE9B_PROFILE
++    new_path = experiments / _PHASE9C_PROFILE
++
++    assert new_path.exists(), "v2 experiment profile is missing"
++
++    old_payload = json.loads(old_path.read_text(encoding="utf-8"))
++    new_payload = json.loads(new_path.read_text(encoding="utf-8"))
++    assert hashlib.sha256(old_path.read_bytes()).hexdigest() == _PHASE9B_PROFILE_BYTES_HASH
++    assert new_payload["profile_id"] == (
++        "kama-coding-mvp-v1-deepseek-v4-pro-requirement-contract-v2"
++    )
++    assert new_payload["expected_identity"]["prompt_hash"] == _PHASE9C_PROMPT_HASH
++    normalized = dict(new_payload)
++    normalized["profile_id"] = old_payload["profile_id"]
++    normalized["expected_identity"] = dict(new_payload["expected_identity"])
++    normalized["expected_identity"]["prompt_hash"] = old_payload["expected_identity"][
++        "prompt_hash"
++    ]
++    assert normalized == old_payload
++
++
++# 功能：验证 Phase 9B control prompt hash 仍由冻结 base 与 v1 字节唯一决定
++# 设计：不要求历史 profile 匹配未来 runtime，直接重建历史 control bytes 并核对冻结 hash
++def test_phase9b_control_prompt_hash_remains_frozen() -> None:
++    prompt = _DEFAULT_BASE_PROMPT + "\n\n" + _REQUIREMENT_CONTRACT
++
++    assert hashlib.sha256(prompt.encode("utf-8")).hexdigest() == _PHASE9B_PROMPT_HASH
++
++
++# 功能：验证真实 benchmark worker 的默认 prompt 继承 state-transition protocol
++# 设计：穿过 execute_request、AgentRunner、AgentLoop、TracingProvider 与 journal，仅用 scripted provider 捕获 system
+ @pytest.mark.asyncio
+-async def test_requirement_contract_profile_matches_real_traced_prompt(
++async def test_default_benchmark_worker_inherits_state_transition_protocol(
+     tmp_path: Path,
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+     experiment = _experiment_module()
+     repository_root = Path(__file__).resolve().parents[2]
+-    profile_path = repository_root / "benchmarks" / "experiments" / _PHASE9B_PROFILE
++    profile_path = repository_root / "benchmarks" / "experiments" / _PHASE9C_PROFILE
+     loaded = experiment.load_experiment_profile(profile_path)
+     declared = experiment.capture_declared_identity(
+         loaded,
+@@ -936,8 +1009,8 @@ async def test_requirement_contract_profile_matches_real_traced_prompt(
+     workspace.mkdir()
+     runs_dir = attempt_root / "runs"
+     request = WorkerRequest(
+-        task_id="phase9b-identity",
+-        run_id="phase9b-run",
++        task_id="phase9c-identity",
++        run_id="phase9c-run",
+         goal="Implement behavior A and preserve invariant B.",
+         workspace=str(workspace.resolve()),
+         runs_dir=str(runs_dir.resolve()),
+@@ -963,9 +1036,18 @@ async def test_requirement_contract_profile_matches_real_traced_prompt(
+     observed = experiment.collect_observed_identity(attempt_root)
+     verification = experiment.verify_declared_observed(declared, observed)
+ 
++    assert len(provider.seen_systems) == 1
++    system = provider.seen_systems[0]
++    assert system is not None
++    assert system.count(_REQUIREMENT_CONTRACT) == 1
++    assert system.count(_STATE_TRANSITION_PROTOCOL) == 1
++    assert system.index(_REQUIREMENT_CONTRACT) < system.index(_STATE_TRANSITION_PROTOCOL)
+     assert verification.valid is True
+     assert verification.mismatches == []
+-    assert observed.prompt_hash == _PHASE9B_PROMPT_HASH
++    assert observed.api_call_count == 1
++    assert observed.model_event_ids == ["deepseek-v4-pro"]
++    assert declared.prompt_hash == _PHASE9C_PROMPT_HASH
++    assert observed.prompt_hash == _PHASE9C_PROMPT_HASH
+     assert observed.tool_schema_hash == _FROZEN_TOOL_SCHEMA_HASH
+     assert observed.runtime_config_hash == _FROZEN_RUNTIME_CONFIG_HASH
+     assert declared.runtime_config_hash == _FROZEN_RUNTIME_CONFIG_HASH
+@@ -975,13 +1057,6 @@ async def test_requirement_contract_profile_matches_real_traced_prompt(
+     assert len(declared.suite.grader_hashes) == 9
+     experiment.require_identity_match(declared, observed)
+ 
+-    mismatched = declared.model_copy(update={"prompt_hash": "0" * 64})
+-    with pytest.raises(
+-        experiment.ExperimentIdentityMismatch,
+-        match="prompt_hash",
+-    ):
+-        experiment.require_identity_match(mismatched, observed)
+-
+ 
+ # 功能：验证 artifact policy 拒绝 repository 内路径与已存在输出，只接受全新的外部目录
+ # 设计：对三个 concrete path 调用同一 preflight，防止 baseline artifacts 污染 Git identity
+diff --git a/tests/unit/test_context_system_prompt.py b/tests/unit/test_context_system_prompt.py
+index fba59708e31a88e2816048ca9377d7421f35b5d1..efd5a74dfb7cc18b93ab9ec81ac730c94777daeb 100644
+--- a/tests/unit/test_context_system_prompt.py
++++ b/tests/unit/test_context_system_prompt.py
+@@ -2,7 +2,28 @@ from __future__ import annotations
+ 
+ from kama_claude.core.context import ExecutionContext
+ 
++_REQUIREMENT_CONTRACT = (
++    "Before changing the workspace, create a concise requirement contract from every "
++    "explicit acceptance criterion. For each item, record the required observable "
++    "behavior, relevant failure or invalid-input behavior, any side-effect or state "
++    "invariant, and the evidence you plan to use for verification. Keep this checklist "
++    "visible in the conversation as you work, and update each item as implemented, "
++    "verified, or unchecked. Before finishing, review every item. Do not assume unchecked "
++    "items are complete: verify them when possible, otherwise clearly report the "
++    "limitation. Keep the contract brief and auditable; do not expose private "
++    "chain-of-thought or force any particular tool."
++)
++_STATE_TRANSITION_PROTOCOL = (
++    "When a task changes persistent or shared state through multiple operations, briefly "
++    "map the pre-state, each mutation point, every later operation that can fail, and the "
++    "required post-state after success or failure. Before finishing, exercise at least "
++    "one failure after an earlier mutation succeeds, and verify that rollback or "
++    "compensation preserves the stated invariant. Do not apply this protocol to tasks "
++    "without multi-step side effects."
++)
+ 
++
++# 构造最小 ExecutionContext 并允许测试覆盖任意字段
+ def _make_ctx(**kwargs) -> ExecutionContext:
+     defaults = dict(run_id="r1", goal="test goal", max_steps=5)
+     defaults.update(kwargs)
+@@ -50,3 +71,41 @@ def test_session_notes_hint() -> None:
+     ctx = _make_ctx(session_notes="some note")
+     prompt = ctx.system_prompt("BASE")
+     assert "note_save" in prompt
++
++
++# 功能：验证完整 default base 之后仍按 Global、Project、Session 顺序追加 context
++# 设计：把 v1/v2 作为一个不可分 base 传入真实 system_prompt，逐段定位以排除 context 层重排
++def test_v1_v2_default_base_precedes_all_context_layers() -> None:
++    base = "BASE\n\n" + _REQUIREMENT_CONTRACT + "\n\n" + _STATE_TRANSITION_PROTOCOL
++    ctx = _make_ctx(
++        global_context="global",
++        project_context="project",
++        session_notes="session",
++    )
++
++    prompt = ctx.system_prompt(base)
++
++    assert prompt.startswith(base)
++    assert prompt.index(_STATE_TRANSITION_PROTOCOL) < prompt.index("## Global Context")
++    assert prompt.index("## Global Context") < prompt.index("## Project Context")
++    assert prompt.index("## Project Context") < prompt.index("## Session Notes")
++
++
++# 功能：验证显式 override 完全替换包含 v1/v2 的 default base
++# 设计：向真实 ExecutionContext 同时传 full base 和 override，排除默认协议泄露到 slash skill/profile 路径
++def test_override_excludes_v1_and_v2_but_keeps_context_order() -> None:
++    base = "BASE\n\n" + _REQUIREMENT_CONTRACT + "\n\n" + _STATE_TRANSITION_PROTOCOL
++    ctx = _make_ctx(
++        system_prompt_override="OVERRIDE",
++        global_context="global",
++        project_context="project",
++        session_notes="session",
++    )
++
++    prompt = ctx.system_prompt(base)
++
++    assert prompt.startswith("OVERRIDE\n\n## Global Context")
++    assert _REQUIREMENT_CONTRACT not in prompt
++    assert _STATE_TRANSITION_PROTOCOL not in prompt
++    assert prompt.index("## Global Context") < prompt.index("## Project Context")
++    assert prompt.index("## Project Context") < prompt.index("## Session Notes")
+diff --git a/tests/unit/test_loop.py b/tests/unit/test_loop.py
+index ddb7b25d41c31715501805d5076d8b3911cb0c69..8f425b99022ba12b151f8328d50ca14b009382d1 100644
+--- a/tests/unit/test_loop.py
++++ b/tests/unit/test_loop.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import hashlib
+ 
+ import pytest
+ from pydantic import BaseModel
+@@ -29,6 +30,23 @@ _REQUIREMENT_CONTRACT = (
+     "limitation. Keep the contract brief and auditable; do not expose private "
+     "chain-of-thought or force any particular tool."
+ )
++_STATE_TRANSITION_PROTOCOL = (
++    "When a task changes persistent or shared state through multiple operations, briefly "
++    "map the pre-state, each mutation point, every later operation that can fail, and the "
++    "required post-state after success or failure. Before finishing, exercise at least "
++    "one failure after an earlier mutation succeeds, and verify that rollback or "
++    "compensation preserves the stated invariant. Do not apply this protocol to tasks "
++    "without multi-step side effects."
++)
++_PHASE9B_PROMPT_HASH = (
++    "b248587ef77d172cefb5e7b777a1523cf50978d6d273b466a8b6eb37349621eb"
++)
++_REQUIREMENT_CONTRACT_HASH = (
++    "90fc45897aa8323175ceb0e5be6af3561ae44b2d0ca9bcb64244411d65561812"
++)
++_STATE_TRANSITION_PROTOCOL_HASH = (
++    "310b308df8cad96fc20ff63b7f50f799ed717a16a65f67db392ca4f6eb7762a3"
++)
+ 
+ # --- stubs -------------------------------------------------------------------
+ 
+@@ -334,9 +352,34 @@ async def test_assistant_message_blocks_added_to_context() -> None:
+     assert blocks[0]["text"] == "answer"  # type: ignore[index]
+ 
+ 
+-# 功能：验证每次默认模型调用精确包含一次冻结的 requirement-contract 指导
+-# 设计：使用两步 scripted provider 捕获完整 system，锁定字节级 base 拼接与每次调用的一次注入
+-async def test_default_prompt_contains_requirement_contract_once_per_call() -> None:
++# 功能：验证 Phase 9B 的 base 与 v1 字节身份在追加 v2 前保持冻结
++# 设计：直接对冻结文本做词数、字节数和 SHA-256 检查，避免未来 prompt 变化改写历史 control
++def test_phase9b_prompt_identity_remains_frozen() -> None:
++    prompt = _DEFAULT_BASE_PROMPT + "\n\n" + _REQUIREMENT_CONTRACT
++
++    assert len(_REQUIREMENT_CONTRACT.split()) == 97
++    assert len(_REQUIREMENT_CONTRACT.encode("utf-8")) == 676
++    assert (
++        hashlib.sha256(_REQUIREMENT_CONTRACT.encode("utf-8")).hexdigest()
++        == _REQUIREMENT_CONTRACT_HASH
++    )
++    assert hashlib.sha256(prompt.encode("utf-8")).hexdigest() == _PHASE9B_PROMPT_HASH
++
++
++# 功能：验证冻结的 state-transition protocol 文本满足精确 addition 身份
++# 设计：同时锁定词数、UTF-8 字节数和完整 SHA-256，防止摘要中的截断 hash 或同义改写进入实现
++def test_state_transition_protocol_addition_identity_is_frozen() -> None:
++    assert len(_STATE_TRANSITION_PROTOCOL.split()) == 65
++    assert len(_STATE_TRANSITION_PROTOCOL.encode("utf-8")) == 440
++    assert (
++        hashlib.sha256(_STATE_TRANSITION_PROTOCOL.encode("utf-8")).hexdigest()
++        == _STATE_TRANSITION_PROTOCOL_HASH
++    )
++
++
++# 功能：验证每次默认模型调用精确包含一次冻结的 v1 与 v2 指导
++# 设计：使用两步 scripted provider 捕获完整 system，锁定 base、双换行、v1、双换行、v2 的字节级组合
++async def test_default_prompt_contains_v1_and_v2_once_per_call() -> None:
+     provider = _MockProvider(
+         [
+             LlmResponse(stop_reason="tool_use", tool_calls=[_tc()]),
+@@ -349,12 +392,21 @@ async def test_default_prompt_contains_requirement_contract_once_per_call() -> N
+ 
+     await loop.run(_ctx())
+ 
+-    expected = _DEFAULT_BASE_PROMPT + "\n\n" + _REQUIREMENT_CONTRACT
+-    assert provider.seen_systems == [expected, expected]
+-    assert all(
+-        system is not None and system.count(_REQUIREMENT_CONTRACT) == 1
+-        for system in provider.seen_systems
++    expected = (
++        _DEFAULT_BASE_PROMPT
++        + "\n\n"
++        + _REQUIREMENT_CONTRACT
++        + "\n\n"
++        + _STATE_TRANSITION_PROTOCOL
+     )
++    for system in provider.seen_systems:
++        assert system is not None
++        assert system.count(_REQUIREMENT_CONTRACT) == 1
++        assert system.count(_STATE_TRANSITION_PROTOCOL) == 1
++        assert system.index(_REQUIREMENT_CONTRACT) < system.index(
++            _STATE_TRANSITION_PROTOCOL
++        )
++    assert provider.seen_systems == [expected, expected]
+ 
+ 
+ # 功能：验证新增 contract 不改写消息、上下文顺序、工具顺序、步数、停止状态或事件序列
+@@ -397,7 +449,9 @@ async def test_requirement_contract_preserves_runtime_inputs_and_lifecycle() ->
+     for system in systems:
+         assert system is not None
+         assert system.count(_REQUIREMENT_CONTRACT) == 1
+-        assert system.index(_REQUIREMENT_CONTRACT) < system.index("## Global Context")
++        assert system.count(_STATE_TRANSITION_PROTOCOL) == 1
++        assert system.index(_REQUIREMENT_CONTRACT) < system.index(_STATE_TRANSITION_PROTOCOL)
++        assert system.index(_STATE_TRANSITION_PROTOCOL) < system.index("## Global Context")
+         assert system.index("## Global Context") < system.index("## Project Context")
+         assert system.index("## Project Context") < system.index("## Session Notes")
+         assert "global-marker" in system
+@@ -411,3 +465,33 @@ async def test_requirement_contract_preserves_runtime_inputs_and_lifecycle() ->
+         "step.started",
+         "step.finished",
+     ]
++
++
++# 功能：验证 stateful 与 non-stateful goal 使用相同 prompt、工具和 loop 生命周期
++# 设计：用同一 scripted provider 分别执行两类 goal，比较除 user goal 外的全部 runtime 观测值
++async def test_stateful_and_non_stateful_goals_share_runtime_control_flow() -> None:
++    observations: list[tuple[str | None, list[dict[str, object]], list[str], str]] = []
++    for goal in (
++        "Explain how the parser handles quoted input.",
++        "Import several orders atomically and roll back on failure.",
++    ):
++        provider = _MockProvider([LlmResponse(stop_reason="end_turn", text="done")])
++        registry = ToolRegistry()
++        registry.register(_EchoTool())
++        bus = EventBus()
++        events = await _events(bus)
++        loop, _ = _make_loop(provider, registry, bus)
++        ctx = ExecutionContext(run_id="r1", goal=goal, max_steps=5)
++
++        await loop.run(ctx)
++
++        observations.append(
++            (
++                provider.seen_systems[0],
++                provider.seen_tool_schemas[0],
++                [event.type for event in events],  # type: ignore[attr-defined]
++                ctx.status,
++            )
++        )
++
++    assert observations[0] == observations[1]
+diff --git a/tests/unit/test_session_manager.py b/tests/unit/test_session_manager.py
+index cafd1d76753609235c4f3108d982070288a72a79..a6cb48b458fcbdd6530f7546020ed9cdb21f8b8a 100644
+--- a/tests/unit/test_session_manager.py
++++ b/tests/unit/test_session_manager.py
+@@ -12,8 +12,33 @@ from kama_claude.core.session.manager import SESSION_CLOSED, SESSION_NOT_FOUND,
+ from kama_claude.core.session.model import Session
+ from kama_claude.core.session.store import SessionStore
+ 
++_REQUIREMENT_CONTRACT = (
++    "Before changing the workspace, create a concise requirement contract from every "
++    "explicit acceptance criterion. For each item, record the required observable "
++    "behavior, relevant failure or invalid-input behavior, any side-effect or state "
++    "invariant, and the evidence you plan to use for verification. Keep this checklist "
++    "visible in the conversation as you work, and update each item as implemented, "
++    "verified, or unchecked. Before finishing, review every item. Do not assume unchecked "
++    "items are complete: verify them when possible, otherwise clearly report the "
++    "limitation. Keep the contract brief and auditable; do not expose private "
++    "chain-of-thought or force any particular tool."
++)
++_STATE_TRANSITION_PROTOCOL = (
++    "When a task changes persistent or shared state through multiple operations, briefly "
++    "map the pre-state, each mutation point, every later operation that can fail, and the "
++    "required post-state after success or failure. Before finishing, exercise at least "
++    "one failure after an earlier mutation succeeds, and verify that rollback or "
++    "compensation preserves the stated invariant. Do not apply this protocol to tasks "
++    "without multi-step side effects."
++)
++
+ 
+ class _Runner:
++    # 初始化 prompt override 与 goal 观测记录
++    def __init__(self) -> None:
++        self.seen_goals: list[str] = []
++        self.seen_system_prompt_overrides: list[str | None] = []
++
+     # 模拟 AgentRunner，将 run 新消息写入 thread 后返回成功
+     async def run_and_capture(
+         self,
+@@ -28,6 +53,8 @@ class _Runner:
+         assert run_id is not None
+         assert session is not None
+         assert store is not None
++        self.seen_goals.append(goal)
++        self.seen_system_prompt_overrides.append(system_prompt_override)
+         store.append_messages(
+             session.id,
+             [{"role": "assistant", "content": [{"type": "text", "text": f"done {goal}"}]}],
+@@ -144,6 +171,34 @@ async def test_run_stream_registers_before_skill_invoked_event(tmp_path: Path) -
+     )
+ 
+ 
++# 功能：验证 slash skill 传入的 system prompt override 不包含 default v1/v2
++# 设计：让 SessionManager 解析真实项目 skill，并由 recording runner 检查 override 的完整字节
++async def test_slash_skill_override_excludes_default_v1_and_v2(tmp_path: Path) -> None:
++    workspace = tmp_path / "workspace"
++    skill_dir = workspace / ".kama" / "skills"
++    skill_dir.mkdir(parents=True)
++    (skill_dir / "custom.md").write_text(
++        "---\nname: custom\ndescription: custom\n---\nCustom override $ARGUMENTS\n",
++        encoding="utf-8",
++    )
++    runner = _Runner()
++    manager = SessionManager(
++        SessionStore(tmp_path / "sessions"),
++        lambda _workspace_root: runner,  # type: ignore[arg-type]
++        EventBus(),
++    )
++    session = await manager.create("chat", workspace_root=workspace.resolve())
++
++    await manager.send_message(session.id, "/custom alpha")
++
++    assert runner.seen_goals == ["Custom override alpha"]
++    assert runner.seen_system_prompt_overrides == ["Custom override $ARGUMENTS"]
++    override = runner.seen_system_prompt_overrides[0]
++    assert override is not None
++    assert _REQUIREMENT_CONTRACT not in override
++    assert _STATE_TRANSITION_PROTOCOL not in override
++
++
+ # 功能：验证 chat session 处理一条消息后进入 waiting_for_input，并保留 user/assistant thread
+ # 设计：mock runner 主动追加 assistant 消息，确认 send_message 负责 user 消息、状态流转和 run_id 记录
+ async def test_send_message_chat_enters_waiting_and_writes_thread(tmp_path: Path) -> None:
+diff --git a/tests/unit/test_spawn_agent_tool.py b/tests/unit/test_spawn_agent_tool.py
+index f2618f4036fe341ff73383dc8d00086f61e677f8..1c51666a1c635bd5ab743da773d863d4dd24974a 100644
+--- a/tests/unit/test_spawn_agent_tool.py
++++ b/tests/unit/test_spawn_agent_tool.py
+@@ -42,6 +42,14 @@ _REQUIREMENT_CONTRACT = (
+     "limitation. Keep the contract brief and auditable; do not expose private "
+     "chain-of-thought or force any particular tool."
+ )
++_STATE_TRANSITION_PROTOCOL = (
++    "When a task changes persistent or shared state through multiple operations, briefly "
++    "map the pre-state, each mutation point, every later operation that can fail, and the "
++    "required post-state after success or failure. Before finishing, exercise at least "
++    "one failure after an earlier mutation succeeds, and verify that rollback or "
++    "compensation preserves the stated invariant. Do not apply this protocol to tasks "
++    "without multi-step side effects."
++)
+ 
+ 
+ def _make_provider(result_text: str = "child done") -> Any:
+@@ -304,11 +312,13 @@ async def test_subagents_isolate_profile_and_context_by_workspace(tmp_path: Path
+     assert "context-a" not in systems[1]
+     assert _REQUIREMENT_CONTRACT not in systems[0]
+     assert _REQUIREMENT_CONTRACT not in systems[1]
++    assert _STATE_TRANSITION_PROTOCOL not in systems[0]
++    assert _STATE_TRANSITION_PROTOCOL not in systems[1]
+ 
+ 
+-# 功能：验证未指定 profile 的 subagent 继承默认 requirement-contract prompt
++# 功能：验证未指定 profile 的 subagent 继承默认 v1 与 v2 prompt
+ # 设计：执行真实前台 child loop 并捕获 provider system，区别于 profile override 的完全替换路径
+-async def test_unprofiled_subagent_inherits_requirement_contract(tmp_path: Path) -> None:
++async def test_unprofiled_subagent_inherits_v1_and_v2(tmp_path: Path) -> None:
+     provider = _make_provider()
+     tool, _, _ = _make_tool(tmp_path, provider)
+ 
+@@ -323,6 +333,8 @@ async def test_unprofiled_subagent_inherits_requirement_contract(tmp_path: Path)
+     system = provider.chat.await_args.kwargs["system"]
+     assert isinstance(system, str)
+     assert system.count(_REQUIREMENT_CONTRACT) == 1
++    assert system.count(_STATE_TRANSITION_PROTOCOL) == 1
++    assert system.index(_REQUIREMENT_CONTRACT) < system.index(_STATE_TRANSITION_PROTOCOL)
+ 
+ 
+ # 功能：验证 subagent 模块不保留绑定项目目录的全局 profile loader
+diff --git a/benchmarks/experiments/kama-coding-mvp-v1-deepseek-v4-pro-requirement-contract-v2.json b/benchmarks/experiments/kama-coding-mvp-v1-deepseek-v4-pro-requirement-contract-v2.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..1c9dc10d6751ccf8491ce72f7d89ac1b41408f4a
+--- /dev/null
++++ b/benchmarks/experiments/kama-coding-mvp-v1-deepseek-v4-pro-requirement-contract-v2.json
+@@ -0,0 +1,44 @@
++{
++  "schema_version": 1,
++  "profile_id": "kama-coding-mvp-v1-deepseek-v4-pro-requirement-contract-v2",
++  "suite": {
++    "manifest": "../suites/kama-coding-mvp-v1.json",
++    "freeze_manifest": "../suites/kama-coding-mvp-v1.freeze.json",
++    "tasks_root": "../tasks",
++    "expected_suite_hash": "6e1b554df12962fc454a5b61c6e6145bd022041ec77b24149d73bd616e6044d7"
++  },
++  "provider": {
++    "service_provider": "deepseek",
++    "wire_protocol": "anthropic_messages",
++    "endpoint_id": "deepseek-anthropic-compatible",
++    "endpoint": "https://api.deepseek.com/anthropic",
++    "model_id": "deepseek-v4-pro",
++    "sdk_distribution": "anthropic",
++    "sdk_version": "0.111.0",
++    "credential_env": "ANTHROPIC_API_KEY"
++  },
++  "runtime": {
++    "max_steps": 20,
++    "router": "static",
++    "compaction_threshold": 0.0,
++    "tool_result_limit": 8000,
++    "tool_result_keep": 4000,
++    "mcp_enabled": false,
++    "trace_enabled": true,
++    "include_llm_payload": true
++  },
++  "schedule": {
++    "repeats": 3,
++    "execution_order": "suite_task_then_repeat_ascending"
++  },
++  "artifacts": {
++    "output_root_must_be_new": true,
++    "output_root_must_be_outside_repository": true,
++    "retain_all_attempts": true,
++    "raw_trace_visibility": "private"
++  },
++  "expected_identity": {
++    "prompt_hash": "bc9d1a2fbcc3458efb5b153f4ff539050c96e28a9c76f3fcd8823588933eb6c0",
++    "tool_schema_hash": "8ea67642a27db476c048575e9a532c41a044e39f63f729260428cdce0fd35f9f"
++  }
++}
+diff --git a/docs/learning/devlog/phase9c-state-transition-protocol-implementation.md b/docs/learning/devlog/phase9c-state-transition-protocol-implementation.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..541d284986aed361c65d1f34429986bf6c840db7
+--- /dev/null
++++ b/docs/learning/devlog/phase9c-state-transition-protocol-implementation.md
+@@ -0,0 +1,527 @@
++# Phase 9C-B State-Transition Protocol Implementation
++
++## 0. Metadata
++
++- Phase：`Phase 9C-B`
++- Date：`2026-07-28`
++- Direct control commit：`966cfa4072c63fd8abc05870a57f0dd8f6a1ab8a`
++- Branch：`codex/evaluation-harness`
++- Direct control profile：`kama-coding-mvp-v1-deepseek-v4-pro-requirement-contract-v1`
++- Treatment profile：`kama-coding-mvp-v1-deepseek-v4-pro-requirement-contract-v2`
++- Scope：严格单变量追加 generic state-transition/failure-injection protocol，冻结本地实验身份与预注册。
++- Out of scope：真实模型/API、benchmark、holdout、任务/grader/suite、Evaluation/Benchmark runtime、timeout 或 Agent lifecycle 修改。
++- External report：等待 External Diff Review。
++
++## 1. Problem and direct control
++
++Phase 9B 的 requirement-contract protocol 提升了总体表现，但 inventory lifecycle 仍为 0/3。失败集中在多操作状态变更中：Agent 可能验证 happy path，却没有明确枚举早期 mutation、后续 failure point 和失败后的 invariant。
++
++Direct control 必须是 Phase 9B，而不是其他 baseline：
++
++| Metric | Phase 9B |
++| --- | ---: |
++| Overall | 20/27 |
++| Bug fixing | 9/9 |
++| Feature implementation | 5/9 |
++| Test generation | 6/9 |
++| Inventory lifecycle | 0/3 |
++| Atomic + inventory | 2/6 |
++| Timeout | 3/27 |
++| Complete median latency | 80056.252 ms |
++| Complete median input + output tokens | 10887.5 |
++| Total wall | 2413.770 s |
++| Runtime/infra/trace/grader failures | 0 |
++| Status | VALID |
++
++Phase 9C-B only changes the default prompt. No runtime branch decides whether a task is stateful。
++
++## 2. Why it matters to an Agent
++
++The protocol adds an auditable planning checkpoint to the existing plan → act → observe loop：
++
++```text
++goal
++  → identify persistent/shared pre-state
++  → enumerate ordered mutations
++  → identify later failure points
++  → state success/failure post-state
++  → execute
++  → inject one failure after an earlier mutation
++  → verify rollback/compensation invariant
++```
++
++This is guidance, not a runtime gate. `AgentLoop` does not parse the goal、store a checklist、force a tool or alter stopping。
++
++## 3. Architecture and module boundaries
++
++| Module | Role | Must not own |
++| --- | --- | --- |
++| `src/kama_claude/core/loop.py` | Unique default prompt source; exact v2 append | Task classification、protocol state、new events |
++| `ExecutionContext.system_prompt()` | Existing base/override and context-layer composition | v2 text ownership |
++| `AgentRunner` | Existing runtime assembly | Experiment-specific prompt behavior |
++| `TracingProvider` | Existing local observation of actual API-call identity | Applying profile behavior |
++| Benchmark identity observer | Hash actual trace system bytes and ordered tools | Prompt mutation |
++| Experiment profile | Declare expected identity | Carry raw prompt text or override runtime |
++
++Data flow：
++
++```text
++AgentLoop frozen default bytes
++  → ExecutionContext chooses default or override
++  → Global Context
++  → Project Context
++  → Session Notes
++  → TracingProvider records actual system bytes privately
++  → observer hashes UTF-8 bytes
++  → declared/observed identity comparison
++```
++
++## 4. Exact prompt identities
++
++### 4.1 Existing v1 — unchanged
++
++```text
++Before changing the workspace, create a concise requirement contract from every explicit acceptance criterion. For each item, record the required observable behavior, relevant failure or invalid-input behavior, any side-effect or state invariant, and the evidence you plan to use for verification. Keep this checklist visible in the conversation as you work, and update each item as implemented, verified, or unchecked. Before finishing, review every item. Do not assume unchecked items are complete: verify them when possible, otherwise clearly report the limitation. Keep the contract brief and auditable; do not expose private chain-of-thought or force any particular tool.
++```
++
++| Property | Value |
++| --- | --- |
++| Words | 97 |
++| UTF-8 bytes | 676 |
++| v1-only SHA-256 | `90fc45897aa8323175ceb0e5be6af3561ae44b2d0ca9bcb64244411d65561812` |
++| Phase 9B full prompt SHA-256 | `b248587ef77d172cefb5e7b777a1523cf50978d6d273b466a8b6eb37349621eb` |
++
++### 4.2 New v2 addition
++
++```text
++When a task changes persistent or shared state through multiple operations, briefly map the pre-state, each mutation point, every later operation that can fail, and the required post-state after success or failure. Before finishing, exercise at least one failure after an earlier mutation succeeds, and verify that rollback or compensation preserves the stated invariant. Do not apply this protocol to tasks without multi-step side effects.
++```
++
++| Property | Value |
++| --- | --- |
++| Words | 65 |
++| UTF-8 bytes | 440 |
++| Addition SHA-256 | `310b308df8cad96fc20ff63b7f50f799ed717a16a65f67db392ca4f6eb7762a3` |
++| Trace-derived full prompt SHA-256 | `bc9d1a2fbcc3458efb5b153f4ff539050c96e28a9c76f3fcd8823588933eb6c0` |
++
++The addition hash includes the complete `...f67db392...` segment. The full prompt hash was not hand-composed；it came from a real local traced worker path。
++
++### 4.3 Composition invariant
++
++```text
++unchanged base
++  + "\n\n"
++  + exact v1
++  + "\n\n"
++  + exact v2
++```
++
++v1 and v2 each occur once；v1 precedes v2。
++
++## 5. Prompt composition matrix
++
++| Run path | Default/override | v1 | v2 | Context layers |
++| --- | --- | ---: | ---: | --- |
++| Normal root | default | once | once | appended if present |
++| Normal session | default | once | once | Global → Project → Session |
++| Benchmark worker | default | once | once | existing behavior |
++| Unprofiled subagent | default | once | once | existing behavior |
++| Slash skill | override | absent | absent | still appended after override |
++| Profiled subagent | override | absent | absent | still appended after override |
++| Compactor summarizer | independent prompt | unchanged | unchanged | independent path |
++| Provider fallback | independent fallback | unchanged | unchanged | not used when AgentLoop supplies system |
++
++## 6. Minimal implementation decision
++
++### Invariant
++
++The only production behavior change is the exact prompt append。
++
++### Implementation
++
++`src/kama_claude/core/loop.py` changed one existing string expression：
++
++- add `"\n\n"` after v1；
++- append the frozen 65 words using adjacent Python string literals。
++
++No function、constant owner、branch、classifier、state、event or tool was added。
++
++### Why
++
++The default prompt already has a single authoritative owner. A helper module would create a second source or an unrelated refactor；a benchmark/profile override would violate the external-observer boundary。
++
++## 7. Changed files
++
++Tracked implementation scope：
++
++- `src/kama_claude/core/loop.py`
++- `tests/unit/test_loop.py`
++- `tests/unit/test_context_system_prompt.py`
++- `tests/unit/test_spawn_agent_tool.py`
++- `tests/unit/test_session_manager.py`
++- `tests/benchmark/test_experiment_identity.py`
++- `benchmarks/experiments/kama-coding-mvp-v1-deepseek-v4-pro-requirement-contract-v2.json`
++
++Ignored learning evidence：
++
++- `docs/learning/devlog/phase9c-state-transition-protocol-plan.md`
++- `docs/learning/devlog/phase9c-state-transition-protocol-preregistration.md`
++- `docs/learning/devlog/phase9c-state-transition-protocol-implementation.md`
++
++No historical profile or artifact was modified。
++
++## 8. RED evidence
++
++### 8.1 RED-A — default prompt inheritance
++
++Pre-RED baseline：
++
++```text
++Command:
++uv run pytest tests/unit/test_loop.py tests/unit/test_context_system_prompt.py tests/unit/test_spawn_agent_tool.py tests/unit/test_session_manager.py tests/benchmark/test_experiment_identity.py -q
++
++Observed:
++79 passed
++```
++
++After tests and before production：
++
++```text
++Command:
++uv run pytest tests/unit/test_loop.py tests/unit/test_context_system_prompt.py tests/unit/test_spawn_agent_tool.py tests/unit/test_session_manager.py tests/benchmark/test_experiment_identity.py -q
++
++Expected:
++Default root、context lifecycle、unprofiled subagent and real benchmark worker fail only because v2 occurrence is zero.
++
++Observed:
++4 failed, 82 passed
++Every failure reported:
++assert system.count(_STATE_TRANSITION_PROTOCOL) == 1
++E assert 0 == 1
++```
++
++Frozen v1/hash、addition identity、stateful/non-stateful shared control flow、context ordering、slash skill override and profiled subagent boundaries passed during RED。
++
++### 8.2 Trace-derived hash probe
++
++```text
++Command:
++uv run pytest tests/benchmark/test_experiment_identity.py::test_default_benchmark_worker_inherits_state_transition_protocol -q
++
++Probe:
++Expected hash temporarily set to 64 zeroes.
++
++Observed actual trace hash:
++bc9d1a2fbcc3458efb5b153f4ff539050c96e28a9c76f3fcd8823588933eb6c0
++```
++
++After freezing that observed value, the same test passed。
++
++### 8.3 RED-B — missing profile
++
++```text
++Command:
++uv run pytest tests/benchmark/test_experiment_identity.py::test_state_transition_profile_changes_only_prompt_identity -q
++
++Expected and observed:
++AssertionError: v2 experiment profile is missing
++```
++
++After creating the profile with only the two approved identity changes, the test passed。
++
++## 9. GREEN evidence
++
++Focused GREEN after the production append：
++
++```text
++86 passed
++```
++
++Final individual focused files：
++
++| Command target | Result |
++| --- | ---: |
++| `tests/unit/test_loop.py` | 18 passed |
++| `tests/unit/test_context_system_prompt.py` | 6 passed |
++| `tests/unit/test_spawn_agent_tool.py` | 21 passed |
++| `tests/unit/test_session_manager.py` | 11 passed |
++| `tests/benchmark/test_experiment_identity.py` | 31 passed |
++| Total focused | 87 passed |
++
++The fake provider proves prompt wiring and observed identity only. It is not capability evidence。
++
++## 10. Experiment identity
++
++### 10.1 New profile
++
++- Profile ID：`kama-coding-mvp-v1-deepseek-v4-pro-requirement-contract-v2`
++- Profile bytes SHA-256：`5b29ee53229f89fac9fd7298f38f92122b8fe24bb2284f459185af8b5136c4ef`
++- Expected prompt SHA-256：`bc9d1a2fbcc3458efb5b153f4ff539050c96e28a9c76f3fcd8823588933eb6c0`
++
++After normalizing `profile_id` and `expected_identity.prompt_hash` to the Phase 9B values, the complete JSON tree equals the v1 profile。
++
++Historical Phase 9B profile bytes remain：
++
++```text
++9346d813af69ea1d3bc3d16a5f7e9b5cecc2f601f69e40aa1c138799ed2e1da0
++```
++
++### 10.2 Declared vs observed
++
++The no-network path was：
++
++```text
++real AgentRunner
++  → real AgentLoop
++  → TracingProvider
++  → scripted fake provider
++  → real trace/journal
++  → collect_observed_identity
++  → verify_declared_observed
++```
++
++Observed：
++
++- one API call；
++- one model identity：`deepseek-v4-pro`；
++- one effective prompt hash；
++- declared/observed verification valid；
++- mismatch list empty。
++
++### 10.3 Unchanged identity
++
++| Field | Value |
++| --- | --- |
++| Tool-schema SHA-256 | `8ea67642a27db476c048575e9a532c41a044e39f63f729260428cdce0fd35f9f` |
++| Runtime-config SHA-256 | `bd7d46cf2e3139369704dcc67ade71c58a9d9e2247d7912abae1c378a7b35a64` |
++| Dependency SHA-256 | `dfdbce9b7ec2a3164390e373d13a2f547280db34e96d58f66d20255f5f436793` |
++| Suite SHA-256 | `6e1b554df12962fc454a5b61c6e6145bd022041ec77b24149d73bd616e6044d7` |
++| Task hashes | 9, unchanged |
++| Grader hashes | 9, unchanged |
++| Max steps | 20 |
++| Repeats | 3 |
++| MCP | disabled |
++
++Prompt mutation remains fail closed through the existing parameterized declared/observed mismatch test。
++
++## 11. Atomic oracle disposition
++
++Disposition：`CONTRACT_AMBIGUITY_NOTE`
++
++Evidence：
++
++- public goal requires order IDs in input order but does not explicitly fix the result collection type；
++- fixture exposes tuple through its existing `all_orders()` convention；
++- reference and alternative patches both use tuple；
++- this is insufficient to establish grader overconstraint；
++- it is also insufficient to claim the contract has no ambiguity。
++
++Consequences：
++
++- historical canonical Atomic result remains unchanged；
++- no task、grader、suite、reference or artifact changed；
++- Atomic is not primary causal evidence；
++- if Atomic materially affects the future decision, the result is at least `MIXED` until independently resolved。
++
++## 12. Preregistered thresholds
++
++Primary：
++
++- inventory lifecycle >= 1/3；
++- feature implementation >= 6/9；
++- overall success >= 20/27。
++
++Hard guardrails：
++
++- bug fixing = 9/9；
++- timeout <= 3/27；
++- runtime/infra/trace/grader failures = 0；
++- status = VALID；
++- planned/started/completed = 27/27/27。
++
++Efficiency：
++
++- complete median latency <= 88061.8772 ms；
++- complete median input + output tokens <= 11976.25；
++- report total wall；
++- exclude timeout zero-token attempts from complete medians。
++
++The complete decision rules and analysis-only rubric are frozen in `phase9c-state-transition-protocol-preregistration.md`。
++
++## 13. Analysis-only rubric
++
++Applicable tasks：
++
++- `feature-atomic-bulk-import`
++- `feature-inventory-reservation-lifecycle`
++- `bugfix-retry-state-idempotency`
++
++Fields：
++
++1. pre-state；
++2. mutation points；
++3. later failure points；
++4. success post-state；
++5. failure post-state；
++6. rollback/compensation；
++7. mid-operation failure injection；
++8. invariant verification after injection。
++
++Values are `yes/partial/no/not_applicable/insufficient_evidence`. They never alter canonical success。
++
++## 14. Full validation
++
++| Gate | Result |
++| --- | --- |
++| Five focused files | 87 passed |
++| `tests/benchmark -q` | 86 passed in 201.72 s |
++| `tests/ -q` | 985 passed in 218.62 s |
++| Ruff | All checks passed |
++| mypy | No issues in 115 source files |
++| Protocol doc check | Up to date |
++| `git diff --check` | Clean |
++| Forbidden production/task/suite diffs | Empty |
++
++No model、credential or network API was used。
++
++## 15. Security and privacy boundaries
++
++| Boundary | Guarantee | Limitation |
++| --- | --- | --- |
++| Credential | Not read by scripted provider；not persisted | A future real run needs separate authorization |
++| Trace | Used locally to hash actual system bytes | Raw trace is private and may contain sensitive payload |
++| Profile | Contains hashes and provider identity, not prompt payload | It is not a security control |
++| Worker | Provides lifecycle isolation | It is not a sandbox against malicious code |
++| Reports | Preregistration contains no raw messages/tool payload | Future private artifacts must remain outside public upload |
++
++The implementation devlog contains the approved frozen prompt text, but no raw attempt message、complete tool schema、hidden grader source、tool payload、credential or host-private absolute path。
++
++## 16. Failure modes and debugging
++
++| Symptom | Cause | Evidence | Action |
++| --- | --- | --- | --- |
++| RED fails with occurrence 0 | v2 absent before production | Four focused RED assertions | Append exact text once |
++| Trace hash differs | Prompt bytes/composition drift | observed prompt hash | Fail closed；do not create runnable profile |
++| Runtime-config hash changes | More than prompt changed | declared/observed identity | BLOCKED |
++| Profile normalized tree differs | Extra experiment variable changed | profile equality test | Reject profile |
++| Override contains v1/v2 | Default prompt leaked into override | skill/profile tests | Reject implementation |
++| Atomic drives conclusion | Ambiguous result collection contract | oracle note | At least MIXED |
++
++## 17. Mutation and probe evidence
++
++| Probe | Semantic mutation | Killer | Result |
++| --- | --- | --- | --- |
++| RED-A pre-state | Remove/omit v2 from default | root、context、child、worker tests | killed |
++| RED-B pre-state | Omit treatment profile | profile-missing test | killed |
++| Prompt identity mismatch | Replace declared prompt hash | existing mismatch test | killed |
++| Override leakage | Include default protocols in override | context、skill、profile tests | killed |
++
++This is targeted prompt mutation evidence, not repository-wide mutation coverage。
++
++## 18. Remaining risks
++
++- No real-model capability evidence exists yet；
++- three repeats per task do not eliminate model variance；
++- the development benchmark informed prompt design, so later success is not generalization evidence；
++- the prompt may increase latency/tokens without improving targeted tasks；
++- compliance is inferred from visible trajectory evidence, not private chain-of-thought；
++- Atomic remains ambiguous；
++- process isolation remains lifecycle isolation, not a security sandbox。
++
++## 19. Resume claim impact
++
++| Candidate claim | Status | Evidence | Safe wording |
++| --- | --- | --- | --- |
++| Generic state-transition protocol integrated | Implemented and tested | Exact prompt tests、985-test regression | “Implemented a byte-frozen default-prompt protocol with traced identity verification.” |
++| Single-variable experiment ready | Preregistered | v2 profile、identity match、threshold doc | “Prepared a preregistered direct-control experiment.” |
++| Protocol improves coding-agent capability | Not benchmarked | No real-model run | Must not claim |
++| Protocol generalizes | Not tested | No holdout | Must not claim |
++
++## 20. Safe claims
++
++Safe now：
++
++- exact 65-word protocol is implemented once in the unique default prompt；
++- default and override inheritance boundaries are tested；
++- the effective prompt hash was obtained from a real local trace with a scripted provider；
++- tool/runtime/dependency/suite identities remain frozen；
++- an immutable treatment profile and preregistration exist；
++- full local tests and static gates pass。
++
++Unsafe now：
++
++- v2 improves task success；
++- v2 fixes inventory behavior；
++- DeepSeek was evaluated under v2；
++- protocol compliance proves model reasoning；
++- results generalize beyond the development suite。
++
++## 21. 90-second interview explanation
++
++Phase 9B improved overall benchmark success but inventory lifecycle stayed at zero, so I designed a strict single-variable follow-up. I appended a 65-word generic state-transition and failure-injection protocol after the existing 97-word requirement contract in the only production prompt source, without adding runtime classification、state、tools or events. I first wrote RED tests across root runs、context composition、subagents、slash-skill overrides and the real benchmark worker；the four intended paths failed only because the new protocol occurred zero times. After the one-file append, those tests turned green. I then ran the real local AgentRunner-to-trace path with a scripted provider and froze the observed prompt hash in a new experiment profile whose normalized JSON differs from Phase 9B only by profile ID and prompt hash. Tool schema、runtime config、dependency and suite identities stayed unchanged. The full 985-test suite、Ruff、mypy and protocol checks passed. The experiment is only preregistered：no real model has run, and Atomic remains an explicitly disclosed ambiguous secondary signal。
++
++## 22. Comprehension questions and standard answers
++
++### Q1. 为什么只改 `AgentLoop.run()`？
++
++标准答案：它是唯一默认 prompt source。这里追加能覆盖所有 default paths，而不改变 `ExecutionContext`、runner、worker 或 profile 的行为所有权。
++
++### Q2. 为什么 profile 不能保存或应用 prompt 内容？
++
++标准答案：profile 是 external observer 的声明，不是第二套 runtime configuration。它只能冻结预期 hash，实际 prompt 必须由 runtime trace 观察。
++
++### Q3. 为什么 Phase 9B profile 不再要求匹配当前 runtime？
++
++标准答案：Phase 9B 是历史 control。当前 runtime 加入 v2 后，其 observed prompt 必然不同；历史 profile 应冻结旧 bytes/hash，而不是错误地声明它仍代表新 runtime。
++
++### Q4. fake provider 能证明什么？
++
++标准答案：它能证明真实 wiring、prompt composition、trace hash 和 identity verification，不证明模型能力提升。
++
++### Q5. 为什么 stateful 和 non-stateful task 仍走相同控制流？
++
++标准答案：v2 明确要求模型自行判断 applicability。runtime 没有 classifier 或 branch，因此两类 goal 的 prompt、tools、events 和 stopping path 相同。
++
++### Q6. 为什么 Atomic 不能作为主要证据？
++
++标准答案：公开 goal 未明确 result collection type，而隐藏 target 使用 tuple。fixture、reference 和 alternative 都支持 tuple convention，但仍不足以消除公开 contract ambiguity。
++
++### Q7. 何时实验必须判为 INVALID？
++
++标准答案：任何 behavior identity、attempt matrix、journal 或 artifact evidence 无效时都必须 INVALID，不能发布 capability score。
++
++### Q8. 为什么还不能写“提升了 Agent 能力”？
++
++标准答案：目前只有 implementation 和 deterministic wiring evidence，没有真实模型 27-attempt result，也没有 holdout。
++
++## 23. Interview follow-up questions
++
++### 1. 如何证明这是严格单变量实验？
++
++回答框架：展示 direct control、唯一 production diff、normalized profile equality、observed tool/runtime/dependency/suite hash 不变，以及同一 suite/repeats/order。
++
++### 2. Prompt hash 为什么必须来自 trace？
++
++回答框架：源码推导可能遗漏 runtime composition、override 或 context；trace 是 provider 实际收到的 system bytes，observer 对 UTF-8 bytes 做 hash 才是 observed identity。
++
++### 3. 为什么不自动 rollback？
++
++回答框架：门禁只生成 `ACCEPT/MIXED/REJECT/INVALID` 证据，Git 回滚是独立的人类授权动作，不能由 benchmark 自动扩大权限。
++
++### 4. 如何防止为了成功率无限增加 token？
++
++回答框架：同时冻结 latency/token guardrails，并只在 complete attempts 上用相同 median 定义；targeted improvement 和 efficiency 必须同时满足。
++
++### 5. 为什么 holdout 不能现在运行？
++
++回答框架：本阶段只实现和预注册 development experiment。提前反复查看 holdout 会造成过拟合，并且真实模型执行还需要单独的数据、费用和 artifact 授权。
++
++## 24. Final gate
++
++```text
++Implementation: COMPLETE
++Ready for External Diff Review: YES
++Real model experiment: NOT AUTHORIZED
++```
++
++No stage、commit or push was performed。
+diff --git a/docs/learning/devlog/phase9c-state-transition-protocol-preregistration.md b/docs/learning/devlog/phase9c-state-transition-protocol-preregistration.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..c33311e00946677773fcf18cda928995a17a18bb
+--- /dev/null
++++ b/docs/learning/devlog/phase9c-state-transition-protocol-preregistration.md
+@@ -0,0 +1,261 @@
++# Phase 9C-B State-Transition Protocol Preregistration
++
++## 0. Metadata
++
++- Phase：`Phase 9C-B`
++- Date：`2026-07-28`
++- Direct control commit：`966cfa4072c63fd8abc05870a57f0dd8f6a1ab8a`
++- Direct control profile：`kama-coding-mvp-v1-deepseek-v4-pro-requirement-contract-v1`
++- Treatment profile：`kama-coding-mvp-v1-deepseek-v4-pro-requirement-contract-v2`
++- Suite：`kama-coding-mvp@1`
++- Experiment status：`NOT AUTHORIZED`
++- Scope：在 Phase 9B 默认 prompt 后追加一个通用 state-transition/failure-injection protocol。
++- Out of scope：真实模型调用、benchmark、holdout、任务/grader/suite 修改、timeout 或 runtime 行为修改。
++
++## 1. Direct control
++
++Phase 9C-B 必须直接与 Phase 9B 比较，不得使用 Third Baseline 或其他历史运行替代。
++
++| Metric | Phase 9B control |
++| --- | ---: |
++| Overall | 20/27 |
++| Bug fixing | 9/9 |
++| Feature implementation | 5/9 |
++| Test generation | 6/9 |
++| Inventory lifecycle | 0/3 |
++| Atomic + inventory | 2/6 |
++| Timeout | 3/27 |
++| Complete median latency | 80056.252 ms |
++| Complete median input + output tokens | 10887.5 |
++| Total experiment wall | 2413.770 s |
++| Runtime/infra/trace/grader failures | 0 |
++| Experiment status | VALID |
++
++## 2. Preregistered treatment identity
++
++The only behavior-affecting production change is an exact 65-word append to the existing default prompt after the unchanged 97-word requirement contract。
++
++| Identity field | Frozen treatment value |
++| --- | --- |
++| Addition word count | 65 |
++| Addition UTF-8 bytes | 440 |
++| Addition SHA-256 | `310b308df8cad96fc20ff63b7f50f799ed717a16a65f67db392ca4f6eb7762a3` |
++| Effective prompt SHA-256 | `bc9d1a2fbcc3458efb5b153f4ff539050c96e28a9c76f3fcd8823588933eb6c0` |
++| Ordered tool-schema SHA-256 | `8ea67642a27db476c048575e9a532c41a044e39f63f729260428cdce0fd35f9f` |
++| Runtime-config SHA-256 | `bd7d46cf2e3139369704dcc67ade71c58a9d9e2247d7912abae1c378a7b35a64` |
++| Dependency SHA-256 | `dfdbce9b7ec2a3164390e373d13a2f547280db34e96d58f66d20255f5f436793` |
++| Suite SHA-256 | `6e1b554df12962fc454a5b61c6e6145bd022041ec77b24149d73bd616e6044d7` |
++| Model | `deepseek-v4-pro` |
++| Protocol | `anthropic_messages` |
++| SDK | `anthropic==0.111.0` |
++| Max steps | 20 |
++| Repeats | 3 |
++| Execution order | suite task, then repeat ascending |
++| MCP | disabled |
++
++The effective prompt hash was collected through a local real `AgentRunner → AgentLoop → TracingProvider → scripted provider → trace observer` path. No credential or network API was used。
++
++## 3. Single-variable controls
++
++Must remain identical to Phase 9B：
++
++- suite、ordered task list、task hashes and grader hashes；
++- provider、model、endpoint identity、wire protocol and SDK；
++- goal/messages；
++- ordered tools and tool-schema hash；
++- runtime-config hash；
++- dependency hash；
++- max_steps、timeout、repeats and execution order；
++- permission、stopping、cancellation、compaction and event semantics；
++- trace/artifact policy；
++- MCP disabled。
++
++Expected identity changes：
++
++- Git commit；
++- profile ID；
++- profile bytes hash；
++- prompt hash；
++- fresh external output root。
++
++Any unexpected behavior-affecting identity change makes the future experiment `INVALID`。
++
++## 4. Primary metrics
++
++All Primary thresholds must be satisfied for `ACCEPT`：
++
++| Metric | Threshold |
++| --- | ---: |
++| Inventory lifecycle | >= 1/3 |
++| Feature implementation | >= 6/9 |
++| Overall success | >= 20/27 |
++
++Inventory lifecycle is the targeted primary signal because Phase 9B scored 0/3 and the new protocol explicitly addresses multi-step state invariants and later failure points。
++
++## 5. Secondary targeted metrics
++
++- Atomic + inventory：>= 3/6，subject to the Atomic ambiguity note；
++- state-transition coverage；
++- mutation-point coverage；
++- mid-operation failure-injection evidence。
++
++Secondary protocol fields are analysis-only and may not change canonical grader results or the public baseline schema。
++
++## 6. Hard guardrails
++
++| Guardrail | Requirement |
++| --- | ---: |
++| Bug fixing | 9/9 |
++| Timeout | <= 3/27 |
++| Runtime failures | 0 |
++| Infrastructure failures | 0 |
++| Trace failures | 0 |
++| Grader failures | 0 |
++| Experiment status | VALID |
++| Planned/started/completed | 27/27/27 |
++
++Timeout attempts retain canonical zero token/step/tool metrics and are excluded from complete-attempt medians。
++
++## 7. Efficiency guardrails
++
++Relative to Phase 9B：
++
++| Metric | Maximum |
++| --- | ---: |
++| Complete median latency | 88061.8772 ms |
++| Complete median input + output tokens | 11976.25 |
++
++The same `statistics.median` definition and wall-time measurement must be used. Total experiment wall must be reported in full but has no automatic threshold。
++
++## 8. Analysis-only protocol rubric
++
++Applicable frozen tasks：
++
++- `feature-atomic-bulk-import`
++- `feature-inventory-reservation-lifecycle`
++- `bugfix-retry-state-idempotency`
++
++Applicability requires：
++
++1. persistent or shared target-system state；
++2. at least two ordered operations；
++3. a later operation that can fail after an earlier mutation succeeds。
++
++Agent workspace editing alone does not make a task applicable。
++
++For each applicable attempt, record：
++
++1. `pre_state_identified`
++2. `mutation_points_enumerated`
++3. `later_failure_points_enumerated`
++4. `success_post_state_identified`
++5. `failure_post_state_identified`
++6. `rollback_or_compensation_planned`
++7. `mid_operation_failure_injected`
++8. `invariant_verified_after_injection`
++
++Allowed values：
++
++- `yes`
++- `partial`
++- `no`
++- `not_applicable`
++- `insufficient_evidence`
++
++If an analysis score is rendered：
++
++```text
++yes = 1
++partial = 0.5
++no = 0
++not_applicable = excluded
++insufficient_evidence = reported separately
++```
++
++This rubric is not a grader and never overrides task success。
++
++## 9. Atomic oracle ambiguity
++
++Disposition：`CONTRACT_AMBIGUITY_NOTE`
++
++Read-only evidence：
++
++- the public goal requires IDs in input order but does not explicitly fix the result collection type；
++- the fixture exposes an existing tuple convention；
++- both reference and alternative implementations use tuple-valued IDs；
++- the evidence does not prove grader overconstraint；
++- the public contract is still not explicit enough to claim no ambiguity。
++
++Consequences：
++
++- canonical historical Atomic results remain unchanged；
++- no task、grader、reference、suite or artifact is modified；
++- Atomic cannot be the primary causal evidence for v2；
++- if Atomic materially determines the decision while the ambiguity remains unresolved, the result is at least `MIXED`。
++
++## 10. Decision rules
++
++### ACCEPT
++
++All must hold：
++
++1. experiment `VALID`；
++2. every hard guardrail passes；
++3. inventory >= 1/3；
++4. feature >= 6/9；
++5. overall >= 20/27；
++6. latency/token guardrails pass；
++7. Atomic ambiguity is not used as primary support。
++
++### MIXED
++
++Any of：
++
++- only part of the targeted capability improves；
++- targeted improvement occurs but an efficiency guardrail fails；
++- the conclusion materially depends on Atomic ambiguity；
++- attempt-level evidence is internally inconsistent。
++
++### REJECT / rollback candidate
++
++Any of：
++
++- inventory remains 0/3；
++- bug fixing drops below 9/9；
++- timeout exceeds 3/27；
++- overall drops below 20/27；
++- runtime/infra/trace/grader failure occurs；
++- no targeted improvement and efficiency regresses。
++
++No rollback is automatic。
++
++### INVALID
++
++Any invalid identity、attempt matrix、journal or artifact evidence makes the experiment invalid. No capability score may be published。
++
++## 11. Output and authorization policy
++
++A future experiment requires：
++
++- a new output root outside the repository；
++- a non-existing root rechecked immediately before execution；
++- retention of all attempts and private traces；
++- no default upload；
++- separate explicit human authorization covering data disclosure、27 attempts、cost and private artifact retention。
++
++Current state：
++
++```text
++Preregistration: FROZEN
++Real model experiment: NOT AUTHORIZED
++Holdout: NOT AUTHORIZED
++```
++
++## 12. Remaining risks
++
++- The development suite informed prompt design, so a positive result does not prove generalization；
++- only three repeats per task leave substantial model variance；
++- protocol compliance is inferred from private trajectory evidence, not a formal proof of internal planning；
++- the protocol may increase tokens or latency without improving canonical success；
++- Atomic remains an ambiguous secondary signal；
++- process isolation is lifecycle isolation, not a security sandbox。

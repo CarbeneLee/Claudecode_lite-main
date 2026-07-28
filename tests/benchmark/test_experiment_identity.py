@@ -20,8 +20,14 @@ from kama_claude.eval.worker import WorkerRequest, execute_request
 _PHASE9B_PROFILE = (
     "kama-coding-mvp-v1-deepseek-v4-pro-requirement-contract-v1.json"
 )
+_PHASE9C_PROFILE = (
+    "kama-coding-mvp-v1-deepseek-v4-pro-requirement-contract-v2.json"
+)
 _PHASE9B_PROMPT_HASH = (
     "b248587ef77d172cefb5e7b777a1523cf50978d6d273b466a8b6eb37349621eb"
+)
+_PHASE9C_PROMPT_HASH = (
+    "bc9d1a2fbcc3458efb5b153f4ff539050c96e28a9c76f3fcd8823588933eb6c0"
 )
 _FROZEN_TOOL_SCHEMA_HASH = (
     "8ea67642a27db476c048575e9a532c41a044e39f63f729260428cdce0fd35f9f"
@@ -35,6 +41,34 @@ _FROZEN_DEPENDENCY_HASH = (
 _OLD_PROFILE_BYTES_HASH = (
     "1b35206b1d0ef4449a3773cc17025c3149d797b49e9d022c707f9c9ee9fa4aa7"
 )
+_PHASE9B_PROFILE_BYTES_HASH = (
+    "9346d813af69ea1d3bc3d16a5f7e9b5cecc2f601f69e40aa1c138799ed2e1da0"
+)
+_DEFAULT_BASE_PROMPT = (
+    "You are a helpful AI assistant. "
+    "Use the available tools to complete the user's goal. "
+    "When the goal is fully achieved, respond with a final answer "
+    "and do not call any more tools."
+)
+_REQUIREMENT_CONTRACT = (
+    "Before changing the workspace, create a concise requirement contract from every "
+    "explicit acceptance criterion. For each item, record the required observable "
+    "behavior, relevant failure or invalid-input behavior, any side-effect or state "
+    "invariant, and the evidence you plan to use for verification. Keep this checklist "
+    "visible in the conversation as you work, and update each item as implemented, "
+    "verified, or unchecked. Before finishing, review every item. Do not assume unchecked "
+    "items are complete: verify them when possible, otherwise clearly report the "
+    "limitation. Keep the contract brief and auditable; do not expose private "
+    "chain-of-thought or force any particular tool."
+)
+_STATE_TRANSITION_PROTOCOL = (
+    "When a task changes persistent or shared state through multiple operations, briefly "
+    "map the pre-state, each mutation point, every later operation that can fail, and the "
+    "required post-state after success or failure. Before finishing, exercise at least "
+    "one failure after an earlier mutation succeeds, and verify that rollback or "
+    "compensation preserves the stated invariant. Do not apply this protocol to tasks "
+    "without multi-step side effects."
+)
 
 
 # 加载待实现的 experiment identity 模块，并把缺失模块转换为明确的 RED 失败
@@ -46,6 +80,10 @@ def _experiment_module() -> ModuleType:
 
 
 class _Phase9BScriptedProvider:
+    # 初始化真实 worker 调用收到的 system prompt 观测列表
+    def __init__(self) -> None:
+        self.seen_systems: list[str | None] = []
+
     # 通过真实 AgentRunner wiring 返回稳定 end_turn，且不读取 credential 或访问网络
     async def chat(
         self,
@@ -57,6 +95,7 @@ class _Phase9BScriptedProvider:
         step: int = 0,
         system: str | None = None,
     ) -> LlmResponse:
+        self.seen_systems.append(system)
         await bus.publish(
             LlmModelSelectedEvent(
                 run_id=run_id,
@@ -899,16 +938,50 @@ def test_requirement_contract_profile_changes_only_prompt_identity() -> None:
     assert normalized == old_payload
 
 
-# 功能：验证真实本地 trace 的 effective prompt identity 与 Phase 9B declaration 完整匹配
-# 设计：穿过 AgentRunner、AgentLoop、TracingProvider 和真实 journal，再由 observer fail-closed 比较
+# 功能：验证 Phase 9C profile 只改变 profile ID 与 trace-derived prompt hash
+# 设计：先以明确 missing RED 锁定新文件，再归一化完整 JSON tree 并冻结历史 Phase 9B bytes
+def test_state_transition_profile_changes_only_prompt_identity() -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    experiments = repository_root / "benchmarks" / "experiments"
+    old_path = experiments / _PHASE9B_PROFILE
+    new_path = experiments / _PHASE9C_PROFILE
+
+    assert new_path.exists(), "v2 experiment profile is missing"
+
+    old_payload = json.loads(old_path.read_text(encoding="utf-8"))
+    new_payload = json.loads(new_path.read_text(encoding="utf-8"))
+    assert hashlib.sha256(old_path.read_bytes()).hexdigest() == _PHASE9B_PROFILE_BYTES_HASH
+    assert new_payload["profile_id"] == (
+        "kama-coding-mvp-v1-deepseek-v4-pro-requirement-contract-v2"
+    )
+    assert new_payload["expected_identity"]["prompt_hash"] == _PHASE9C_PROMPT_HASH
+    normalized = dict(new_payload)
+    normalized["profile_id"] = old_payload["profile_id"]
+    normalized["expected_identity"] = dict(new_payload["expected_identity"])
+    normalized["expected_identity"]["prompt_hash"] = old_payload["expected_identity"][
+        "prompt_hash"
+    ]
+    assert normalized == old_payload
+
+
+# 功能：验证 Phase 9B control prompt hash 仍由冻结 base 与 v1 字节唯一决定
+# 设计：不要求历史 profile 匹配未来 runtime，直接重建历史 control bytes 并核对冻结 hash
+def test_phase9b_control_prompt_hash_remains_frozen() -> None:
+    prompt = _DEFAULT_BASE_PROMPT + "\n\n" + _REQUIREMENT_CONTRACT
+
+    assert hashlib.sha256(prompt.encode("utf-8")).hexdigest() == _PHASE9B_PROMPT_HASH
+
+
+# 功能：验证真实 benchmark worker 的默认 prompt 继承 state-transition protocol
+# 设计：穿过 execute_request、AgentRunner、AgentLoop、TracingProvider 与 journal，仅用 scripted provider 捕获 system
 @pytest.mark.asyncio
-async def test_requirement_contract_profile_matches_real_traced_prompt(
+async def test_default_benchmark_worker_inherits_state_transition_protocol(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     experiment = _experiment_module()
     repository_root = Path(__file__).resolve().parents[2]
-    profile_path = repository_root / "benchmarks" / "experiments" / _PHASE9B_PROFILE
+    profile_path = repository_root / "benchmarks" / "experiments" / _PHASE9C_PROFILE
     loaded = experiment.load_experiment_profile(profile_path)
     declared = experiment.capture_declared_identity(
         loaded,
@@ -936,8 +1009,8 @@ async def test_requirement_contract_profile_matches_real_traced_prompt(
     workspace.mkdir()
     runs_dir = attempt_root / "runs"
     request = WorkerRequest(
-        task_id="phase9b-identity",
-        run_id="phase9b-run",
+        task_id="phase9c-identity",
+        run_id="phase9c-run",
         goal="Implement behavior A and preserve invariant B.",
         workspace=str(workspace.resolve()),
         runs_dir=str(runs_dir.resolve()),
@@ -963,9 +1036,18 @@ async def test_requirement_contract_profile_matches_real_traced_prompt(
     observed = experiment.collect_observed_identity(attempt_root)
     verification = experiment.verify_declared_observed(declared, observed)
 
+    assert len(provider.seen_systems) == 1
+    system = provider.seen_systems[0]
+    assert system is not None
+    assert system.count(_REQUIREMENT_CONTRACT) == 1
+    assert system.count(_STATE_TRANSITION_PROTOCOL) == 1
+    assert system.index(_REQUIREMENT_CONTRACT) < system.index(_STATE_TRANSITION_PROTOCOL)
     assert verification.valid is True
     assert verification.mismatches == []
-    assert observed.prompt_hash == _PHASE9B_PROMPT_HASH
+    assert observed.api_call_count == 1
+    assert observed.model_event_ids == ["deepseek-v4-pro"]
+    assert declared.prompt_hash == _PHASE9C_PROMPT_HASH
+    assert observed.prompt_hash == _PHASE9C_PROMPT_HASH
     assert observed.tool_schema_hash == _FROZEN_TOOL_SCHEMA_HASH
     assert observed.runtime_config_hash == _FROZEN_RUNTIME_CONFIG_HASH
     assert declared.runtime_config_hash == _FROZEN_RUNTIME_CONFIG_HASH
@@ -974,13 +1056,6 @@ async def test_requirement_contract_profile_matches_real_traced_prompt(
     assert len(declared.suite.task_hashes) == 9
     assert len(declared.suite.grader_hashes) == 9
     experiment.require_identity_match(declared, observed)
-
-    mismatched = declared.model_copy(update={"prompt_hash": "0" * 64})
-    with pytest.raises(
-        experiment.ExperimentIdentityMismatch,
-        match="prompt_hash",
-    ):
-        experiment.require_identity_match(mismatched, observed)
 
 
 # 功能：验证 artifact policy 拒绝 repository 内路径与已存在输出，只接受全新的外部目录

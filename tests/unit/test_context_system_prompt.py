@@ -2,7 +2,28 @@ from __future__ import annotations
 
 from kama_claude.core.context import ExecutionContext
 
+_REQUIREMENT_CONTRACT = (
+    "Before changing the workspace, create a concise requirement contract from every "
+    "explicit acceptance criterion. For each item, record the required observable "
+    "behavior, relevant failure or invalid-input behavior, any side-effect or state "
+    "invariant, and the evidence you plan to use for verification. Keep this checklist "
+    "visible in the conversation as you work, and update each item as implemented, "
+    "verified, or unchecked. Before finishing, review every item. Do not assume unchecked "
+    "items are complete: verify them when possible, otherwise clearly report the "
+    "limitation. Keep the contract brief and auditable; do not expose private "
+    "chain-of-thought or force any particular tool."
+)
+_STATE_TRANSITION_PROTOCOL = (
+    "When a task changes persistent or shared state through multiple operations, briefly "
+    "map the pre-state, each mutation point, every later operation that can fail, and the "
+    "required post-state after success or failure. Before finishing, exercise at least "
+    "one failure after an earlier mutation succeeds, and verify that rollback or "
+    "compensation preserves the stated invariant. Do not apply this protocol to tasks "
+    "without multi-step side effects."
+)
 
+
+# 构造最小 ExecutionContext 并允许测试覆盖任意字段
 def _make_ctx(**kwargs) -> ExecutionContext:
     defaults = dict(run_id="r1", goal="test goal", max_steps=5)
     defaults.update(kwargs)
@@ -50,3 +71,41 @@ def test_session_notes_hint() -> None:
     ctx = _make_ctx(session_notes="some note")
     prompt = ctx.system_prompt("BASE")
     assert "note_save" in prompt
+
+
+# 功能：验证完整 default base 之后仍按 Global、Project、Session 顺序追加 context
+# 设计：把 v1/v2 作为一个不可分 base 传入真实 system_prompt，逐段定位以排除 context 层重排
+def test_v1_v2_default_base_precedes_all_context_layers() -> None:
+    base = "BASE\n\n" + _REQUIREMENT_CONTRACT + "\n\n" + _STATE_TRANSITION_PROTOCOL
+    ctx = _make_ctx(
+        global_context="global",
+        project_context="project",
+        session_notes="session",
+    )
+
+    prompt = ctx.system_prompt(base)
+
+    assert prompt.startswith(base)
+    assert prompt.index(_STATE_TRANSITION_PROTOCOL) < prompt.index("## Global Context")
+    assert prompt.index("## Global Context") < prompt.index("## Project Context")
+    assert prompt.index("## Project Context") < prompt.index("## Session Notes")
+
+
+# 功能：验证显式 override 完全替换包含 v1/v2 的 default base
+# 设计：向真实 ExecutionContext 同时传 full base 和 override，排除默认协议泄露到 slash skill/profile 路径
+def test_override_excludes_v1_and_v2_but_keeps_context_order() -> None:
+    base = "BASE\n\n" + _REQUIREMENT_CONTRACT + "\n\n" + _STATE_TRANSITION_PROTOCOL
+    ctx = _make_ctx(
+        system_prompt_override="OVERRIDE",
+        global_context="global",
+        project_context="project",
+        session_notes="session",
+    )
+
+    prompt = ctx.system_prompt(base)
+
+    assert prompt.startswith("OVERRIDE\n\n## Global Context")
+    assert _REQUIREMENT_CONTRACT not in prompt
+    assert _STATE_TRANSITION_PROTOCOL not in prompt
+    assert prompt.index("## Global Context") < prompt.index("## Project Context")
+    assert prompt.index("## Project Context") < prompt.index("## Session Notes")

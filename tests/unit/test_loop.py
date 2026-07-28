@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 
 import pytest
 from pydantic import BaseModel
@@ -28,6 +29,23 @@ _REQUIREMENT_CONTRACT = (
     "items are complete: verify them when possible, otherwise clearly report the "
     "limitation. Keep the contract brief and auditable; do not expose private "
     "chain-of-thought or force any particular tool."
+)
+_STATE_TRANSITION_PROTOCOL = (
+    "When a task changes persistent or shared state through multiple operations, briefly "
+    "map the pre-state, each mutation point, every later operation that can fail, and the "
+    "required post-state after success or failure. Before finishing, exercise at least "
+    "one failure after an earlier mutation succeeds, and verify that rollback or "
+    "compensation preserves the stated invariant. Do not apply this protocol to tasks "
+    "without multi-step side effects."
+)
+_PHASE9B_PROMPT_HASH = (
+    "b248587ef77d172cefb5e7b777a1523cf50978d6d273b466a8b6eb37349621eb"
+)
+_REQUIREMENT_CONTRACT_HASH = (
+    "90fc45897aa8323175ceb0e5be6af3561ae44b2d0ca9bcb64244411d65561812"
+)
+_STATE_TRANSITION_PROTOCOL_HASH = (
+    "310b308df8cad96fc20ff63b7f50f799ed717a16a65f67db392ca4f6eb7762a3"
 )
 
 # --- stubs -------------------------------------------------------------------
@@ -334,9 +352,34 @@ async def test_assistant_message_blocks_added_to_context() -> None:
     assert blocks[0]["text"] == "answer"  # type: ignore[index]
 
 
-# 功能：验证每次默认模型调用精确包含一次冻结的 requirement-contract 指导
-# 设计：使用两步 scripted provider 捕获完整 system，锁定字节级 base 拼接与每次调用的一次注入
-async def test_default_prompt_contains_requirement_contract_once_per_call() -> None:
+# 功能：验证 Phase 9B 的 base 与 v1 字节身份在追加 v2 前保持冻结
+# 设计：直接对冻结文本做词数、字节数和 SHA-256 检查，避免未来 prompt 变化改写历史 control
+def test_phase9b_prompt_identity_remains_frozen() -> None:
+    prompt = _DEFAULT_BASE_PROMPT + "\n\n" + _REQUIREMENT_CONTRACT
+
+    assert len(_REQUIREMENT_CONTRACT.split()) == 97
+    assert len(_REQUIREMENT_CONTRACT.encode("utf-8")) == 676
+    assert (
+        hashlib.sha256(_REQUIREMENT_CONTRACT.encode("utf-8")).hexdigest()
+        == _REQUIREMENT_CONTRACT_HASH
+    )
+    assert hashlib.sha256(prompt.encode("utf-8")).hexdigest() == _PHASE9B_PROMPT_HASH
+
+
+# 功能：验证冻结的 state-transition protocol 文本满足精确 addition 身份
+# 设计：同时锁定词数、UTF-8 字节数和完整 SHA-256，防止摘要中的截断 hash 或同义改写进入实现
+def test_state_transition_protocol_addition_identity_is_frozen() -> None:
+    assert len(_STATE_TRANSITION_PROTOCOL.split()) == 65
+    assert len(_STATE_TRANSITION_PROTOCOL.encode("utf-8")) == 440
+    assert (
+        hashlib.sha256(_STATE_TRANSITION_PROTOCOL.encode("utf-8")).hexdigest()
+        == _STATE_TRANSITION_PROTOCOL_HASH
+    )
+
+
+# 功能：验证每次默认模型调用精确包含一次冻结的 v1 与 v2 指导
+# 设计：使用两步 scripted provider 捕获完整 system，锁定 base、双换行、v1、双换行、v2 的字节级组合
+async def test_default_prompt_contains_v1_and_v2_once_per_call() -> None:
     provider = _MockProvider(
         [
             LlmResponse(stop_reason="tool_use", tool_calls=[_tc()]),
@@ -349,12 +392,21 @@ async def test_default_prompt_contains_requirement_contract_once_per_call() -> N
 
     await loop.run(_ctx())
 
-    expected = _DEFAULT_BASE_PROMPT + "\n\n" + _REQUIREMENT_CONTRACT
-    assert provider.seen_systems == [expected, expected]
-    assert all(
-        system is not None and system.count(_REQUIREMENT_CONTRACT) == 1
-        for system in provider.seen_systems
+    expected = (
+        _DEFAULT_BASE_PROMPT
+        + "\n\n"
+        + _REQUIREMENT_CONTRACT
+        + "\n\n"
+        + _STATE_TRANSITION_PROTOCOL
     )
+    for system in provider.seen_systems:
+        assert system is not None
+        assert system.count(_REQUIREMENT_CONTRACT) == 1
+        assert system.count(_STATE_TRANSITION_PROTOCOL) == 1
+        assert system.index(_REQUIREMENT_CONTRACT) < system.index(
+            _STATE_TRANSITION_PROTOCOL
+        )
+    assert provider.seen_systems == [expected, expected]
 
 
 # 功能：验证新增 contract 不改写消息、上下文顺序、工具顺序、步数、停止状态或事件序列
@@ -397,7 +449,9 @@ async def test_requirement_contract_preserves_runtime_inputs_and_lifecycle() -> 
     for system in systems:
         assert system is not None
         assert system.count(_REQUIREMENT_CONTRACT) == 1
-        assert system.index(_REQUIREMENT_CONTRACT) < system.index("## Global Context")
+        assert system.count(_STATE_TRANSITION_PROTOCOL) == 1
+        assert system.index(_REQUIREMENT_CONTRACT) < system.index(_STATE_TRANSITION_PROTOCOL)
+        assert system.index(_STATE_TRANSITION_PROTOCOL) < system.index("## Global Context")
         assert system.index("## Global Context") < system.index("## Project Context")
         assert system.index("## Project Context") < system.index("## Session Notes")
         assert "global-marker" in system
@@ -411,3 +465,33 @@ async def test_requirement_contract_preserves_runtime_inputs_and_lifecycle() -> 
         "step.started",
         "step.finished",
     ]
+
+
+# 功能：验证 stateful 与 non-stateful goal 使用相同 prompt、工具和 loop 生命周期
+# 设计：用同一 scripted provider 分别执行两类 goal，比较除 user goal 外的全部 runtime 观测值
+async def test_stateful_and_non_stateful_goals_share_runtime_control_flow() -> None:
+    observations: list[tuple[str | None, list[dict[str, object]], list[str], str]] = []
+    for goal in (
+        "Explain how the parser handles quoted input.",
+        "Import several orders atomically and roll back on failure.",
+    ):
+        provider = _MockProvider([LlmResponse(stop_reason="end_turn", text="done")])
+        registry = ToolRegistry()
+        registry.register(_EchoTool())
+        bus = EventBus()
+        events = await _events(bus)
+        loop, _ = _make_loop(provider, registry, bus)
+        ctx = ExecutionContext(run_id="r1", goal=goal, max_steps=5)
+
+        await loop.run(ctx)
+
+        observations.append(
+            (
+                provider.seen_systems[0],
+                provider.seen_tool_schemas[0],
+                [event.type for event in events],  # type: ignore[attr-defined]
+                ctx.status,
+            )
+        )
+
+    assert observations[0] == observations[1]
