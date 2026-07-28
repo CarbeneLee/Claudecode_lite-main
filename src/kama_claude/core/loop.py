@@ -70,7 +70,18 @@ class AgentLoop:
                         "You are a helpful AI assistant. "
                         "Use the available tools to complete the user's goal. "
                         "When the goal is fully achieved, respond with a final answer "
-                        "and do not call any more tools."
+                        "and do not call any more tools.\n\n"
+                        "Before changing the workspace, create a concise requirement "
+                        "contract from every explicit acceptance criterion. For each "
+                        "item, record the required observable behavior, relevant failure "
+                        "or invalid-input behavior, any side-effect or state invariant, "
+                        "and the evidence you plan to use for verification. Keep this "
+                        "checklist visible in the conversation as you work, and update "
+                        "each item as implemented, verified, or unchecked. Before "
+                        "finishing, review every item. Do not assume unchecked items are "
+                        "complete: verify them when possible, otherwise clearly report "
+                        "the limitation. Keep the contract brief and auditable; do not "
+                        "expose private chain-of-thought or force any particular tool."
                     ),
                 )
             except asyncio.CancelledError: # 异常策略处理

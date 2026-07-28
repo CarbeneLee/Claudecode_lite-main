@@ -1,0 +1,46 @@
+diff --git a/tests/test_dependency_planner_contract.py b/tests/test_dependency_planner_contract.py
+new file mode 100644
+index 0000000..97c6ea4
+--- /dev/null
++++ b/tests/test_dependency_planner_contract.py
+@@ -0,0 +1,40 @@
++import pytest
++
++from dependency_planner import (
++    DependencyCycleError,
++    DuplicateTaskError,
++    Task,
++    UnknownDependencyError,
++    plan,
++)
++
++
++# 功能：验证单一依赖图的顺序和输入不变性
++# 设计：有意不加入 disconnected 节点以形成 plausible omission
++def test_dependency_order_and_immutability() -> None:
++    tasks = [Task("compile"), Task("package", ("compile",))]
++    before = list(tasks)
++
++    assert plan(tasks) == ["compile", "package"]
++    assert tasks == before
++
++
++# 功能：验证重复名称被拒绝
++# 设计：使用最小重复输入隔离错误类型
++def test_duplicates_are_rejected() -> None:
++    with pytest.raises(DuplicateTaskError):
++        plan([Task("build"), Task("build")])
++
++
++# 功能：验证未知依赖被拒绝
++# 设计：只提供一个缺失依赖名称
++def test_unknown_dependencies_are_rejected() -> None:
++    with pytest.raises(UnknownDependencyError):
++        plan([Task("deploy", ("missing",))])
++
++
++# 功能：验证依赖环被拒绝
++# 设计：使用两个互相依赖的节点触发 no-progress
++def test_cycles_are_rejected() -> None:
++    with pytest.raises(DependencyCycleError):
++        plan([Task("alpha", ("beta",)), Task("beta", ("alpha",))])

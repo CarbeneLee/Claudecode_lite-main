@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "task_id": "bugfix-retry-state-idempotency",
+  "review_status": "author_validated_pending_external_review",
+  "difficulty": {
+    "level": "challenging",
+    "axes": {
+      "localization": 2,
+      "change_breadth": 2,
+      "contract_complexity": 2,
+      "oracle_depth": 2,
+      "issue_abstraction": 1
+    },
+    "total": 9
+  },
+  "requirement_test_matrix": [
+    {
+      "requirement_id": "attempt-accounting-and-retry-bound",
+      "public_contract": "each executor invocation increments attempts and retryable failures stop at max_attempts",
+      "criterion_ids": ["target-tests"],
+      "hidden_evidence": [
+        "hidden_tests/test_target.py::test_retry_then_success_counts_every_invocation_and_commits_once",
+        "hidden_tests/test_target.py::test_retryable_failures_stop_at_maximum_attempts"
+      ],
+      "out_of_scope": "backoff timing or concurrent workers"
+    },
+    {
+      "requirement_id": "failure-classification",
+      "public_contract": "permanent failures stop immediately while retryable failures may continue",
+      "criterion_ids": ["target-tests"],
+      "hidden_evidence": [
+        "hidden_tests/test_target.py::test_permanent_failure_stops_immediately"
+      ],
+      "out_of_scope": "new error taxonomy values"
+    },
+    {
+      "requirement_id": "terminal-idempotency-and-isolation",
+      "public_contract": "terminal reruns have no new invocation or effect and jobs retain independent state",
+      "criterion_ids": ["target-tests"],
+      "hidden_evidence": [
+        "hidden_tests/test_target.py::test_terminal_success_is_idempotent",
+        "hidden_tests/test_target.py::test_terminal_failure_is_idempotent",
+        "hidden_tests/test_target.py::test_jobs_keep_independent_state_and_effects"
+      ],
+      "out_of_scope": "persistent databases or distributed idempotency"
+    },
+    {
+      "requirement_id": "existing-success-and-store-contract",
+      "public_contract": "first-attempt success and existing store behavior remain stable",
+      "criterion_ids": ["regression-tests"],
+      "hidden_evidence": [
+        "hidden_tests/test_regression.py::test_first_success_state_and_effect_remain_stable",
+        "hidden_tests/test_regression.py::test_store_contract_remains_stable"
+      ],
+      "out_of_scope": "changing public class names or exception messages"
+    }
+  ],
+  "alternative_patch": "authoring/alternative.patch",
+  "wrong_patch_probes": [
+    {
+      "id": "wrong-success-only-count",
+      "patch": "authoring/wrong-success-only-count.patch",
+      "expected_failing_groups": ["target_behavior"]
+    },
+    {
+      "id": "wrong-off-by-one-max",
+      "patch": "authoring/wrong-off-by-one-max.patch",
+      "expected_failing_groups": ["target_behavior"]
+    },
+    {
+      "id": "wrong-retries-permanent",
+      "patch": "authoring/wrong-retries-permanent.patch",
+      "expected_failing_groups": ["target_behavior"]
+    },
+    {
+      "id": "wrong-reruns-terminal",
+      "patch": "authoring/wrong-reruns-terminal.patch",
+      "expected_failing_groups": ["target_behavior"]
+    }
+  ],
+  "forbidden_public_markers": [
+    "wrong-success-only-count",
+    "wrong-off-by-one-max",
+    "wrong-retries-permanent",
+    "wrong-reruns-terminal"
+  ],
+  "forbidden_issue_markers": [
+    "retryjobs/scheduler.py",
+    "begin_attempt",
+    "job.attempts +="
+  ],
+  "environment_file": "environment.json",
+  "determinism_runs": 3,
+  "security": {
+    "trusted_fixture": true,
+    "offline": true,
+    "data_flow_isolation_only": true,
+    "process_isolation_is_sandbox": false
+  }
+}

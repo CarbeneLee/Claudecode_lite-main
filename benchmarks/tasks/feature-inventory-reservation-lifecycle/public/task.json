@@ -1,0 +1,6 @@
+{
+  "id": "feature-inventory-reservation-lifecycle",
+  "goal": "Implement the public ReservationService lifecycle. reserve(request_key, sku, quantity) must atomically reduce available stock or raise without mutation. Reusing the same request key with identical arguments returns the same reservation without another reduction; reusing it with different arguments is a conflict. confirm and release accept a reservation ID, are idempotent when repeated in the same terminal state, and release restores stock exactly once. A confirmed reservation cannot be released. Preserve existing inventory query and adjustment behavior.",
+  "workspace_fixture": "public/workspace",
+  "timeout_s": 180.0
+}

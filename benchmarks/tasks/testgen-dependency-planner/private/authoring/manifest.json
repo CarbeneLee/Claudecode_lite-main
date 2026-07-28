@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "task_id": "testgen-dependency-planner",
+  "review_status": "author_validated_pending_external_review",
+  "difficulty": {
+    "level": "challenging",
+    "axes": {
+      "localization": 2,
+      "change_breadth": 1,
+      "contract_complexity": 2,
+      "oracle_depth": 2,
+      "issue_abstraction": 2
+    },
+    "total": 9
+  },
+  "requirement_test_matrix": [
+    {
+      "requirement_id": "source-integrity-and-correct-tests",
+      "public_contract": "production dependency_planner files remain byte-identical and candidate tests pass on correct source",
+      "criterion_ids": ["generated-tests"],
+      "hidden_evidence": [
+        "hidden_tests/validate_generated_tests.py",
+        "hidden_tests/expected_source/dependency_planner/planner.py",
+        "hidden_tests/expected_source/dependency_planner/validation.py"
+      ],
+      "out_of_scope": "exact test names, fixtures, or assertion style"
+    },
+    {
+      "requirement_id": "graph-contract-sensitivity",
+      "public_contract": "tests distinguish cycles, unknown dependencies, duplicates, dependency direction, disconnected tasks, and input mutation",
+      "criterion_ids": ["generated-tests"],
+      "hidden_evidence": [
+        "hidden_tests/mutants/accepts_cycle/planner.py",
+        "hidden_tests/mutants/accepts_unknown_dependency/validation.py",
+        "hidden_tests/mutants/accepts_duplicate_names/validation.py",
+        "hidden_tests/mutants/reverses_dependency_order/planner.py",
+        "hidden_tests/mutants/drops_disconnected_tasks/planner.py",
+        "hidden_tests/mutants/mutates_input/planner.py"
+      ],
+      "out_of_scope": "general mutation score or performance"
+    },
+    {
+      "requirement_id": "existing-test-regression",
+      "public_contract": "all repository tests continue to pass on the correct implementation",
+      "criterion_ids": ["regression-tests"],
+      "hidden_evidence": [
+        "hidden_tests/expected_source/dependency_planner/__init__.py"
+      ],
+      "out_of_scope": "production behavior changes"
+    },
+    {
+      "requirement_id": "critical-branch-coverage",
+      "public_contract": "new tests execute validation and cycle-handling branches beyond the pristine suite",
+      "criterion_ids": ["coverage-threshold"],
+      "hidden_evidence": [
+        "hidden_tests/validate_coverage.py"
+      ],
+      "out_of_scope": "project-wide line coverage as a quality score"
+    }
+  ],
+  "alternative_patch": "authoring/alternative.patch",
+  "wrong_patch_probes": [
+    {
+      "id": "wrong-misses-cycle",
+      "patch": "authoring/wrong-misses-cycle.patch",
+      "expected_failing_groups": ["generated_tests"]
+    },
+    {
+      "id": "wrong-misses-unknown",
+      "patch": "authoring/wrong-misses-unknown.patch",
+      "expected_failing_groups": ["generated_tests"]
+    },
+    {
+      "id": "wrong-misses-duplicates",
+      "patch": "authoring/wrong-misses-duplicates.patch",
+      "expected_failing_groups": ["generated_tests"]
+    },
+    {
+      "id": "wrong-misses-disconnected",
+      "patch": "authoring/wrong-misses-disconnected.patch",
+      "expected_failing_groups": ["generated_tests"]
+    }
+  ],
+  "forbidden_public_markers": [
+    "KAMA_BENCH_METRICS_V1",
+    "accepts_cycle",
+    "accepts_unknown_dependency",
+    "accepts_duplicate_names",
+    "reverses_dependency_order",
+    "drops_disconnected_tasks",
+    "mutates_input"
+  ],
+  "forbidden_issue_markers": [
+    "validate_generated_tests.py",
+    "validate_coverage.py",
+    "expected_source",
+    "mutants/"
+  ],
+  "environment_file": "environment.json",
+  "determinism_runs": 3,
+  "security": {
+    "trusted_fixture": true,
+    "offline": true,
+    "data_flow_isolation_only": true,
+    "process_isolation_is_sandbox": false
+  }
+}

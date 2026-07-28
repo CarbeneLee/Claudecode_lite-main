@@ -1,0 +1,11 @@
+diff --git a/configkit/merge.py b/configkit/merge.py
+--- a/configkit/merge.py
++++ b/configkit/merge.py
+@@ -8,6 +8,6 @@ def merge_layers(
+     resolved = dict(defaults)
+     for layer in overrides:
+         for key, value in layer.items():
+-            if value:
++            if value or (key == "timeout_s" and value == 0):
+                 resolved[key] = value
+     return resolved

@@ -1,0 +1,6 @@
+{
+  "id": "feature-atomic-bulk-import",
+  "goal": "Add a public ImportSummary model and import_orders(store, rows) API. Parse rows with the existing order parser and return the imported count plus order IDs in input order. The import must be atomic: if any row is invalid, an ID is duplicated within the batch or already exists, or a store write fails, leave the store exactly unchanged. An empty batch succeeds with an empty summary. Preserve the existing single-order API.",
+  "workspace_fixture": "public/workspace",
+  "timeout_s": 180.0
+}

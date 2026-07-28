@@ -1,0 +1,7 @@
+{
+  "dependencies": ["pytest"],
+  "network": "disabled",
+  "python": "3.12",
+  "schema_version": 1,
+  "test_command": ["python", "-m", "pytest", "-q"]
+}

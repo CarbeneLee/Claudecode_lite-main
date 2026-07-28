@@ -1,0 +1,6 @@
+{
+  "id": "bugfix-subtract",
+  "goal": "Fix calculator.subtract so it returns left minus right. Preserve add and multiply behavior, and run the tests.",
+  "workspace_fixture": "public/workspace",
+  "timeout_s": 120.0
+}

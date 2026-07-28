@@ -1,0 +1,6 @@
+{
+  "id": "testgen-dependency-planner",
+  "goal": "Add a comprehensive test suite for the documented dependency_planner behavior. Tests must cover dependency ordering, stable input-order ties, disconnected tasks, duplicate names, unknown dependencies, cycles, and caller-input immutability. Production source under dependency_planner/ must remain unchanged. Keep all existing tests passing.",
+  "workspace_fixture": "public/workspace",
+  "timeout_s": 180.0
+}

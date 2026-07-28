@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "suite_id": "kama-coding-mvp",
+  "suite_version": 1,
+  "runtime_suite": "kama-coding-mvp-v1.json",
+  "suite_hash": "6e1b554df12962fc454a5b61c6e6145bd022041ec77b24149d73bd616e6044d7",
+  "task_hash_algorithm": "sha256-path-content-v1",
+  "grader_hash_algorithm": "sha256-path-content-v1",
+  "reference_hash_algorithm": "sha256-bytes-v1",
+  "review_status": "frozen_for_first_real_baseline",
+  "tasks": [
+    {
+      "task_id": "bugfix-subtract",
+      "task_version": 1,
+      "category": "bug_fixing",
+      "difficulty": "easy",
+      "task_hash": "f9bd33017d1bdf34de1b1508615750f168e8cc7671f4667d7ba2e55539b7543b",
+      "grader_hash": "8e459f83d27b05ab8ee78b4c727612b7713114b3057c71a5509896de42667680",
+      "reference_hash": "f83d918f1b7f16566628613179320187e10d38d127f1563da54d446b3539e0ff"
+    },
+    {
+      "task_id": "feature-low-stock",
+      "task_version": 1,
+      "category": "feature_implementation",
+      "difficulty": "easy",
+      "task_hash": "73500f46c66498ee0b7552bd9623294d152c422e7e58e7379dd554001ea21263",
+      "grader_hash": "1d2c46b9921882394e8073b2e3039fb413da6f7588e20dbcc1794567b79858d7",
+      "reference_hash": "bf730e0ed6af1f4d7cf4b89adec11fbf6061ce90e5d81d3af416ca2500988524"
+    },
+    {
+      "task_id": "testgen-normalize-username",
+      "task_version": 1,
+      "category": "test_generation",
+      "difficulty": "easy",
+      "task_hash": "af74ab5ac8650607709122a7b5b2bbdb494a548b169207256ebcc120725e83b7",
+      "grader_hash": "3b20371e5afcb3d93d95d30024e9ba1b8ea358ff647498c031eb016e34f9b3c5",
+      "reference_hash": "6ca045b11badfcb44aaebb3d8b0228d96d918f2d93ebd0c5d64d1d00c600ec6c"
+    },
+    {
+      "task_id": "bugfix-config-precedence",
+      "task_version": 1,
+      "category": "bug_fixing",
+      "difficulty": "medium",
+      "task_hash": "c240f06cde3d27cf09656fd65585c520f0305efddde6ae55de9a009178a96da6",
+      "grader_hash": "44472f050af00fa089f54c04125e791947662ecbdc8e37fbf2c8aa295fc8aadc",
+      "reference_hash": "f5604bd207a01cf1b53843c2f788ac635380d99f106c2324fb41ade2892afa05"
+    },
+    {
+      "task_id": "feature-atomic-bulk-import",
+      "task_version": 1,
+      "category": "feature_implementation",
+      "difficulty": "medium",
+      "task_hash": "ddf08fa5185029e5f187525b4f108a3beac5f426042d372b65c3d2208efe870c",
+      "grader_hash": "0730394e84f227930101908bc966eefdc42e9d3150298af21ffe1f026f3a5e9a",
+      "reference_hash": "78501d5b3c6cedb65c7e299e46908c6bc5c51ae8b7bbc6cf2724104eb5fae4cb"
+    },
+    {
+      "task_id": "testgen-quoted-query-parser",
+      "task_version": 1,
+      "category": "test_generation",
+      "difficulty": "medium",
+      "task_hash": "5b507ab9bcf2640d3c23733b94fb0ebecff84dc57cabb5bc89f2093071cc16ff",
+      "grader_hash": "6c632b7b36860f5ddeeaead761863c2528fc676fdcb542ebe69443654fb0e252",
+      "reference_hash": "7a894c412d76d6a181c5b3273a67a10913f631314ddb0feee7c2898834f90412"
+    },
+    {
+      "task_id": "bugfix-retry-state-idempotency",
+      "task_version": 1,
+      "category": "bug_fixing",
+      "difficulty": "challenging",
+      "task_hash": "3bf231b74396714b5138a5e1242a2b752f2ee6f64ccd9de3d3fd42e1eca3e382",
+      "grader_hash": "b58244bf716f98d34251fc2ffdd45296bc4e1c9a748793d3f7a135d59b75ecb8",
+      "reference_hash": "b30a7ae8e2e8b420f4e60616f4cb11e8f1d494a440b1d7192bed88665a73784b"
+    },
+    {
+      "task_id": "feature-inventory-reservation-lifecycle",
+      "task_version": 1,
+      "category": "feature_implementation",
+      "difficulty": "challenging",
+      "task_hash": "cbb9fd08b92170a6408dca2264da92450b80519e6e016e9241afbc76a15de334",
+      "grader_hash": "ec74c160cc4cff70bf9f6ceb9c678a05bb5238b318cca634d71eb26fc9b89107",
+      "reference_hash": "8a3de2f364df0ada70a3882eaea3d478ba1b5652a8f332cd55a1499f36f97c94"
+    },
+    {
+      "task_id": "testgen-dependency-planner",
+      "task_version": 1,
+      "category": "test_generation",
+      "difficulty": "challenging",
+      "task_hash": "9743ca7221b771b00f926cfa5787a5036332f2389fb61169ec034e74df2417b7",
+      "grader_hash": "3e9da05ae878e49f16c35391ed8d0ad46b2caa9f89dda51a954cc50feecbbf2a",
+      "reference_hash": "10a69d5f2e7b55db6dbab0c26f3ef327895aafd342eed60ae2a5fab8fed25c56"
+    }
+  ]
+}

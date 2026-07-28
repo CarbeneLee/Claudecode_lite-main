@@ -1,0 +1,34 @@
+diff --git a/retryjobs/models.py b/retryjobs/models.py
+index ef15d0d..ce9134d 100644
+--- a/retryjobs/models.py
++++ b/retryjobs/models.py
+@@ -19,3 +19,8 @@ class Job:
+     # 判断任务是否已经进入不可继续执行的终态
+     def is_terminal(self) -> bool:
+         return self.state in {JobState.SUCCEEDED, JobState.FAILED}
++
++    # 记录一次即将发生的执行并推进运行状态
++    def begin_attempt(self) -> None:
++        self.attempts += 1
++        self.state = JobState.RUNNING
+diff --git a/retryjobs/scheduler.py b/retryjobs/scheduler.py
+index d102da4..689caeb 100644
+--- a/retryjobs/scheduler.py
++++ b/retryjobs/scheduler.py
+@@ -27,7 +27,7 @@ class JobScheduler:
+             return job
+ 
+         while job.attempts < self._policy.max_attempts:
+-            job.state = JobState.RUNNING
++            job.begin_attempt()
+             result = self._executor.execute(job.job_id)
+             if result.success:
+                 job.state = JobState.SUCCEEDED
+@@ -36,7 +36,6 @@ class JobScheduler:
+                 self._store.save(job)
+                 return job
+ 
+-            job.attempts += 1
+             job.last_error = result.error
+             if not result.retryable or job.attempts >= self._policy.max_attempts:
+                 job.state = JobState.FAILED

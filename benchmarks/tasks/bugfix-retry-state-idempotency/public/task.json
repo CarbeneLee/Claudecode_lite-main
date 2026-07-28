@@ -1,0 +1,6 @@
+{
+  "id": "bugfix-retry-state-idempotency",
+  "goal": "Fix retry job execution so attempts count every executor invocation and job state remains consistent. A retryable failure may retry only up to the configured maximum; a permanent failure must stop immediately. A later success commits its effect once. Running an already terminal job again must be idempotent, and one job must not affect another. Preserve existing successful execution behavior.",
+  "workspace_fixture": "public/workspace",
+  "timeout_s": 180.0
+}

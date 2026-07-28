@@ -31,6 +31,18 @@ from kama_claude.core.tools.builtin.write_file import WriteFileTool
 from kama_claude.core.tools.invocation import invoke_tool
 from kama_claude.core.tools.registry import ToolRegistry
 
+_REQUIREMENT_CONTRACT = (
+    "Before changing the workspace, create a concise requirement contract from every "
+    "explicit acceptance criterion. For each item, record the required observable "
+    "behavior, relevant failure or invalid-input behavior, any side-effect or state "
+    "invariant, and the evidence you plan to use for verification. Keep this checklist "
+    "visible in the conversation as you work, and update each item as implemented, "
+    "verified, or unchecked. Before finishing, review every item. Do not assume unchecked "
+    "items are complete: verify them when possible, otherwise clearly report the "
+    "limitation. Keep the contract brief and auditable; do not expose private "
+    "chain-of-thought or force any particular tool."
+)
+
 
 def _make_provider(result_text: str = "child done") -> Any:
     provider = AsyncMock()
@@ -290,6 +302,27 @@ async def test_subagents_isolate_profile_and_context_by_workspace(tmp_path: Path
     assert "context-b" in systems[1]
     assert "profile-a" not in systems[1]
     assert "context-a" not in systems[1]
+    assert _REQUIREMENT_CONTRACT not in systems[0]
+    assert _REQUIREMENT_CONTRACT not in systems[1]
+
+
+# 功能：验证未指定 profile 的 subagent 继承默认 requirement-contract prompt
+# 设计：执行真实前台 child loop 并捕获 provider system，区别于 profile override 的完全替换路径
+async def test_unprofiled_subagent_inherits_requirement_contract(tmp_path: Path) -> None:
+    provider = _make_provider()
+    tool, _, _ = _make_tool(tmp_path, provider)
+
+    result = await tool.invoke(
+        {
+            "description": "inspect requirements",
+            "prompt": "Implement behavior A and preserve invariant B.",
+        }
+    )
+
+    assert result.is_error is False
+    system = provider.chat.await_args.kwargs["system"]
+    assert isinstance(system, str)
+    assert system.count(_REQUIREMENT_CONTRACT) == 1
 
 
 # 功能：验证 subagent 模块不保留绑定项目目录的全局 profile loader
