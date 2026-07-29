@@ -276,8 +276,11 @@ class AgentRunner:
             if not context.is_done():
                 context.mark_failed("cancelled")
         except Exception:
-            logging.getLogger(__name__).exception(
-                "agent run failed run_id=%s step=%d", run_id, context.step
+            logging.getLogger(__name__).error(
+                "agent run failed run_id=%s step=%d "
+                "failure_role=primary failure_category=propagated_exception",
+                run_id,
+                context.step,
             )
             if not context.is_done():
                 context.mark_failed("llm_error")

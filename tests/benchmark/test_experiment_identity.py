@@ -107,6 +107,34 @@ class _Phase9BScriptedProvider:
         return LlmResponse(stop_reason="end_turn", text="done")
 
 
+class _Phase9CErrorProvider:
+    # 初始化failed worker收到的system prompt观测列表
+    def __init__(self) -> None:
+        self.seen_systems: list[str | None] = []
+
+    # 发布合法model identity后抛出稳定本地异常且不读取credential
+    async def chat(
+        self,
+        messages: list[dict[str, object]],
+        tool_schemas: list[dict[str, object]],
+        bus: EventBus,
+        run_id: str,
+        *,
+        step: int = 0,
+        system: str | None = None,
+    ) -> LlmResponse:
+        self.seen_systems.append(system)
+        await bus.publish(
+            LlmModelSelectedEvent(
+                run_id=run_id,
+                model="deepseek-v4-pro",
+                strategy="static",
+                ts="2026-07-29T00:00:00+00:00",
+            )
+        )
+        raise RuntimeError("local provider failure")
+
+
 # 创建只含冻结 baseline 行为与公开 identity hash 的合法 experiment profile
 def _profile_payload() -> dict[str, object]:
     return {
@@ -1063,6 +1091,82 @@ async def test_default_benchmark_worker_inherits_state_transition_protocol(
         match="prompt_hash",
     ):
         experiment.require_identity_match(mismatched, observed)
+
+
+# 功能：验证failed/llm_error complete run仍可通过declared/observed identity核验
+# 设计：复用真实worker、Runner、TracingProvider与journal，只把远端provider替换为本地error seam
+@pytest.mark.asyncio
+async def test_provider_error_worker_preserves_experiment_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment = _experiment_module()
+    repository_root = Path(__file__).resolve().parents[2]
+    profile_path = repository_root / "benchmarks" / "experiments" / _PHASE9C_PROFILE
+    loaded = experiment.load_experiment_profile(profile_path)
+    declared = experiment.capture_declared_identity(
+        loaded,
+        repository_root=repository_root,
+        repository=experiment.RepositoryIdentity(commit="c" * 40, dirty=False),
+        installed_sdk_version="0.111.0",
+    )
+    config = KamaConfig()
+    config.agent.max_steps = loaded.profile.runtime.max_steps
+    config.llm.default_model = loaded.profile.provider.model_id
+    config.llm.router = loaded.profile.runtime.router
+    config.trace.enabled = loaded.profile.runtime.trace_enabled
+    config.trace.include_llm_payload = loaded.profile.runtime.include_llm_payload
+    config.compaction.auto_threshold = loaded.profile.runtime.compaction_threshold
+    config.compaction.tool_result_limit = loaded.profile.runtime.tool_result_limit
+    config.compaction.tool_result_keep = loaded.profile.runtime.tool_result_keep
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", loaded.profile.provider.endpoint)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    attempt_root = tmp_path / "failed-attempt"
+    runtime_dir = attempt_root / "runtime"
+    workspace = attempt_root / "workspace"
+    runtime_dir.mkdir(parents=True)
+    workspace.mkdir()
+    runs_dir = attempt_root / "runs"
+    request = WorkerRequest(
+        task_id="phase9c-provider-error",
+        run_id="phase9c-provider-error-run",
+        goal="Fail locally after recording identity.",
+        workspace=str(workspace.resolve()),
+        runs_dir=str(runs_dir.resolve()),
+        trace_path=str((runtime_dir / "trace.jsonl").resolve()),
+    )
+    provider = _Phase9CErrorProvider()
+
+    # 只在provider seam注入本地异常，保留production worker wiring
+    def runner_factory(config: KamaConfig, **kwargs: object) -> AgentRunner:
+        return AgentRunner(config, provider=provider, **kwargs)  # type: ignore[arg-type]
+
+    result = await execute_request(
+        request,
+        runner_factory=runner_factory,
+        config_loader=lambda: config,
+    )
+    shutil.copyfile(
+        runs_dir / request.run_id / "events.v2.jsonl",
+        runtime_dir / "events.v2.jsonl",
+    )
+    observed = experiment.collect_observed_identity(attempt_root)
+    verification = experiment.verify_declared_observed(declared, observed)
+
+    assert result.runtime_status == "failed"
+    assert result.reason == "llm_error"
+    assert len(provider.seen_systems) == 1
+    assert provider.seen_systems[0] is not None
+    assert verification.valid is True
+    assert verification.mismatches == []
+    assert observed.prompt_hash == _PHASE9C_PROMPT_HASH
+    assert observed.tool_schema_hash == _FROZEN_TOOL_SCHEMA_HASH
+    assert observed.runtime_config_hash == _FROZEN_RUNTIME_CONFIG_HASH
+    assert observed.api_call_count == 1
+    assert observed.model_event_ids == ["deepseek-v4-pro"]
+    experiment.require_identity_match(declared, observed)
 
 
 # 功能：验证 artifact policy 拒绝 repository 内路径与已存在输出，只接受全新的外部目录
