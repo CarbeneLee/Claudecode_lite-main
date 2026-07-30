@@ -6,14 +6,41 @@ from typing import Any, cast
 import pytest
 
 from kama_claude.core.bus.envelope import HandlerError
+from kama_claude.core.config import KamaConfig
 from kama_claude.core.events.bus import EventBus
-from kama_claude.core.runner import RunOutcome
+from kama_claude.core.llm.types import LlmResponse
+from kama_claude.core.runner import AgentRunner, RunOutcome
 from kama_claude.core.session.manager import SESSION_CLOSED, SESSION_NOT_FOUND, SessionManager
 from kama_claude.core.session.model import Session
 from kama_claude.core.session.store import SessionStore
 
+_REQUIREMENT_CONTRACT = (
+    "Before changing the workspace, create a concise requirement contract from every "
+    "explicit acceptance criterion. For each item, record the required observable "
+    "behavior, relevant failure or invalid-input behavior, any side-effect or state "
+    "invariant, and the evidence you plan to use for verification. Keep this checklist "
+    "visible in the conversation as you work, and update each item as implemented, "
+    "verified, or unchecked. Before finishing, review every item. Do not assume unchecked "
+    "items are complete: verify them when possible, otherwise clearly report the "
+    "limitation. Keep the contract brief and auditable; do not expose private "
+    "chain-of-thought or force any particular tool."
+)
+_STATE_TRANSITION_PROTOCOL = (
+    "When a task changes persistent or shared state through multiple operations, briefly "
+    "map the pre-state, each mutation point, every later operation that can fail, and the "
+    "required post-state after success or failure. Before finishing, exercise at least "
+    "one failure after an earlier mutation succeeds, and verify that rollback or "
+    "compensation preserves the stated invariant. Do not apply this protocol to tasks "
+    "without multi-step side effects."
+)
+
 
 class _Runner:
+    # 初始化 prompt override 与 goal 观测记录
+    def __init__(self) -> None:
+        self.seen_goals: list[str] = []
+        self.seen_system_prompt_overrides: list[str | None] = []
+
     # 模拟 AgentRunner，将 run 新消息写入 thread 后返回成功
     async def run_and_capture(
         self,
@@ -28,6 +55,8 @@ class _Runner:
         assert run_id is not None
         assert session is not None
         assert store is not None
+        self.seen_goals.append(goal)
+        self.seen_system_prompt_overrides.append(system_prompt_override)
         store.append_messages(
             session.id,
             [{"role": "assistant", "content": [{"type": "text", "text": f"done {goal}"}]}],
@@ -56,6 +85,28 @@ class _RecordingJournal:
     ) -> object:
         self.order.append(f"register:run:{run_id}:{session_id}")
         return object()
+
+
+class _SessionPromptProvider:
+    # 初始化正常 session run 的真实 LLM 输入观测
+    def __init__(self) -> None:
+        self.messages: list[dict[str, object]] = []
+        self.system: str | None = None
+
+    # 捕获 AgentRunner 传入的真实 session messages 与 system 后本地结束
+    async def chat(
+        self,
+        messages: list[dict[str, object]],
+        tool_schemas: list[dict[str, object]],
+        bus: EventBus,
+        run_id: str,
+        *,
+        step: int = 0,
+        system: str | None = None,
+    ) -> LlmResponse:
+        self.messages = [dict(message) for message in messages]
+        self.system = system
+        return LlmResponse(stop_reason="end_turn", text="done")
 
 
 # 功能：验证 create 会创建 active session、写入 meta 并发布 session.created 事件
@@ -142,6 +193,70 @@ async def test_run_stream_registers_before_skill_invoked_event(tmp_path: Path) -
     assert order.index(f"register:run:{run_id}:{session.id}") < order.index(
         "event:skill.invoked"
     )
+
+
+# 功能：验证正常 session 通过真实 Runner/Loop 各继承一次 v1 与 v2
+# 设计：仅在 provider seam 使用本地 fake，保留 SessionManager、AgentRunner 与 AgentLoop 的真实组合路径
+async def test_normal_session_inherits_v1_and_v2(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = _SessionPromptProvider()
+    config = KamaConfig()
+    config.agent.max_steps = 2
+    store = SessionStore(tmp_path / "sessions")
+
+    # 为 SessionManager 构造真实 AgentRunner，仅替换外部 provider
+    def runner_factory(workspace_root: Path) -> AgentRunner:
+        return AgentRunner(
+            config,
+            workspace_root=workspace_root,
+            provider=provider,  # type: ignore[arg-type]
+            runs_dir=tmp_path / "runs",
+        )
+
+    manager = SessionManager(store, runner_factory, EventBus())
+    session = await manager.create("chat", workspace_root=workspace.resolve())
+
+    await manager.send_message(session.id, "Implement behavior A.")
+
+    assert provider.messages == [{"role": "user", "content": "Implement behavior A."}]
+    assert provider.system is not None
+    assert provider.system.count(_REQUIREMENT_CONTRACT) == 1
+    assert provider.system.count(_STATE_TRANSITION_PROTOCOL) == 1
+
+
+# 功能：验证 slash skill 传入的 system prompt override 不包含 default v1/v2
+# 设计：让 SessionManager 解析真实项目 skill，并由 recording runner 检查 override 的完整字节
+async def test_slash_skill_override_excludes_default_v1_and_v2(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    skill_dir = workspace / ".kama" / "skills"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "custom.md").write_text(
+        "---\nname: custom\ndescription: custom\n---\nCustom override $ARGUMENTS\n",
+        encoding="utf-8",
+    )
+    runner = _Runner()
+    manager = SessionManager(
+        SessionStore(tmp_path / "sessions"),
+        lambda _workspace_root: runner,  # type: ignore[arg-type]
+        EventBus(),
+    )
+    session = await manager.create("chat", workspace_root=workspace.resolve())
+
+    await manager.send_message(session.id, "/custom alpha")
+
+    assert runner.seen_goals == ["Custom override alpha"]
+    assert runner.seen_system_prompt_overrides == ["Custom override $ARGUMENTS"]
+    override = runner.seen_system_prompt_overrides[0]
+    assert override is not None
+    assert _REQUIREMENT_CONTRACT not in override
+    assert _STATE_TRANSITION_PROTOCOL not in override
 
 
 # 功能：验证 chat session 处理一条消息后进入 waiting_for_input，并保留 user/assistant thread

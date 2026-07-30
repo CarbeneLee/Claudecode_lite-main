@@ -9,8 +9,14 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 
+from kama_claude.core.bus.events import (
+    LlmModelSelectedEvent,
+    StepFinishedEvent,
+    ToolCallStartedEvent,
+)
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.events.bus import EventBus
+from kama_claude.core.events.journal import EventJournalCoordinator
 from kama_claude.core.events.writer import EventWriter
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
 from kama_claude.core.loop import AgentLoop
@@ -22,6 +28,7 @@ from kama_claude.core.tools.builtin.list_dir import ListDirTool
 from kama_claude.core.tools.builtin.read_file import ReadFileTool
 from kama_claude.core.tools.builtin.search_code import SearchCodeTool
 from kama_claude.core.tools.builtin.write_file import WriteFileTool
+from kama_claude.eval.graders import grade_trace
 
 # --- mock provider -----------------------------------------------------------
 
@@ -84,6 +91,29 @@ class _CapturingProvider:
         self.messages = [dict(m) for m in messages]
         self.system = system
         return self.response
+
+
+class _ModelThenErrorProvider:
+    # 发布稳定model identity后抛出无网络provider异常
+    async def chat(
+        self,
+        messages: list[dict[str, object]],
+        tool_schemas: list[dict[str, object]],
+        bus: EventBus,
+        run_id: str,
+        *,
+        step: int = 0,
+        system: str | None = None,
+    ) -> LlmResponse:
+        await bus.publish(
+            LlmModelSelectedEvent(
+                run_id=run_id,
+                model="local-test-model",
+                strategy="static",
+                ts="2026-07-29T00:00:00+00:00",
+            )
+        )
+        raise RuntimeError("local provider failure")
 
 
 # --- helpers -----------------------------------------------------------------
@@ -598,6 +628,423 @@ def _read_v2_events(path: Path) -> list[dict[str, Any]]:
         json.loads(line)["event"]
         for line in path.read_text(encoding="utf-8").splitlines()
     ]
+
+
+# 功能：验证provider异常run在真实Runner与journal中先闭合step再发布failed terminal
+# 设计：provider发布model event后抛错，读取真实v2 journal并交给complete grader验证精确序列
+async def test_provider_error_persists_complete_failed_lifecycle(
+    tmp_path: Path,
+) -> None:
+    run_id = "run-provider-error"
+    runs_dir = tmp_path / "runs"
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        provider=_ModelThenErrorProvider(),  # type: ignore[arg-type]
+        runs_dir=runs_dir,
+    )
+
+    outcome = await runner.run_and_capture("fail locally", run_id=run_id)
+    journal_path = runs_dir / run_id / "events.v2.jsonl"
+    events = _read_v2_events(journal_path)
+    grade = grade_trace(journal_path, expected_run_id=run_id)
+
+    assert [event["type"] for event in events] == [
+        "run.started",
+        "step.started",
+        "llm.model_selected",
+        "step.finished",
+        "run.finished",
+    ]
+    assert events[-1]["status"] == "failed"
+    assert events[-1]["reason"] == "llm_error"
+    assert events[-1]["steps"] == 1
+    assert outcome.status == "failed"
+    assert outcome.reason == "llm_error"
+    assert grade.passed is True
+    assert grade.errors == []
+
+
+# 功能：验证无primary的step delivery failure阻止Runner提交success并保留fail-closed journal
+# 设计：end_turn先形成pending success，再由journal前subscriber破坏finish，检查最终outcome与真实grader
+async def test_step_delivery_failure_prevents_runner_success(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    run_id = "run-step-delivery-failure"
+    runs_dir = tmp_path / "runs"
+    bus = EventBus()
+    attempts = 0
+    finalizer_sentinel = "FINALIZER_ONLY_SECRET_SENTINEL_DO_NOT_LOG"
+
+    # 只阻断step terminal到达journal，允许Runner terminal继续持久化
+    async def fail_before_journal(event: BaseModel) -> None:
+        nonlocal attempts
+        if not isinstance(event, StepFinishedEvent):
+            return
+        attempts += 1
+        raise RuntimeError(finalizer_sentinel)
+
+    bus.subscribe(fail_before_journal)
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        bus=bus,
+        provider=_EndTurnProvider(),  # type: ignore[arg-type]
+        runs_dir=runs_dir,
+    )
+
+    outcome = await runner.run_and_capture("finish locally", run_id=run_id)
+    journal_path = runs_dir / run_id / "events.v2.jsonl"
+    events = _read_v2_events(journal_path)
+    grade = grade_trace(journal_path, expected_run_id=run_id)
+    runner_records = [
+        record for record in caplog.records if record.name == "kama_claude.core.runner"
+    ]
+
+    assert attempts == 1
+    assert outcome.status == "failed"
+    assert outcome.result == ""
+    assert outcome.reason == "llm_error"
+    assert [event["type"] for event in events] == [
+        "run.started",
+        "step.started",
+        "run.finished",
+    ]
+    assert events[-1]["status"] == "failed"
+    assert events[-1]["reason"] == "llm_error"
+    assert grade.passed is False
+    assert grade.errors == ["run finished with open step"]
+    assert len(runner_records) == 1
+    assert runner_records[0].getMessage() == (
+        "agent run failed run_id=run-step-delivery-failure step=1 "
+        "failure_role=primary failure_category=propagated_exception"
+    )
+    assert runner_records[0].exc_info is None
+    assert runner_records[0].exc_text in (None, "")
+    assert finalizer_sentinel not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "RuntimeError" not in caplog.text
+    assert str(Path(__file__).resolve()) not in caplog.text
+
+
+# 功能：验证provider primary遇到step delivery secondary时保持llm_error且grader对缺帧fail closed
+# 设计：把失败subscriber注册在Runner自有journal之前，组合验证primary优先级、单次发布和真实持久化证据
+async def test_provider_primary_with_step_delivery_failure_fails_trace_closed(
+    tmp_path: Path,
+) -> None:
+    run_id = "run-provider-primary-step-secondary"
+    runs_dir = tmp_path / "runs"
+    bus = EventBus()
+    attempts = 0
+
+    # 只在step terminal阻断后续journal subscriber，保留其他事件与run terminal持久化
+    async def fail_before_journal(event: BaseModel) -> None:
+        nonlocal attempts
+        if not isinstance(event, StepFinishedEvent):
+            return
+        attempts += 1
+        raise RuntimeError("secondary step delivery failure")
+
+    bus.subscribe(fail_before_journal)
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        bus=bus,
+        provider=_ModelThenErrorProvider(),  # type: ignore[arg-type]
+        runs_dir=runs_dir,
+    )
+
+    outcome = await runner.run_and_capture("fail locally", run_id=run_id)
+    journal_path = runs_dir / run_id / "events.v2.jsonl"
+    events = _read_v2_events(journal_path)
+    grade = grade_trace(journal_path, expected_run_id=run_id)
+
+    assert attempts == 1
+    assert outcome.status == "failed"
+    assert outcome.reason == "llm_error"
+    assert [event["type"] for event in events] == [
+        "run.started",
+        "step.started",
+        "llm.model_selected",
+        "run.finished",
+    ]
+    assert events[-1]["status"] == "failed"
+    assert events[-1]["reason"] == "llm_error"
+    assert grade.passed is False
+    assert grade.errors == ["run finished with open step"]
+
+
+# 功能：验证tool-path普通异常与step delivery失败组合时Runner仍映射llm_error且grader fail closed
+# 设计：在真实ToolCallStartedEvent与StepFinishedEvent上依次抛primary/secondary，读取真实journal
+async def test_tool_path_primary_with_step_delivery_failure_fails_trace_closed(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    run_id = "run-tool-primary-step-secondary"
+    runs_dir = tmp_path / "runs"
+    bus = EventBus()
+    primary = RuntimeError("TOOL_PRIMARY_SENTINEL_DO_NOT_LOG")
+    secondary = RuntimeError("FINALIZER_SECRET_SENTINEL_DO_NOT_LOG")
+    finish_attempts = 0
+
+    # 先在真实tool invocation事件抛primary，再在唯一step terminal抛secondary
+    async def fail_tool_and_step(event: BaseModel) -> None:
+        nonlocal finish_attempts
+        if isinstance(event, ToolCallStartedEvent):
+            raise primary
+        if isinstance(event, StepFinishedEvent):
+            finish_attempts += 1
+            raise secondary
+
+    bus.subscribe(fail_tool_and_step)
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        bus=bus,
+        provider=_LoopingProvider(),  # type: ignore[arg-type]
+        runs_dir=runs_dir,
+    )
+
+    outcome = await runner.run_and_capture("fail in tool path", run_id=run_id)
+    journal_path = runs_dir / run_id / "events.v2.jsonl"
+    events = _read_v2_events(journal_path)
+    grade = grade_trace(journal_path, expected_run_id=run_id)
+    await asyncio.sleep(0)
+    orphan_publications = [
+        task
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+        and not task.done()
+        and task.get_coro().__qualname__ == "EventBus.publish"
+    ]
+    runner_records = [
+        record for record in caplog.records if record.name == "kama_claude.core.runner"
+    ]
+
+    assert finish_attempts == 1
+    assert outcome.status == "failed"
+    assert outcome.result == ""
+    assert outcome.reason == "llm_error"
+    assert [event["type"] for event in events] == [
+        "run.started",
+        "step.started",
+        "run.finished",
+    ]
+    assert events[-1]["status"] == "failed"
+    assert events[-1]["reason"] == "llm_error"
+    assert grade.passed is False
+    assert grade.errors == ["run finished with open step"]
+    assert orphan_publications == []
+    assert len(runner_records) == 1
+    assert runner_records[0].getMessage() == (
+        "agent run failed run_id=run-tool-primary-step-secondary step=1 "
+        "failure_role=primary failure_category=propagated_exception"
+    )
+    assert runner_records[0].exc_info is None
+    assert runner_records[0].exc_text in (None, "")
+    assert "TOOL_PRIMARY_SENTINEL_DO_NOT_LOG" not in caplog.text
+    assert "FINALIZER_SECRET_SENTINEL_DO_NOT_LOG" not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "RuntimeError" not in caplog.text
+    assert str(Path(__file__).resolve()) not in caplog.text
+
+
+# 功能：验证finalizer期间取消会完成同一次journal publication再发布cancelled run terminal
+# 设计：把阻塞subscriber注册在journal之前，取消Runner后释放，确保shield而非subscriber顺序保护生命周期
+async def test_finalizer_cancellation_finishes_step_before_run_terminal(
+    tmp_path: Path,
+) -> None:
+    run_id = "run-finalizer-cancel"
+    runs_dir = tmp_path / "runs"
+    bus = EventBus()
+    journal = EventJournalCoordinator()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    completed = asyncio.Event()
+    attempts = 0
+
+    # 在journal之前阻塞step terminal，制造publication尚未到达durable subscriber的窗口
+    async def block_before_journal(event: BaseModel) -> None:
+        nonlocal attempts
+        if not isinstance(event, StepFinishedEvent):
+            return
+        attempts += 1
+        entered.set()
+        await release.wait()
+        completed.set()
+
+    bus.subscribe(block_before_journal)
+    bus.subscribe(journal.handle)
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        bus=bus,
+        provider=_EndTurnProvider(),  # type: ignore[arg-type]
+        runs_dir=runs_dir,
+        journal=journal,
+    )
+    observed_in_runner: asyncio.CancelledError | None = None
+
+    # 保存Runner边界传播出的取消对象供外层做identity比较
+    async def observe_runner_cancellation() -> None:
+        nonlocal observed_in_runner
+        try:
+            await runner.run_and_capture("cancel finalizer", run_id=run_id)
+        except asyncio.CancelledError as exc:
+            observed_in_runner = exc
+            raise
+
+    task = asyncio.create_task(observe_runner_cancellation())
+    await entered.wait()
+    task.cancel("cancel-finalizer-runner")
+    await asyncio.sleep(0)
+    release.set()
+
+    try:
+        await task
+    except asyncio.CancelledError as caught:
+        observed_by_caller = caught
+    else:
+        raise AssertionError("runner cancellation did not propagate")
+    await journal.flush_all()
+    await journal.close()
+
+    journal_path = runs_dir / run_id / "events.v2.jsonl"
+    events = _read_v2_events(journal_path)
+    grade = grade_trace(journal_path, expected_run_id=run_id)
+
+    assert attempts == 1
+    assert completed.is_set()
+    assert observed_in_runner is observed_by_caller
+    assert observed_by_caller.args == ("cancel-finalizer-runner",)
+    assert [event["type"] for event in events] == [
+        "run.started",
+        "step.started",
+        "step.finished",
+        "run.finished",
+    ]
+    assert events[-1]["status"] == "failed"
+    assert events[-1]["reason"] == "cancelled"
+    assert events[-1]["steps"] == 1
+    assert grade.passed is True
+    assert grade.errors == []
+
+
+# 功能：验证finalizer阻塞期间重复取消仍复用一次publication并传播provider捕获的首个对象
+# 设计：真实Runner/journal链路执行三次cancel，在释放subscriber后检查identity、顺序与无orphan
+async def test_repeated_cancellation_during_step_finalization_reuses_one_publication(
+    tmp_path: Path,
+) -> None:
+    run_id = "run-repeated-finalizer-cancel"
+    runs_dir = tmp_path / "runs"
+    bus = EventBus()
+    journal = EventJournalCoordinator()
+    provider = _CancellationProvider()
+    finalizer_entered = asyncio.Event()
+    release = asyncio.Event()
+    completed = asyncio.Event()
+    finish_attempts = 0
+    loop_errors: list[dict[str, Any]] = []
+    running_loop = asyncio.get_running_loop()
+    previous_handler = running_loop.get_exception_handler()
+
+    # 捕获未retrieve task异常，确保重复取消不会遗留finalizer warning
+    def capture_loop_error(
+        event_loop: asyncio.AbstractEventLoop,
+        context: dict[str, Any],
+    ) -> None:
+        loop_errors.append(context)
+
+    # 在journal之前阻塞唯一step terminal以建立两次secondary cancellation窗口
+    async def block_before_journal(event: BaseModel) -> None:
+        nonlocal finish_attempts
+        if not isinstance(event, StepFinishedEvent):
+            return
+        finish_attempts += 1
+        finalizer_entered.set()
+        await release.wait()
+        completed.set()
+
+    bus.subscribe(block_before_journal)
+    bus.subscribe(journal.handle)
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        bus=bus,
+        provider=provider,
+        runs_dir=runs_dir,
+        journal=journal,
+    )
+    observed_in_runner: asyncio.CancelledError | None = None
+
+    # 保存Runner边界传播对象，验证它仍是provider第一次捕获的X
+    async def observe_runner_cancellation() -> None:
+        nonlocal observed_in_runner
+        try:
+            await runner.run_and_capture("cancel repeatedly", run_id=run_id)
+        except asyncio.CancelledError as exc:
+            observed_in_runner = exc
+            raise
+
+    running_loop.set_exception_handler(capture_loop_error)
+    try:
+        task = asyncio.create_task(observe_runner_cancellation())
+        await provider.entered.wait()
+        assert task.cancel("primary-provider-cancel") is True
+        await finalizer_entered.wait()
+        assert task.cancel("secondary-finalizer-cancel-1") is True
+        await asyncio.sleep(0)
+        assert task.cancel("secondary-finalizer-cancel-2") is True
+        cancellation_count = task.cancelling()
+        await asyncio.sleep(0)
+        release.set()
+
+        try:
+            await task
+        except asyncio.CancelledError as caught:
+            observed_by_caller = caught
+        else:
+            raise AssertionError("repeated cancellation did not propagate")
+        await journal.flush_all()
+        await journal.close()
+        await asyncio.sleep(0)
+    finally:
+        running_loop.set_exception_handler(previous_handler)
+
+    journal_path = runs_dir / run_id / "events.v2.jsonl"
+    events = _read_v2_events(journal_path)
+    grade = grade_trace(journal_path, expected_run_id=run_id)
+    orphan_publications = [
+        pending
+        for pending in asyncio.all_tasks()
+        if pending is not asyncio.current_task()
+        and not pending.done()
+        and pending.get_coro().__qualname__ == "EventBus.publish"
+    ]
+
+    assert cancellation_count >= 3
+    assert finish_attempts == 1
+    assert completed.is_set()
+    assert provider.cancelled is observed_in_runner
+    assert observed_in_runner is observed_by_caller
+    assert observed_by_caller.args == ("primary-provider-cancel",)
+    assert [event["type"] for event in events] == [
+        "run.started",
+        "step.started",
+        "step.finished",
+        "run.finished",
+    ]
+    assert events[-1]["status"] == "failed"
+    assert events[-1]["reason"] == "cancelled"
+    assert events[-1]["steps"] == 1
+    assert grade.passed is True
+    assert grade.errors == []
+    assert orphan_publications == []
+    assert not any(
+        context.get("message") == "Task exception was never retrieved"
+        for context in loop_errors
+    )
 
 
 # 功能：验证 parent run terminal 前会 cancel/join 所有 background child 并先持久化 child finished
