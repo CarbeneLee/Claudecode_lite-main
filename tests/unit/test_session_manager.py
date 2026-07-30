@@ -195,9 +195,9 @@ async def test_run_stream_registers_before_skill_invoked_event(tmp_path: Path) -
     )
 
 
-# 功能：验证正常 session 通过真实 Runner/Loop 继承一次 v1 且不包含 v2
+# 功能：验证正常 session 通过真实 Runner/Loop 各继承一次 v1 与 v2
 # 设计：仅在 provider seam 使用本地 fake，保留 SessionManager、AgentRunner 与 AgentLoop 的真实组合路径
-async def test_normal_session_inherits_v1_and_excludes_v2(
+async def test_normal_session_inherits_v1_and_v2(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -228,7 +228,7 @@ async def test_normal_session_inherits_v1_and_excludes_v2(
     assert provider.messages == [{"role": "user", "content": "Implement behavior A."}]
     assert provider.system is not None
     assert provider.system.count(_REQUIREMENT_CONTRACT) == 1
-    assert provider.system.count(_STATE_TRANSITION_PROTOCOL) == 0
+    assert provider.system.count(_STATE_TRANSITION_PROTOCOL) == 1
 
 
 # 功能：验证 slash skill 传入的 system prompt override 不包含 default v1/v2

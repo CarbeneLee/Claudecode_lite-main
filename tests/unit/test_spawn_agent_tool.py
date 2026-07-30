@@ -316,9 +316,9 @@ async def test_subagents_isolate_profile_and_context_by_workspace(tmp_path: Path
     assert _STATE_TRANSITION_PROTOCOL not in systems[1]
 
 
-# 功能：验证未指定 profile 的 subagent 继承 repaired default v1 且不包含 v2
+# 功能：验证未指定 profile 的 subagent 各继承一次 repaired default v1 与 v2
 # 设计：执行真实前台 child loop 并捕获 provider system，区别于 profile override 的完全替换路径
-async def test_unprofiled_subagent_inherits_v1_and_excludes_v2(tmp_path: Path) -> None:
+async def test_unprofiled_subagent_inherits_v1_and_v2(tmp_path: Path) -> None:
     provider = _make_provider()
     tool, _, _ = _make_tool(tmp_path, provider)
 
@@ -333,7 +333,7 @@ async def test_unprofiled_subagent_inherits_v1_and_excludes_v2(tmp_path: Path) -
     system = provider.chat.await_args.kwargs["system"]
     assert isinstance(system, str)
     assert system.count(_REQUIREMENT_CONTRACT) == 1
-    assert system.count(_STATE_TRANSITION_PROTOCOL) == 0
+    assert system.count(_STATE_TRANSITION_PROTOCOL) == 1
 
 
 # 功能：验证 subagent 模块不保留绑定项目目录的全局 profile loader

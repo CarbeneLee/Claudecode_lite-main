@@ -73,10 +73,10 @@ def test_session_notes_hint() -> None:
     assert "note_save" in prompt
 
 
-# 功能：验证 repaired v1 default base 之后仍按 Global、Project、Session 顺序追加 context
-# 设计：把 base 与 exact v1 传入真实 system_prompt，逐段定位并排除被删除 v2 与 context 层重排
-def test_v1_default_base_precedes_all_context_layers_and_excludes_v2() -> None:
-    base = "BASE\n\n" + _REQUIREMENT_CONTRACT
+# 功能：验证 repaired v2 default base 之后仍按 Global、Project、Session 顺序追加 context
+# 设计：把 base 与 exact v1/v2 传入真实 system_prompt，逐段定位并排除协议或 context 层重排
+def test_v1_and_v2_default_base_precede_all_context_layers() -> None:
+    base = "BASE\n\n" + _REQUIREMENT_CONTRACT + "\n\n" + _STATE_TRANSITION_PROTOCOL
     ctx = _make_ctx(
         global_context="global",
         project_context="project",
@@ -86,8 +86,14 @@ def test_v1_default_base_precedes_all_context_layers_and_excludes_v2() -> None:
     prompt = ctx.system_prompt(base)
 
     assert prompt.startswith(base)
-    assert _STATE_TRANSITION_PROTOCOL not in prompt
-    assert prompt.index(_REQUIREMENT_CONTRACT) < prompt.index("## Global Context")
+    assert prompt.count(_REQUIREMENT_CONTRACT) == 1
+    assert prompt.count(_STATE_TRANSITION_PROTOCOL) == 1
+    assert prompt.index(_REQUIREMENT_CONTRACT) < prompt.index(
+        _STATE_TRANSITION_PROTOCOL
+    )
+    assert prompt.index(_STATE_TRANSITION_PROTOCOL) < prompt.index(
+        "## Global Context"
+    )
     assert prompt.index("## Global Context") < prompt.index("## Project Context")
     assert prompt.index("## Project Context") < prompt.index("## Session Notes")
 

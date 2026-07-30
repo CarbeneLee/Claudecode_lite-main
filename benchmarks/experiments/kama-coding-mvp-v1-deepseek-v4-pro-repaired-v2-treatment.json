@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "profile_id": "kama-coding-mvp-v1-deepseek-v4-pro-repaired-v2-treatment",
+  "suite": {
+    "manifest": "../suites/kama-coding-mvp-v1.json",
+    "freeze_manifest": "../suites/kama-coding-mvp-v1.freeze.json",
+    "tasks_root": "../tasks",
+    "expected_suite_hash": "6e1b554df12962fc454a5b61c6e6145bd022041ec77b24149d73bd616e6044d7"
+  },
+  "provider": {
+    "service_provider": "deepseek",
+    "wire_protocol": "anthropic_messages",
+    "endpoint_id": "deepseek-anthropic-compatible",
+    "endpoint": "https://api.deepseek.com/anthropic",
+    "model_id": "deepseek-v4-pro",
+    "sdk_distribution": "anthropic",
+    "sdk_version": "0.111.0",
+    "credential_env": "ANTHROPIC_API_KEY"
+  },
+  "runtime": {
+    "max_steps": 20,
+    "router": "static",
+    "compaction_threshold": 0.0,
+    "tool_result_limit": 8000,
+    "tool_result_keep": 4000,
+    "mcp_enabled": false,
+    "trace_enabled": true,
+    "include_llm_payload": true
+  },
+  "schedule": {
+    "repeats": 3,
+    "execution_order": "suite_task_then_repeat_ascending"
+  },
+  "artifacts": {
+    "output_root_must_be_new": true,
+    "output_root_must_be_outside_repository": true,
+    "retain_all_attempts": true,
+    "raw_trace_visibility": "private"
+  },
+  "expected_identity": {
+    "prompt_hash": "bc9d1a2fbcc3458efb5b153f4ff539050c96e28a9c76f3fcd8823588933eb6c0",
+    "tool_schema_hash": "8ea67642a27db476c048575e9a532c41a044e39f63f729260428cdce0fd35f9f"
+  }
+}

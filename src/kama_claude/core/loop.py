@@ -139,7 +139,14 @@ class AgentLoop:
                             "finishing, review every item. Do not assume unchecked items are "
                             "complete: verify them when possible, otherwise clearly report "
                             "the limitation. Keep the contract brief and auditable; do not "
-                            "expose private chain-of-thought or force any particular tool."
+                            "expose private chain-of-thought or force any particular tool.\n\n"
+                            "When a task changes persistent or shared state through multiple "
+                            "operations, briefly map the pre-state, each mutation point, every "
+                            "later operation that can fail, and the required post-state after "
+                            "success or failure. Before finishing, exercise at least one failure "
+                            "after an earlier mutation succeeds, and verify that rollback or "
+                            "compensation preserves the stated invariant. Do not apply this "
+                            "protocol to tasks without multi-step side effects."
                         ),
                     )
                 except asyncio.CancelledError as exc: # 异常策略处理
