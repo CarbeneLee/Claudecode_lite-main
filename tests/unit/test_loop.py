@@ -1021,9 +1021,9 @@ def test_state_transition_protocol_addition_identity_is_frozen() -> None:
     )
 
 
-# 功能：验证每次默认模型调用精确包含一次冻结的 v1 与 v2 指导
-# 设计：使用两步 scripted provider 捕获完整 system，锁定 base、双换行、v1、双换行、v2 的字节级组合
-async def test_default_prompt_contains_v1_and_v2_once_per_call() -> None:
+# 功能：验证 repaired control 每次默认模型调用只包含一次冻结 v1 且不包含 v2
+# 设计：用两步 scripted provider 捕获真实 system，锁定 base、双换行、v1 与无尾随换行的字节组合
+async def test_default_prompt_contains_v1_once_and_excludes_v2_per_call() -> None:
     provider = _MockProvider(
         [
             LlmResponse(stop_reason="tool_use", tool_calls=[_tc()]),
@@ -1036,20 +1036,12 @@ async def test_default_prompt_contains_v1_and_v2_once_per_call() -> None:
 
     await loop.run(_ctx())
 
-    expected = (
-        _DEFAULT_BASE_PROMPT
-        + "\n\n"
-        + _REQUIREMENT_CONTRACT
-        + "\n\n"
-        + _STATE_TRANSITION_PROTOCOL
-    )
+    expected = _DEFAULT_BASE_PROMPT + "\n\n" + _REQUIREMENT_CONTRACT
     for system in provider.seen_systems:
         assert system is not None
         assert system.count(_REQUIREMENT_CONTRACT) == 1
-        assert system.count(_STATE_TRANSITION_PROTOCOL) == 1
-        assert system.index(_REQUIREMENT_CONTRACT) < system.index(
-            _STATE_TRANSITION_PROTOCOL
-        )
+        assert system.count(_STATE_TRANSITION_PROTOCOL) == 0
+        assert not system.endswith("\n")
     assert provider.seen_systems == [expected, expected]
 
 
@@ -1093,9 +1085,8 @@ async def test_requirement_contract_preserves_runtime_inputs_and_lifecycle() -> 
     for system in systems:
         assert system is not None
         assert system.count(_REQUIREMENT_CONTRACT) == 1
-        assert system.count(_STATE_TRANSITION_PROTOCOL) == 1
-        assert system.index(_REQUIREMENT_CONTRACT) < system.index(_STATE_TRANSITION_PROTOCOL)
-        assert system.index(_STATE_TRANSITION_PROTOCOL) < system.index("## Global Context")
+        assert system.count(_STATE_TRANSITION_PROTOCOL) == 0
+        assert system.index(_REQUIREMENT_CONTRACT) < system.index("## Global Context")
         assert system.index("## Global Context") < system.index("## Project Context")
         assert system.index("## Project Context") < system.index("## Session Notes")
         assert "global-marker" in system

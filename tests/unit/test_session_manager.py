@@ -6,8 +6,10 @@ from typing import Any, cast
 import pytest
 
 from kama_claude.core.bus.envelope import HandlerError
+from kama_claude.core.config import KamaConfig
 from kama_claude.core.events.bus import EventBus
-from kama_claude.core.runner import RunOutcome
+from kama_claude.core.llm.types import LlmResponse
+from kama_claude.core.runner import AgentRunner, RunOutcome
 from kama_claude.core.session.manager import SESSION_CLOSED, SESSION_NOT_FOUND, SessionManager
 from kama_claude.core.session.model import Session
 from kama_claude.core.session.store import SessionStore
@@ -83,6 +85,28 @@ class _RecordingJournal:
     ) -> object:
         self.order.append(f"register:run:{run_id}:{session_id}")
         return object()
+
+
+class _SessionPromptProvider:
+    # 初始化正常 session run 的真实 LLM 输入观测
+    def __init__(self) -> None:
+        self.messages: list[dict[str, object]] = []
+        self.system: str | None = None
+
+    # 捕获 AgentRunner 传入的真实 session messages 与 system 后本地结束
+    async def chat(
+        self,
+        messages: list[dict[str, object]],
+        tool_schemas: list[dict[str, object]],
+        bus: EventBus,
+        run_id: str,
+        *,
+        step: int = 0,
+        system: str | None = None,
+    ) -> LlmResponse:
+        self.messages = [dict(message) for message in messages]
+        self.system = system
+        return LlmResponse(stop_reason="end_turn", text="done")
 
 
 # 功能：验证 create 会创建 active session、写入 meta 并发布 session.created 事件
@@ -169,6 +193,42 @@ async def test_run_stream_registers_before_skill_invoked_event(tmp_path: Path) -
     assert order.index(f"register:run:{run_id}:{session.id}") < order.index(
         "event:skill.invoked"
     )
+
+
+# 功能：验证正常 session 通过真实 Runner/Loop 继承一次 v1 且不包含 v2
+# 设计：仅在 provider seam 使用本地 fake，保留 SessionManager、AgentRunner 与 AgentLoop 的真实组合路径
+async def test_normal_session_inherits_v1_and_excludes_v2(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = _SessionPromptProvider()
+    config = KamaConfig()
+    config.agent.max_steps = 2
+    store = SessionStore(tmp_path / "sessions")
+
+    # 为 SessionManager 构造真实 AgentRunner，仅替换外部 provider
+    def runner_factory(workspace_root: Path) -> AgentRunner:
+        return AgentRunner(
+            config,
+            workspace_root=workspace_root,
+            provider=provider,  # type: ignore[arg-type]
+            runs_dir=tmp_path / "runs",
+        )
+
+    manager = SessionManager(store, runner_factory, EventBus())
+    session = await manager.create("chat", workspace_root=workspace.resolve())
+
+    await manager.send_message(session.id, "Implement behavior A.")
+
+    assert provider.messages == [{"role": "user", "content": "Implement behavior A."}]
+    assert provider.system is not None
+    assert provider.system.count(_REQUIREMENT_CONTRACT) == 1
+    assert provider.system.count(_STATE_TRANSITION_PROTOCOL) == 0
 
 
 # 功能：验证 slash skill 传入的 system prompt override 不包含 default v1/v2
