@@ -11,6 +11,7 @@ from kama_claude.core.git.errors import (
     RollbackFailedError,
     classify_cli_error,
 )
+from kama_claude.core.git.runtime import GitCliRuntime
 
 __all__ = [
     "GitConfig",
@@ -24,4 +25,5 @@ __all__ = [
     "RollbackFailedError",
     "MergeConflictError",
     "classify_cli_error",
+    "GitCliRuntime",
 ]
