@@ -5,6 +5,16 @@ import logging
 
 from pydantic import BaseModel, ValidationError
 
+from kama_claude.core.git.errors import (
+    CheckpointFailedError,
+    CommitFailedError,
+    DirtyWorkspaceError,
+    GitLockError,
+    GitUnavailableError,
+    MergeConflictError,
+    RepositoryNotFoundError,
+    RollbackFailedError,
+)
 from kama_claude.core.sandbox.errors import (
     ContainerNotReadyError,
     SandboxCreationFailedError,
@@ -42,10 +52,26 @@ _STABLE_ERROR_TYPES: frozenset[str] = frozenset(
         "sandbox_creation_failed",
         "container_not_ready",
         "sandbox_timeout",
+        "git_unavailable",
+        "repository_not_found",
+        "dirty_workspace",
+        "git_lock",
+        "checkpoint_failed",
+        "commit_failed",
+        "rollback_failed",
+        "merge_conflict",
     }
 )
 RETRYABLE_ERROR_TYPES: frozenset[str] = frozenset(
-    {"transient_error", "rate_limited", "container_not_ready"}
+    {
+        "transient_error",
+        "rate_limited",
+        "container_not_ready",
+        "git_unavailable",
+        "git_lock",
+        "checkpoint_failed",
+        "commit_failed",
+    }
 )
 _SAFE_ERROR_MESSAGES: dict[str, str] = {
     "execution_error": "tool execution failed",
@@ -235,6 +261,25 @@ def classify_tool_exception(
         return "container_not_ready", "sandbox container not ready"
     if isinstance(exc, SandboxTimeoutError):
         return "sandbox_timeout", "sandbox command timed out"
+    if isinstance(exc, GitUnavailableError):
+        return "git_unavailable", "git CLI unavailable"
+    if isinstance(exc, RepositoryNotFoundError):
+        return "repository_not_found", "workspace is not a git repository"
+    if isinstance(exc, DirtyWorkspaceError):
+        return (
+            "dirty_workspace",
+            "workspace has uncommitted changes; approve snapshot baseline or handle manually",
+        )
+    if isinstance(exc, GitLockError):
+        return "git_lock", "git repository is locked by another process"
+    if isinstance(exc, CheckpointFailedError):
+        return "checkpoint_failed", "git checkpoint write failed"
+    if isinstance(exc, CommitFailedError):
+        return "commit_failed", "git commit failed"
+    if isinstance(exc, RollbackFailedError):
+        return "rollback_failed", "git rollback failed"
+    if isinstance(exc, MergeConflictError):
+        return "merge_conflict", "git merge conflict; human decision required"
     if isinstance(exc, TimeoutError):
         return "timeout", "tool execution timed out"
 

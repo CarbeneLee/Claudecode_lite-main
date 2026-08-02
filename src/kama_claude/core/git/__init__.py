@@ -12,6 +12,13 @@ from kama_claude.core.git.errors import (
     classify_cli_error,
 )
 from kama_claude.core.git.runtime import GitCliRuntime
+from kama_claude.core.git.tools import (
+    GitCheckpointTool,
+    GitCommitTool,
+    GitDiffTool,
+    GitRollbackTool,
+    GitStatusTool,
+)
 
 __all__ = [
     "GitConfig",
@@ -26,4 +33,9 @@ __all__ = [
     "MergeConflictError",
     "classify_cli_error",
     "GitCliRuntime",
+    "GitStatusTool",
+    "GitDiffTool",
+    "GitCheckpointTool",
+    "GitCommitTool",
+    "GitRollbackTool",
 ]

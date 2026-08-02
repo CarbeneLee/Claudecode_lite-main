@@ -8,6 +8,16 @@ import pytest
 from pydantic import BaseModel, Field, ValidationError, create_model, model_validator
 
 import kama_claude.core.tools.errors as error_mod
+from kama_claude.core.git.errors import (
+    CheckpointFailedError,
+    CommitFailedError,
+    DirtyWorkspaceError,
+    GitLockError,
+    GitUnavailableError,
+    MergeConflictError,
+    RepositoryNotFoundError,
+    RollbackFailedError,
+)
 from kama_claude.core.sandbox.errors import (
     ContainerNotReadyError,
     SandboxCreationFailedError,
@@ -838,6 +848,115 @@ def test_unknown_exception_logs_traceback(caplog: pytest.LogCaptureFixture) -> N
     assert record.exc_info[1] is exc
     assert record.exc_info[2] is exc.__traceback__
     assert "Traceback (most recent call last)" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected_error_type", "expected_message"),
+    [
+        (
+            GitUnavailableError("no cli"),
+            "git_unavailable",
+            "git CLI unavailable",
+        ),
+        (
+            RepositoryNotFoundError("no repo"),
+            "repository_not_found",
+            "workspace is not a git repository",
+        ),
+        (
+            DirtyWorkspaceError("dirty"),
+            "dirty_workspace",
+            "workspace has uncommitted changes; approve snapshot baseline or handle manually",
+        ),
+        (
+            GitLockError("lockfile clash"),
+            "git_lock",
+            "git repository is locked by another process",
+        ),
+        (
+            CheckpointFailedError("disk full"),
+            "checkpoint_failed",
+            "git checkpoint write failed",
+        ),
+        (
+            CommitFailedError("hook refused"),
+            "commit_failed",
+            "git commit failed",
+        ),
+        (
+            RollbackFailedError("reset failed"),
+            "rollback_failed",
+            "git rollback failed",
+        ),
+        (
+            MergeConflictError("merge clash"),
+            "merge_conflict",
+            "git merge conflict; human decision required",
+        ),
+    ],
+)
+# 功能：验证八个 git domain 异常映射为独立稳定 error_type 而非落入 execution_error
+# 设计：参数化覆盖全部 git 异常，断言与 sandbox/文件分支互不混淆，消息为安全摘要
+def test_classifies_git_errors(
+    exc: Exception,
+    expected_error_type: str,
+    expected_message: str,
+) -> None:
+    error_type, message = classify_tool_exception(exc)
+
+    assert error_type == expected_error_type
+    assert message == expected_message
+    assert str(exc) not in message
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        "git_unavailable",
+        "repository_not_found",
+        "dirty_workspace",
+        "git_lock",
+        "checkpoint_failed",
+        "commit_failed",
+        "rollback_failed",
+        "merge_conflict",
+    ],
+)
+# 功能：验证 git error_type 经 normalize 后内容原样透传（与 sandbox 行为一致）
+# 设计：参数化全部 git 类型，用含诊断信息的 content 断言不落入安全摘要兜底
+def test_normalize_git_error_passes_content_through(error_type: str) -> None:
+    content = "git stderr diagnostic"
+
+    normalized_type, normalized_content = error_mod.normalize_tool_error(
+        error_type, content
+    )
+
+    assert normalized_type == error_type
+    assert normalized_content == content
+
+
+# 功能：验证 git retryable 归属——瞬时四类可重试，数据安全四类不可重试
+# 设计：直接断言 RETRYABLE_ERROR_TYPES 成员资格，锁定 §9.1 重试矩阵
+def test_git_retryable_error_membership() -> None:
+    retryable = {
+        "git_unavailable",
+        "git_lock",
+        "checkpoint_failed",
+        "commit_failed",
+    }
+    stable = {
+        "git_unavailable",
+        "repository_not_found",
+        "dirty_workspace",
+        "git_lock",
+        "checkpoint_failed",
+        "commit_failed",
+        "rollback_failed",
+        "merge_conflict",
+    }
+    assert stable <= error_mod._STABLE_ERROR_TYPES
+    assert retryable <= error_mod.RETRYABLE_ERROR_TYPES
+    assert stable - retryable <= error_mod._STABLE_ERROR_TYPES - error_mod.RETRYABLE_ERROR_TYPES
 
 
 # 功能：验证 asyncio cancellation 不会被分类成普通 ToolResult 错误

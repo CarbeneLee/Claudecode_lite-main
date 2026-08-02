@@ -17,7 +17,9 @@ from kama_claude.core.git.checkpoint import (
 )
 from kama_claude.core.git.config import GitConfig
 from kama_claude.core.git.errors import (
+    CommitFailedError,
     GitError,
+    MergeConflictError,
     RollbackFailedError,
 )
 from kama_claude.core.git.runtime import GitCliRuntime
@@ -50,6 +52,15 @@ class GitRestoreResult:
     # 回滚结果：目标 checkpoint sha + 实际策略（reset / revert）
     checkpoint_sha: str
     strategy: str
+
+
+@dataclass(frozen=True)
+class GitCommitResult:
+    # finalize 产物：唯一用户可见 commit 的元数据
+    commit_sha: str
+    short_sha: str
+    summary: str
+    diff_stat: str
 
 
 # 解析 git status --porcelain=v1 -b 输出为结构化状态
@@ -258,6 +269,60 @@ class GitManager:
                 checkpoint_sha=checkpoint.commit_sha, strategy="reset"
             )
 
+    # finalize：squash 内部 checkpoint 为唯一用户可见 commit（git_commit 的实质）；
+    # 前置校验（baseline..tip 全为 kama commit）失败抛 MergeConflictError
+    async def finalize(self, run_id: str, summary: str) -> GitCommitResult:
+        async with self._lock:
+            await self._ensure_ready_locked()
+            branch = (await self._status_locked()).branch
+            prefix = self._config.branch_prefix + "/"
+            if not branch.startswith(prefix):
+                raise RollbackFailedError(
+                    "finalize refused on non-agent branch",
+                    detail=f"current branch {branch!r}; checkout {prefix}<task> first",
+                )
+            baseline_sha = await self._baseline_sha_locked(run_id)
+            # 用户中途 commit 会出现在范围内且非 kama 前缀 → 拒绝 squash，防吞用户提交
+            log_result = await self._runtime.run_check(
+                ["log", "--format=%s", f"{baseline_sha}..HEAD"]
+            )
+            foreign = [
+                s
+                for s in log_result.output.decode("utf-8", errors="replace").splitlines()
+                if not s.startswith("kama: ")
+            ]
+            if foreign:
+                raise MergeConflictError(
+                    "finalize refused: user commits interleaved in run range",
+                    detail="\n".join(foreign[:10]),
+                )
+            await self._runtime.run_check(["reset", "--soft", baseline_sha])
+            await self._runtime.run_check(
+                ["commit", "-m", f"kama: {summary}"], env=self._author_env()
+            )
+            sha = await self._head_sha()
+            stat_result = await self._runtime.run_check(["show", "--stat", "--format=", sha])
+            return GitCommitResult(
+                commit_sha=sha,
+                short_sha=sha[:7],
+                summary=summary,
+                diff_stat=stat_result.output.decode("utf-8", errors="replace").strip(),
+            )
+
+    # 解析 finalize 的 squash 基底：step-0 baseline 优先，pre-run 快照兜底
+    async def _baseline_sha_locked(self, run_id: str) -> str:
+        refs = [
+            checkpoint_ref(self._config.checkpoint_namespace, run_id, 0),
+            pre_run_ref(self._config.checkpoint_namespace, run_id),
+        ]
+        for ref in refs:
+            result = await self._runtime.run(
+                ["rev-parse", "--verify", "--quiet", ref]
+            )
+            if result.returncode == 0:
+                return result.output.decode("utf-8", errors="replace").strip()
+        raise CommitFailedError("finalize refused: no run baseline checkpoint")
+
     # 取 run 的最后一步 checkpoint（crash recovery 的恢复点）；无则返回 None
     async def latest_checkpoint(self, run_id: str) -> GitCheckpoint | None:
         async with self._lock:
@@ -288,6 +353,30 @@ class GitManager:
                 kind=KIND_INTERNAL,
                 commit_sha=sha,
                 ref=refname,
+                short_sha=sha[:7],
+                diff_stat="",
+                ts=ts,
+                dirty=False,
+            )
+
+    # 按 step 解析指定 checkpoint（git_rollback 的目标）；不存在返回 None
+    async def get_checkpoint(self, run_id: str, step: int) -> GitCheckpoint | None:
+        async with self._lock:
+            await self._ensure_ready_locked()
+            ref = checkpoint_ref(self._config.checkpoint_namespace, run_id, step)
+            result = await self._runtime.run(["rev-parse", "--verify", "--quiet", ref])
+            if result.returncode != 0:
+                return None
+            sha = result.output.decode("utf-8", errors="replace").strip()
+            subject = await self._run_log_format("%s", sha)
+            ts = await self._run_log_format("%cI", sha)
+            return GitCheckpoint(
+                run_id=run_id,
+                step=step,
+                label=subject.removeprefix("kama: "),
+                kind=KIND_INTERNAL,
+                commit_sha=sha,
+                ref=ref,
                 short_sha=sha[:7],
                 diff_stat="",
                 ts=ts,

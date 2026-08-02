@@ -44,6 +44,12 @@ DEFAULT_POLICIES: dict[str, ToolPolicy] = {
     "list_dir":   ToolPolicy(default=PermissionDecision.ALLOW),
     "search_code": ToolPolicy(default=PermissionDecision.ALLOW),
     "note_save":  ToolPolicy(default=PermissionDecision.ALLOW),
+    # git 工具：只读 auto_allow，写操作 ASK（设计 §7.1）
+    "git_status":  ToolPolicy(default=PermissionDecision.ALLOW),
+    "git_diff":    ToolPolicy(default=PermissionDecision.ALLOW),
+    "git_checkpoint": ToolPolicy(default=PermissionDecision.ASK),
+    "git_commit":  ToolPolicy(default=PermissionDecision.ASK),
+    "git_rollback": ToolPolicy(default=PermissionDecision.ASK),
 }
 
 # 未在 DEFAULT_POLICIES 中登记的工具的兜底策略
@@ -57,6 +63,9 @@ _PREVIEW_KEY: dict[str, str] = {
     "list_dir":   "path",
     "search_code": "query",
     "note_save":  "content",
+    "git_checkpoint": "label",
+    "git_commit":  "summary",
+    "git_rollback": "step",
 }
 _PREVIEW_MAX = 60
 
