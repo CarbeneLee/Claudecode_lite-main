@@ -31,7 +31,15 @@ from kama_claude.core.workspace.errors import (
 # 设计：直接锁定 allowlist 契约，防止新增或删除错误类型静默改变重试边界
 def test_only_explicit_transient_errors_are_retryable() -> None:
     assert RETRYABLE_ERROR_TYPES == frozenset(
-        {"transient_error", "rate_limited", "container_not_ready"}
+        {
+            "transient_error",
+            "rate_limited",
+            "container_not_ready",
+            "git_unavailable",
+            "git_lock",
+            "checkpoint_failed",
+            "commit_failed",
+        }
     )
 
 

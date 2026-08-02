@@ -5,13 +5,31 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
-from kama_claude.core.bus.events import RunFinishedEvent, RunStartedEvent
+from pydantic import BaseModel
+
+from kama_claude.core.bus.events import (
+    GitRunDiffEvent,
+    PermissionRequestedEvent,
+    RunFinishedEvent,
+    RunStartedEvent,
+    StepFinishedEvent,
+)
 from kama_claude.core.compact.compactor import Compactor
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus, EventHandler
 from kama_claude.core.events.journal import EventJournalCoordinator
+from kama_claude.core.git.errors import DirtyWorkspaceError, GitError, GitUnavailableError
+from kama_claude.core.git.manager import GitManager
+from kama_claude.core.git.tools import (
+    GitCheckpointTool,
+    GitCommitTool,
+    GitDiffTool,
+    GitRollbackTool,
+    GitStatusTool,
+)
 from kama_claude.core.llm.base import LLMProvider
 from kama_claude.core.llm.provider import AnthropicProvider
 from kama_claude.core.loop import AgentLoop
@@ -76,6 +94,7 @@ class AgentRunner:
         mcp_manager: McpServerManager | None = None,
         journal: EventJournalCoordinator | None = None,
         sandbox_manager: SandboxManager | None = None,
+        git_manager: GitManager | None = None,
     ) -> None:
         self._config = config
         self._path_resolver = WorkspacePathResolver(workspace_root)
@@ -89,6 +108,7 @@ class AgentRunner:
         self._permission_manager = permission_manager
         self._mcp_manager = mcp_manager
         self._sandbox_manager = sandbox_manager
+        self._git_manager = git_manager
         self._journal = journal or EventJournalCoordinator()
         self._owns_journal = journal is None
         if self._owns_journal:
@@ -169,6 +189,17 @@ class AgentRunner:
             for mcp_tool in self._mcp_manager.get_tools():
                 if _ok(mcp_tool.name):
                     registry.register(mcp_tool)
+        # git 工具仅在注入 git manager 且 run_id 已知时注册（非 git 仓库降级为无 git 能力）
+        if self._git_manager is not None and run_id is not None:
+            for git_tool in [
+                GitStatusTool(self._git_manager),
+                GitDiffTool(self._git_manager),
+                GitCheckpointTool(self._git_manager, run_id),
+                GitCommitTool(self._git_manager, run_id),
+                GitRollbackTool(self._git_manager, run_id),
+            ]:
+                if _ok(git_tool.name):
+                    registry.register(git_tool)
         return registry
 
     # 执行一次完整的 agent run（委托给 run_and_capture，忽略返回值）
@@ -237,6 +268,69 @@ class AgentRunner:
         prefill_len = len(history) #避免重复存储历史消息
 
         await bus.publish(RunStartedEvent(run_id=run_id, goal=goal, ts=_now()))
+
+        # git preflight（P4）：ensure_ready fail-open → dirty ASK → task 分支 + baseline
+        session_id_str = session.id if session is not None else ""
+        git_manager = self._git_manager
+        git_enabled = False
+        if git_manager is not None:
+            try:
+                await git_manager.ensure_ready()
+            except GitUnavailableError:
+                # fail-open：非 git 仓库（或无 git 可用）时降级为无 git 能力的 run
+                logging.getLogger(__name__).warning(
+                    "git preflight skipped run_id=%s failure_category=fail_open",
+                    run_id,
+                )
+            else:
+                git_enabled = True
+        step_checkpoint_handler: EventHandler | None = None
+        if git_enabled and git_manager is not None:
+            gm = git_manager
+            try:
+                status = await gm.status()
+                if status.dirty:
+                    allowed = await self._request_git_snapshot(
+                        bus, run_id, session_id_str
+                    )
+                    if not allowed:
+                        raise DirtyWorkspaceError(
+                            "workspace has uncommitted changes; approve snapshot "
+                            "baseline or handle manually"
+                        )
+                    await gm.snapshot_pre_run(run_id)
+                await gm.ensure_task_branch(run_id)
+                await gm.create_checkpoint(run_id, 0, "baseline")
+            except DirtyWorkspaceError:
+                # 用户拒绝快照：run 直接失败，工作树保持原样
+                await bus.publish(
+                    RunFinishedEvent(
+                        run_id=run_id,
+                        status="failed",
+                        reason="dirty_workspace",
+                        steps=0,
+                        ts=_now(),
+                    )
+                )
+                raise
+            except GitError:
+                # 其余 git 故障同样 fail-open：本次 run 降级为无 git 能力
+                logging.getLogger(__name__).warning(
+                    "git preflight degraded run_id=%s failure_category=fail_open",
+                    run_id,
+                )
+                git_enabled = False
+            if gm.config.checkpoint_mode == "per_step":
+
+                # per_step 模式：每个 step 结束自动落 checkpoint（auto-step-N）
+                async def _step_checkpoint(event: BaseModel) -> None:
+                    if isinstance(event, StepFinishedEvent) and event.run_id == run_id:
+                        await gm.create_checkpoint(
+                            run_id, event.step, f"auto-step-{event.step}"
+                        )
+
+                step_checkpoint_handler = _step_checkpoint
+                bus.subscribe(_step_checkpoint)
 
         cancelled_error: asyncio.CancelledError | None = None
         try:
@@ -309,6 +403,11 @@ class AgentRunner:
                     run_id,
                 )
 
+        if step_checkpoint_handler is not None:
+            bus.unsubscribe(step_checkpoint_handler)
+        if git_enabled and git_manager is not None:
+            await self._git_run_end(bus, run_id, git_manager, context, cancelled_error)
+
         terminal_failure: asyncio.CancelledError | Exception | None = None
         try:
             await bus.publish(
@@ -343,3 +442,54 @@ class AgentRunner:
             result=context.result,
             reason=context.reason,
         )
+
+    # dirty 工作树快照审批：走权限通道向用户 ASK，无权限系统时默认拒绝
+    async def _request_git_snapshot(
+        self, bus: EventBus, run_id: str, session_id: str
+    ) -> bool:
+        if self._permission_manager is None:
+            return False
+
+        async def _emit(raw: dict[str, Any]) -> None:
+            await bus.publish(PermissionRequestedEvent(**raw, run_id=run_id))
+
+        allowed, _decision = await self._permission_manager.check_and_wait(
+            tool_use_id=f"pre-run:{run_id}",
+            tool_name="git_pre_run_snapshot",
+            params={
+                "reason": "workspace has uncommitted changes; snapshot them into "
+                "the run baseline?"
+            },
+            session_id=session_id,
+            event_emitter=_emit,
+        )
+        return allowed
+
+    # run 结束的 git 收尾：失败自动回滚（取消时保留 refs）+ 发布最终 diff 摘要
+    async def _git_run_end(
+        self,
+        bus: EventBus,
+        run_id: str,
+        git_manager: GitManager,
+        context: ExecutionContext,
+        cancelled_error: asyncio.CancelledError | None,
+    ) -> None:
+        if (
+            git_manager.config.auto_rollback_on_fail
+            and context.status == "failed"
+            and cancelled_error is None
+        ):
+            baseline = await git_manager.get_checkpoint(run_id, 0)
+            if baseline is not None:
+                await git_manager.restore(baseline)
+        try:
+            git_diff = await git_manager.diff()
+            await bus.publish(
+                GitRunDiffEvent(run_id=run_id, stat=git_diff.stat, ts=_now())
+            )
+        except GitError:
+            # diff 摘要失败不影响已完成的 run（fail-open）
+            logging.getLogger(__name__).warning(
+                "git run-end diff failed run_id=%s failure_category=fail_open",
+                run_id,
+            )

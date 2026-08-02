@@ -15,6 +15,11 @@ class EventBus:
     def subscribe(self, handler: EventHandler) -> None:
         self._subscribers.append(handler)
 
+    # 注销事件处理函数（重复注销为 no-op）
+    def unsubscribe(self, handler: EventHandler) -> None:
+        if handler in self._subscribers:
+            self._subscribers.remove(handler)
+
     # 按注册顺序依次调用所有订阅者
     async def publish(self, event: BaseModel) -> None:
         for handler in self._subscribers:

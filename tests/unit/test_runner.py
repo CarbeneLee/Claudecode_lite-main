@@ -10,6 +10,7 @@ import pytest
 from pydantic import BaseModel
 
 from kama_claude.core.bus.events import (
+    GitRunDiffEvent,
     LlmModelSelectedEvent,
     StepFinishedEvent,
     ToolCallStartedEvent,
@@ -18,6 +19,9 @@ from kama_claude.core.config import KamaConfig
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.events.journal import EventJournalCoordinator
 from kama_claude.core.events.writer import EventWriter
+from kama_claude.core.git.config import GitConfig
+from kama_claude.core.git.errors import DirtyWorkspaceError, GitUnavailableError
+from kama_claude.core.git.manager import GitDiff
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.runner import AgentRunner
@@ -1214,3 +1218,246 @@ async def test_parent_run_joins_background_child_before_terminal(
         if not child_task.done():
             child_task.cancel()
         await asyncio.gather(child_task, return_exceptions=True)
+
+
+# --- git lifecycle hooks (P4) -------------------------------------------------
+
+
+class _FakeGitManager:
+    # 记录 git 钩子调用；config 复用真实 GitConfig 控制行为开关
+    def __init__(
+        self,
+        *,
+        dirty: bool = False,
+        checkpoint_mode: str = "per_run",
+        auto_rollback_on_fail: bool = False,
+        ensure_fails: bool = False,
+    ) -> None:
+        self.config = GitConfig(
+            checkpoint_mode=checkpoint_mode,
+            auto_rollback_on_fail=auto_rollback_on_fail,
+        )
+        self.calls: list[str] = []
+        self.dirty = dirty
+        self.ensure_fails = ensure_fails
+
+    async def ensure_ready(self) -> None:
+        self.calls.append("ensure_ready")
+        if self.ensure_fails:
+            raise GitUnavailableError("no git")
+
+    async def status(self) -> object:
+        self.calls.append("status")
+        return type("Status", (), {"dirty": self.dirty, "entries": ()})()
+
+    async def snapshot_pre_run(self, run_id: str, label: str = "pre-run") -> None:
+        self.calls.append(f"snapshot_pre_run:{run_id}")
+        return None
+
+    async def ensure_task_branch(self, task_id: str) -> None:
+        self.calls.append(f"ensure_task_branch:{task_id}")
+
+    async def create_checkpoint(
+        self, run_id: str, step: int, label: str, *, force: bool = False
+    ) -> object:
+        self.calls.append(f"create_checkpoint:{run_id}:{step}:{label}")
+        return type("Cp", (), {"step": step})()
+
+    async def get_checkpoint(self, run_id: str, step: int) -> object:
+        self.calls.append(f"get_checkpoint:{run_id}:{step}")
+        if step == 0:
+            return type("Cp", (), {"step": 0})()
+        return None
+
+    async def restore(self, cp: object) -> None:
+        self.calls.append(f"restore:{getattr(cp, 'step', '?')}")
+
+    async def diff(self, ref: str | None = None) -> GitDiff:
+        self.calls.append("diff")
+        return GitDiff(stat="f.txt | 1 +\n", truncated=False)
+
+    async def close(self) -> None:
+        self.calls.append("close")
+
+
+class _FakePermissionManager:
+    # 记录审批请求并返回预设结果，替代真实用户应答
+    def __init__(self, allowed: bool) -> None:
+        self.allowed = allowed
+        self.asked: list[tuple[str, dict[str, Any]]] = []
+
+    async def check_and_wait(
+        self,
+        tool_use_id: str,
+        tool_name: str,
+        params: dict[str, Any],
+        session_id: str,
+        event_emitter: Any,
+    ) -> tuple[bool, str]:
+        self.asked.append((tool_name, params))
+        return self.allowed, ("allow" if self.allowed else "deny")
+
+
+class _OnceToolUseProvider:
+    # 第一步返回未知工具调用（触发失败），第二步结束
+    def __init__(self) -> None:
+        self._call = 0
+
+    async def chat(
+        self,
+        messages: list[dict[str, object]],
+        tool_schemas: list[dict[str, object]],
+        bus: EventBus,
+        run_id: str,
+        *,
+        step: int = 0,
+        system: str | None = None,
+    ) -> LlmResponse:
+        self._call += 1
+        if self._call == 1:
+            tc = ToolCallBlock(id="t1", name="unknown_tool", input={})
+            return LlmResponse(stop_reason="tool_use", tool_calls=[tc])
+        return LlmResponse(stop_reason="end_turn", text="done")
+
+
+class _CancelProvider:
+    # 模拟取消：首次 LLM 调用直接抛 CancelledError
+    async def chat(
+        self,
+        messages: list[dict[str, object]],
+        tool_schemas: list[dict[str, object]],
+        bus: EventBus,
+        run_id: str,
+        *,
+        step: int = 0,
+        system: str | None = None,
+    ) -> LlmResponse:
+        raise asyncio.CancelledError()
+
+
+def _git_runner(
+    tmp_path: Path,
+    git_manager: _FakeGitManager | None,
+    *,
+    provider: object | None = None,
+    permission_manager: object | None = None,
+) -> tuple[AgentRunner, list[BaseModel]]:
+    collected: list[BaseModel] = []
+
+    async def _collect(e: BaseModel) -> None:
+        collected.append(e)
+
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        provider=provider or _EndTurnProvider(),  # type: ignore[arg-type]
+        extra_handlers=[_collect],
+        runs_dir=tmp_path / "runs",
+        permission_manager=permission_manager,  # type: ignore[arg-type]
+        git_manager=git_manager,  # type: ignore[arg-type]
+    )
+    return runner, collected
+
+
+# 功能：验证 run start 自动建立 baseline（ensure_ready → status → task 分支 → baseline checkpoint）
+# 设计：干净工作树 + fake manager，断言调用顺序与 run end diff 事件发布
+async def test_run_start_creates_baseline_in_order(tmp_path: Path) -> None:
+    git = _FakeGitManager()
+    runner, collected = _git_runner(tmp_path, git)
+    outcome = await runner.run_and_capture("goal", run_id="r1")
+    assert outcome.status == "success"
+    assert git.calls == [
+        "ensure_ready",
+        "status",
+        "ensure_task_branch:r1",
+        "create_checkpoint:r1:0:baseline",
+        "diff",
+    ]
+    assert any(isinstance(e, GitRunDiffEvent) for e in collected)
+
+
+# 功能：验证 dirty 工作树且用户批准时调用 snapshot_pre_run（含用户修改的 baseline）
+# 设计：dirty=True + 批准 → ASK 记录与 snapshot 调用，且仍建立 task 分支与 baseline
+async def test_dirty_run_approves_snapshot(tmp_path: Path) -> None:
+    git = _FakeGitManager(dirty=True)
+    perm = _FakePermissionManager(allowed=True)
+    runner, _collected = _git_runner(tmp_path, git, permission_manager=perm)
+    await runner.run_and_capture("goal", run_id="r1")
+    assert perm.asked and perm.asked[0][0] == "git_pre_run_snapshot"
+    assert "snapshot_pre_run:r1" in git.calls
+    assert "ensure_task_branch:r1" in git.calls
+    assert "create_checkpoint:r1:0:baseline" in git.calls
+
+
+# 功能：验证 dirty 工作树且用户拒绝时抛 DirtyWorkspaceError 且不触碰工作树
+# 设计：dirty=True + 拒绝 → run 抛错，git 调用止于 status（无分支/checkpoint）
+async def test_dirty_run_declined_raises(tmp_path: Path) -> None:
+    git = _FakeGitManager(dirty=True)
+    perm = _FakePermissionManager(allowed=False)
+    runner, _collected = _git_runner(tmp_path, git, permission_manager=perm)
+    with pytest.raises(DirtyWorkspaceError):
+        await runner.run_and_capture("goal", run_id="r1")
+    assert "ensure_task_branch:r1" not in git.calls
+    assert "create_checkpoint" not in "".join(git.calls)
+
+
+# 功能：验证 run 失败且 auto_rollback_on_fail 时恢复到 baseline
+# 设计：provider 抛错使 run 标记 failed → restore(baseline) 被调用
+async def test_run_failure_auto_rollback(tmp_path: Path) -> None:
+    git = _FakeGitManager(auto_rollback_on_fail=True)
+    runner, _collected = _git_runner(tmp_path, git, provider=_ModelThenErrorProvider())
+    outcome = await runner.run_and_capture("goal", run_id="r1")
+    assert outcome.status == "failed"
+    assert "restore:0" in git.calls
+
+
+# 功能：验证取消时不做自动 rollback（用户可能正在查看，refs 已持久化）
+# 设计：auto_rollback 开启 + CancelledError → run 抛 CancelledError 且 restore 未被调用
+async def test_cancelled_run_skips_auto_rollback(tmp_path: Path) -> None:
+    git = _FakeGitManager(auto_rollback_on_fail=True)
+    runner, _collected = _git_runner(tmp_path, git, provider=_CancelProvider())
+    with pytest.raises(asyncio.CancelledError):
+        await runner.run_and_capture("goal", run_id="r1")
+    assert "restore" not in "".join(git.calls)
+
+
+# 功能：验证非 git 仓库 fail-open——run 继续但无 git 能力
+# 设计：ensure_ready 抛 GitUnavailableError → run 成功且无分支/checkpoint/diff
+async def test_non_repo_run_fails_open(tmp_path: Path) -> None:
+    git = _FakeGitManager(ensure_fails=True)
+    runner, collected = _git_runner(tmp_path, git)
+    outcome = await runner.run_and_capture("goal", run_id="r1")
+    assert outcome.status == "success"
+    assert git.calls == ["ensure_ready"]
+    assert not any(isinstance(e, GitRunDiffEvent) for e in collected)
+
+
+# 功能：验证 per_step 模式下每个 step 结束自动 checkpoint
+# 设计：两步 run（tool_use + end_turn）→ auto-step-1 与 auto-step-2 各一次
+async def test_per_step_checkpoint_on_step_finished(tmp_path: Path) -> None:
+    git = _FakeGitManager(checkpoint_mode="per_step")
+    runner, _collected = _git_runner(tmp_path, git, provider=_OnceToolUseProvider())
+    await runner.run_and_capture("goal", run_id="r1")
+    assert "create_checkpoint:r1:1:auto-step-1" in git.calls
+    assert "create_checkpoint:r1:2:auto-step-2" in git.calls
+
+
+# 功能：验证 git_manager 存在时注册 5 个 git 工具，缺失时不注册
+# 设计：_build_registry 带 run_id 断言工具齐全；无 manager 断言 git_commit 缺失
+def test_registry_includes_git_tools_when_manager_present(tmp_path: Path) -> None:
+    runner, _collected = _git_runner(tmp_path, _FakeGitManager())
+    registry = runner._build_registry(TaskManager(tmp_path / "t" / ".tasks"), run_id="r1")
+    for name in (
+        "git_status",
+        "git_diff",
+        "git_checkpoint",
+        "git_commit",
+        "git_rollback",
+    ):
+        assert registry.get(name) is not None
+
+    plain, _plain_collected = _git_runner(tmp_path, None)
+    plain_registry = plain._build_registry(
+        TaskManager(tmp_path / "t2" / ".tasks"), run_id="r1"
+    )
+    assert plain_registry.get("git_commit") is None

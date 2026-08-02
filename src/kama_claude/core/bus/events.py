@@ -150,6 +150,13 @@ class ContextCompactedEvent(BaseModel):
     ts: str
 
 
+class GitRunDiffEvent(BaseModel):
+    type: Literal["git.run_diff"] = "git.run_diff"
+    run_id: str
+    stat: str  # diff stat 摘要（截断保护）
+    ts: str
+
+
 class PermissionRequestedEvent(BaseModel):
     type: Literal["permission.requested"] = "permission.requested"
     run_id: str
@@ -223,6 +230,7 @@ Event = Annotated[
     | SessionResumedEvent
     | SessionClosedEvent
     | ContextCompactedEvent
+    | GitRunDiffEvent
     | PermissionRequestedEvent
     | PermissionGrantedEvent
     | PermissionDeniedEvent
