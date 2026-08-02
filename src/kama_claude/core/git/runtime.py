@@ -46,13 +46,20 @@ class GitCliRuntime:
         return self._workspace_root
 
     # 执行一次 git 命令，返回合并输出与退出码；超时/CLI 缺失抛 GitUnavailableError
-    async def run(self, args: list[str], *, timeout: float = _DEFAULT_TIMEOUT_S) -> ExecResult:
+    async def run(
+        self,
+        args: list[str],
+        *,
+        timeout: float = _DEFAULT_TIMEOUT_S,
+        env: dict[str, str] | None = None,
+    ) -> ExecResult:
         try:
             proc = await asyncio.create_subprocess_exec(
                 self._git,
                 "-C",
                 str(self._workspace_root),
                 *args,
+                env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 start_new_session=True,
@@ -77,9 +84,13 @@ class GitCliRuntime:
 
     # 执行一次 git 命令并断言成功；非零退出按 stderr 关键词分类抛 GitError
     async def run_check(
-        self, args: list[str], *, timeout: float = _DEFAULT_TIMEOUT_S
+        self,
+        args: list[str],
+        *,
+        timeout: float = _DEFAULT_TIMEOUT_S,
+        env: dict[str, str] | None = None,
     ) -> ExecResult:
-        result = await self.run(args, timeout=timeout)
+        result = await self.run(args, timeout=timeout, env=env)
         if result.returncode != 0:
             stderr = result.output.decode("utf-8", errors="replace")
             raise classify_cli_error(stderr)

@@ -70,7 +70,8 @@ def classify_cli_error(stderr: str) -> GitError:
     if (
         "could not reset" in lowered
         or "failed to unpack" in lowered
-        or "untracked working tree files would be overwritten" in lowered
+        or "revert failed" in lowered
+        or "would be overwritten" in lowered
     ):
         return RollbackFailedError("git rollback failed", detail=stderr)
     return CommitFailedError("git command failed", detail=stderr)

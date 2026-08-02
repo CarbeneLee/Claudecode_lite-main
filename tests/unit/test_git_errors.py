@@ -121,13 +121,15 @@ def test_classify_checkpoint_failed(stderr: str) -> None:
 
 
 # 功能：验证回滚类失败 stderr 被分类为 RollbackFailedError
-# 设计：参数化 reset 解包失败/索引重置失败两类恢复路径故障
+# 设计：参数化 reset/revert 解包失败与本地修改保护拒绝两类恢复路径故障
 @pytest.mark.parametrize(
     "stderr",
     [
         "fatal: failed to unpack trees",
         "fatal: Could not reset index file to revision 'abc123'.",
         "error: The following untracked working tree files would be overwritten by checkout",
+        "error: Your local changes to the following files would be overwritten by merge",
+        "fatal: revert failed",
     ],
 )
 def test_classify_rollback_failed(stderr: str) -> None:
