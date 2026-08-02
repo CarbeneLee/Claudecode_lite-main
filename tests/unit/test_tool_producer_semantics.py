@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
-import kama_claude.core.tools.builtin.bash as bash_mod
+import kama_claude.core.sandbox.executors as exec_mod
 from kama_claude.core.bus.events import (
     ToolCallFailedEvent,
     ToolCallFinishedEvent,
@@ -15,6 +15,7 @@ from kama_claude.core.bus.events import (
 )
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import ToolCallBlock
+from kama_claude.core.sandbox.executors import HostExecutor
 from kama_claude.core.session.store import SessionStore
 from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.tools.builtin.bash import BashTool
@@ -182,7 +183,7 @@ async def test_bash_nonzero_exit_is_command_failed(
     tmp_path: Path,
     returncode: int,
 ) -> None:
-    result = await BashTool(tmp_path).invoke({"command": f"exit {returncode}"})
+    result = await BashTool(HostExecutor(), workspace_root=tmp_path).invoke({"command": f"exit {returncode}"})
 
     assert result.error_type == "command_failed"
     assert f"[exit {returncode}]" in result.content
@@ -197,7 +198,7 @@ async def test_bash_command_failed_keeps_combined_output(tmp_path: Path) -> None
         "exit 7"
     )
 
-    result = await BashTool(tmp_path).invoke({"command": command})
+    result = await BashTool(HostExecutor(), workspace_root=tmp_path).invoke({"command": command})
 
     assert result.error_type == "command_failed"
     assert "[exit 7]" in result.content
@@ -217,10 +218,10 @@ async def test_bash_direct_invoke_bubbles_unknown_subprocess_error(
     async def _explode(*args: object, **kwargs: object) -> object:
         raise RuntimeError(secret)
 
-    monkeypatch.setattr(bash_mod.asyncio, "create_subprocess_shell", _explode)
+    monkeypatch.setattr(exec_mod.asyncio, "create_subprocess_shell", _explode)
 
     with pytest.raises(RuntimeError, match="bash-secret"):
-        await BashTool(tmp_path).invoke({"command": "echo hi"})
+        await BashTool(HostExecutor(), workspace_root=tmp_path).invoke({"command": "echo hi"})
 
 
 # 功能：验证 Bash 未知异常在中央边界安全化、记 traceback 且只执行一次
@@ -239,10 +240,10 @@ async def test_bash_unknown_error_is_safely_classified_once(
         calls += 1
         raise RuntimeError(secret)
 
-    monkeypatch.setattr(bash_mod.asyncio, "create_subprocess_shell", _explode)
+    monkeypatch.setattr(exec_mod.asyncio, "create_subprocess_shell", _explode)
 
     with caplog.at_level(logging.ERROR, logger="kama_claude.core.tools.errors"):
-        result, events = await _invoke(BashTool(tmp_path), {"command": "echo hi"})
+        result, events = await _invoke(BashTool(HostExecutor(), workspace_root=tmp_path), {"command": "echo hi"})
 
     failed = [e for e in events if isinstance(e, ToolCallFailedEvent)]
     assert calls == 1
@@ -268,10 +269,10 @@ async def test_bash_spawn_cancelled_error_propagates_without_kill(
     async def _cancel(*args: object, **kwargs: object) -> object:
         raise cancellation
 
-    monkeypatch.setattr(bash_mod.asyncio, "create_subprocess_shell", _cancel)
+    monkeypatch.setattr(exec_mod.asyncio, "create_subprocess_shell", _cancel)
 
     with pytest.raises(asyncio.CancelledError) as exc_info:
-        await BashTool(tmp_path).invoke({"command": "echo hi"})
+        await BashTool(HostExecutor(), workspace_root=tmp_path).invoke({"command": "echo hi"})
 
     assert exc_info.value is cancellation
     assert process.kill_calls == 0
@@ -291,9 +292,9 @@ async def test_bash_communicate_cancelled_error_cleans_up_and_propagates(
     async def _spawn(*args: object, **kwargs: object) -> object:
         return process
 
-    monkeypatch.setattr(bash_mod.asyncio, "create_subprocess_shell", _spawn)
+    monkeypatch.setattr(exec_mod.asyncio, "create_subprocess_shell", _spawn)
     registry = ToolRegistry()
-    registry.register(BashTool(tmp_path))
+    registry.register(BashTool(HostExecutor(), workspace_root=tmp_path))
     bus = EventBus()
     events: list[BaseModel] = []
 
@@ -335,16 +336,16 @@ async def test_bash_communicate_runtime_error_cleans_up_and_is_safely_classified
     async def _spawn(*args: object, **kwargs: object) -> object:
         return processes.pop(0)
 
-    monkeypatch.setattr(bash_mod.asyncio, "create_subprocess_shell", _spawn)
+    monkeypatch.setattr(exec_mod.asyncio, "create_subprocess_shell", _spawn)
     direct_process = processes[0]
     with pytest.raises(RuntimeError) as exc_info:
-        await BashTool(tmp_path).invoke({"command": "echo hi"})
+        await BashTool(HostExecutor(), workspace_root=tmp_path).invoke({"command": "echo hi"})
 
     assert exc_info.value is direct_error
     assert direct_process.kill_calls == 1
     assert direct_process.communicate_calls == 2
     invoked_process = processes[0]
-    result, events = await _invoke(BashTool(tmp_path), {"command": "echo hi"})
+    result, events = await _invoke(BashTool(HostExecutor(), workspace_root=tmp_path), {"command": "echo hi"})
     failed = [event for event in events if isinstance(event, ToolCallFailedEvent)]
     assert invoked_process.kill_calls == 1
     assert invoked_process.communicate_calls == 2
@@ -367,9 +368,9 @@ async def test_bash_timeout_kills_and_reaps_fake_process(
     async def _spawn(*args: object, **kwargs: object) -> object:
         return process
 
-    monkeypatch.setattr(bash_mod.asyncio, "create_subprocess_shell", _spawn)
+    monkeypatch.setattr(exec_mod.asyncio, "create_subprocess_shell", _spawn)
 
-    result = await BashTool(tmp_path).invoke({"command": "echo hi"})
+    result = await BashTool(HostExecutor(), workspace_root=tmp_path).invoke({"command": "echo hi"})
 
     assert result.error_type == "timeout"
     assert process.kill_calls == 1
@@ -392,11 +393,11 @@ async def test_bash_cleanup_failure_logs_and_preserves_original_error(
     async def _spawn(*args: object, **kwargs: object) -> object:
         return process
 
-    monkeypatch.setattr(bash_mod.asyncio, "create_subprocess_shell", _spawn)
+    monkeypatch.setattr(exec_mod.asyncio, "create_subprocess_shell", _spawn)
 
-    with caplog.at_level(logging.ERROR, logger="kama_claude.core.tools.builtin.bash"):
+    with caplog.at_level(logging.ERROR, logger="kama_claude.core.sandbox.executors"):
         with pytest.raises(RuntimeError) as exc_info:
-            await BashTool(tmp_path).invoke({"command": "echo hi"})
+            await BashTool(HostExecutor(), workspace_root=tmp_path).invoke({"command": "echo hi"})
 
     assert exc_info.value is original
     assert process.kill_calls == 1
@@ -410,7 +411,7 @@ async def test_bash_command_failed_is_not_retried(tmp_path: Path) -> None:
     marker = tmp_path / "attempts.txt"
     command = f"printf 'attempt\\n' >> {marker.name}; exit 1"
 
-    result, events = await _invoke(BashTool(tmp_path), {"command": command})
+    result, events = await _invoke(BashTool(HostExecutor(), workspace_root=tmp_path), {"command": command})
 
     assert result.error_type == "command_failed"
     assert marker.read_text(encoding="utf-8").splitlines() == ["attempt"]

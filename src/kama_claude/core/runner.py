@@ -19,6 +19,8 @@ from kama_claude.core.mcp.server import McpServerManager
 from kama_claude.core.memory.loader import load_context_file
 from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.runs import RUNS_DIR, new_run_id
+from kama_claude.core.sandbox.executors import build_executor
+from kama_claude.core.sandbox.manager import SandboxManager
 from kama_claude.core.session.model import Session
 from kama_claude.core.session.store import SessionStore
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
@@ -73,6 +75,7 @@ class AgentRunner:
         permission_manager: PermissionManager | None = None,
         mcp_manager: McpServerManager | None = None,
         journal: EventJournalCoordinator | None = None,
+        sandbox_manager: SandboxManager | None = None,
     ) -> None:
         self._config = config
         self._path_resolver = WorkspacePathResolver(workspace_root)
@@ -85,6 +88,7 @@ class AgentRunner:
         self._trace = trace
         self._permission_manager = permission_manager
         self._mcp_manager = mcp_manager
+        self._sandbox_manager = sandbox_manager
         self._journal = journal or EventJournalCoordinator()
         self._owns_journal = journal is None
         if self._owns_journal:
@@ -115,7 +119,12 @@ class AgentRunner:
         registry = ToolRegistry()
         for t in [
             ReadFileTool(self._path_resolver, self._access_policy),
-            BashTool(self._workspace_root),
+            BashTool(
+                build_executor(
+                    self._sandbox_manager, workspace_root=self._workspace_root
+                ),
+                workspace_root=self._workspace_root,
+            ),
             WriteFileTool(self._path_resolver, self._access_policy),
             ListDirTool(self._path_resolver, self._access_policy),
             SearchCodeTool(self._path_resolver, self._access_policy),
@@ -151,6 +160,7 @@ class AgentRunner:
                         depth=0, # 防止agent无限递归调用自身，depth=0表示这是顶层agent
                         journal=self._journal,
                         background_tasks=self._background_tasks,
+                        sandbox_manager=self._sandbox_manager,
                     )
                 )
             if _ok("agent_result"):

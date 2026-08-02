@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 import tomllib
 from dataclasses import dataclass, field
@@ -7,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
+
+from kama_claude.core.sandbox.config import SandboxConfig
 
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 7437
@@ -83,6 +86,7 @@ class KamaConfig:
     permission: PermissionConfig = field(default_factory=PermissionConfig)
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
+    sandbox: SandboxConfig = field(default_factory=SandboxConfig)
 
 
 # 构建并返回运行时配置：默认值 → 全局 TOML → 项目本地 TOML → .env → 系统环境变量（后者优先级最高）
@@ -126,6 +130,7 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
         "permission",
         "compaction",
         "mcp",
+        "sandbox",
     }
     if unknown:
         raise SystemExit(f"Unknown top-level config keys: {', '.join(sorted(unknown))}")
@@ -309,6 +314,36 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
                 s.port = val
             config.mcp.servers.append(s)
 
+    if "sandbox" in data:
+        sb = data["sandbox"]
+        if not isinstance(sb, dict):
+            raise SystemExit("Config error: [sandbox] must be a table")
+        unknown_sb: set[str] = set(sb.keys()) - {"enabled", "image", "network", "exec_timeout_s"}
+        if unknown_sb:
+            raise SystemExit(f"Unknown [sandbox] keys: {', '.join(sorted(unknown_sb))}")
+        if "enabled" in sb:
+            val = sb["enabled"]
+            if not isinstance(val, bool):
+                raise SystemExit("Config error: sandbox.enabled must be a boolean")
+            config.sandbox = dataclasses.replace(config.sandbox, enabled=val)
+        if "image" in sb:
+            val = sb["image"]
+            if not isinstance(val, str):
+                raise SystemExit("Config error: sandbox.image must be a string")
+            config.sandbox = dataclasses.replace(config.sandbox, image=val)
+        if "network" in sb:
+            val = sb["network"]
+            if not isinstance(val, bool):
+                raise SystemExit("Config error: sandbox.network must be a boolean")
+            config.sandbox = dataclasses.replace(config.sandbox, network=val)
+        if "exec_timeout_s" in sb:
+            val = sb["exec_timeout_s"]
+            if not isinstance(val, int) or val <= 0:
+                raise SystemExit(
+                    "Config error: sandbox.exec_timeout_s must be a positive integer"
+                )
+            config.sandbox = dataclasses.replace(config.sandbox, exec_timeout_s=val)
+
 
 # 用 KAMA_* 环境变量覆盖 config 中对应字段（若变量已设置）
 def _apply_env(config: KamaConfig) -> None:
@@ -425,4 +460,40 @@ def _apply_env(config: KamaConfig) -> None:
             raise SystemExit(
                 "Config error: KAMA_COMPACT_TOOL_KEEP must be an integer,"
                 f" got: {compact_tool_keep!r}"
+            )
+
+    sandbox_enabled = os.environ.get("KAMA_SANDBOX_ENABLED")
+    if sandbox_enabled is not None:
+        config.sandbox = dataclasses.replace(
+            config.sandbox,
+            enabled=sandbox_enabled.lower() not in ("0", "false", "no"),
+        )
+
+    sandbox_image = os.environ.get("KAMA_SANDBOX_IMAGE")
+    if sandbox_image is not None:
+        config.sandbox = dataclasses.replace(config.sandbox, image=sandbox_image)
+
+    sandbox_network = os.environ.get("KAMA_SANDBOX_NETWORK")
+    if sandbox_network is not None:
+        config.sandbox = dataclasses.replace(
+            config.sandbox,
+            network=sandbox_network.lower() not in ("0", "false", "no"),
+        )
+
+    sandbox_timeout = os.environ.get("KAMA_SANDBOX_EXEC_TIMEOUT_S")
+    if sandbox_timeout is not None:
+        try:
+            sandbox_timeout_val = int(sandbox_timeout)
+            if sandbox_timeout_val <= 0:
+                raise SystemExit(
+                    "Config error: KAMA_SANDBOX_EXEC_TIMEOUT_S must be a positive integer,"
+                    f" got: {sandbox_timeout!r}"
+                )
+            config.sandbox = dataclasses.replace(
+                config.sandbox, exec_timeout_s=sandbox_timeout_val
+            )
+        except ValueError:
+            raise SystemExit(
+                "Config error: KAMA_SANDBOX_EXEC_TIMEOUT_S must be an integer,"
+                f" got: {sandbox_timeout!r}"
             )

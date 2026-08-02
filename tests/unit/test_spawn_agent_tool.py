@@ -19,6 +19,9 @@ from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock, UsageStats
 from kama_claude.core.loop import AgentLoop
+from kama_claude.core.sandbox.config import SandboxConfig
+from kama_claude.core.sandbox.executors import ContainerExecutor, HostExecutor
+from kama_claude.core.sandbox.manager import SandboxManager
 from kama_claude.core.subagent import tool as subagent_tool_module
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.subagent.tool import AgentResultTool, SpawnAgentTool
@@ -76,6 +79,7 @@ def _make_tool(
     provider: Any = None,
     depth: int = 0,
     journal: Any = None,
+    sandbox_manager: SandboxManager | None = None,
 ) -> tuple[SpawnAgentTool, BackgroundTaskRegistry, EventBus]:
     bus = EventBus()
     registry = BackgroundTaskRegistry()
@@ -91,6 +95,7 @@ def _make_tool(
         session_id="sess-test",
         depth=depth,
         journal=journal,
+        sandbox_manager=sandbox_manager,
     )
     return tool, registry, bus
 
@@ -170,6 +175,38 @@ def test_nested_spawn_agent_inherits_workspace(tmp_path: Path) -> None:
 
     assert isinstance(nested, SpawnAgentTool)
     assert nested._workspace_root == tmp_path.resolve(strict=True)
+
+
+# 功能：验证注入 sandbox_manager 后 child registry 的 bash 使用容器执行器
+# 设计：沿 child registry 组装路径检查 bash executor 类型，不执行命令
+def test_child_registry_bash_uses_container_executor_when_sandbox_injected(
+    tmp_path: Path,
+) -> None:
+    manager = SandboxManager(
+        config=SandboxConfig(image="python:3.12-slim"),
+        workspace_root=tmp_path.resolve(),
+    )
+    tool, _, _ = _make_tool(tmp_path, sandbox_manager=manager)
+
+    registry = tool._build_child_registry(EventBus(), "child-run", None)
+    bash_tool = registry.get("bash")
+
+    assert isinstance(bash_tool, BashTool)
+    assert isinstance(bash_tool._executor, ContainerExecutor)
+
+
+# 功能：验证未注入 sandbox_manager 时 child registry 的 bash 保持宿主执行器
+# 设计：默认路径断言 HostExecutor，防止子 agent 沙箱决策与顶层漂移
+def test_child_registry_bash_uses_host_executor_without_sandbox(
+    tmp_path: Path,
+) -> None:
+    tool, _, _ = _make_tool(tmp_path)
+
+    registry = tool._build_child_registry(EventBus(), "child-run", None)
+    bash_tool = registry.get("bash")
+
+    assert isinstance(bash_tool, BashTool)
+    assert isinstance(bash_tool._executor, HostExecutor)
 
 
 # 功能：验证 child registry 的 read/list 工具绑定 parent workspace

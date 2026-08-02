@@ -11,6 +11,7 @@ from kama_claude.core.bus.events import (
 )
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import ToolCallBlock
+from kama_claude.core.sandbox.errors import ContainerNotReadyError
 from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.tools.errors import (
     RETRYABLE_ERROR_TYPES,
@@ -30,7 +31,7 @@ from kama_claude.core.workspace.errors import (
 # 设计：直接锁定 allowlist 契约，防止新增或删除错误类型静默改变重试边界
 def test_only_explicit_transient_errors_are_retryable() -> None:
     assert RETRYABLE_ERROR_TYPES == frozenset(
-        {"transient_error", "rate_limited"}
+        {"transient_error", "rate_limited", "container_not_ready"}
     )
 
 
@@ -130,6 +131,24 @@ class _TransientExceptionNTimes(BaseTool):
         self.calls += 1
         if self.calls <= self._failures:
             raise TransientToolError("provider transient secret")
+        return ToolResult(content="ok")
+
+
+class _ContainerNotReadyNTimes(BaseTool):
+    name = "not_ready_n"
+    description = "Raises ContainerNotReadyError n times then succeeds"
+    input_schema: dict[str, object] = {"type": "object", "properties": {}, "required": []}
+
+    # 保存容器未就绪失败次数并初始化调用计数
+    def __init__(self, failures: int) -> None:
+        self._failures = failures
+        self.calls = 0
+
+    # 在指定次数内抛出容器未就绪异常，随后成功
+    async def invoke(self, params: dict[str, object]) -> ToolResult:
+        self.calls += 1
+        if self.calls <= self._failures:
+            raise ContainerNotReadyError("sandbox container not ready")
         return ToolResult(content="ok")
 
 
@@ -345,6 +364,32 @@ async def test_retryable_error_succeeds_on_third_attempt(
     assert [event.attempt for event in failed] == [1, 2]
     assert [event.error_class for event in failed] == [expected_error_type] * 2
     assert [event.error_message for event in failed] == [expected_message] * 2
+    assert [type(event) for event in events] == [
+        ToolCallStartedEvent,
+        ToolCallFailedEvent,
+        ToolCallFailedEvent,
+        ToolCallFinishedEvent,
+    ]
+
+
+# 功能：验证 container_not_ready 属于可重试类型，失败两次后第三次成功
+# 设计：真实 exception classifier 进入 retry loop，锁定调用次数、attempt 与最终 finished 事件
+async def test_container_not_ready_retries_and_succeeds_on_third_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool = _ContainerNotReadyNTimes(2)
+
+    result, events = await _run(tool, monkeypatch=monkeypatch)
+
+    failed = _failed(events)
+    assert tool.calls == 3
+    assert not result.is_error
+    assert result.content == "ok"
+    assert [event.attempt for event in failed] == [1, 2]
+    assert [event.error_class for event in failed] == [
+        "container_not_ready",
+        "container_not_ready",
+    ]
     assert [type(event) for event in events] == [
         ToolCallStartedEvent,
         ToolCallFailedEvent,

@@ -16,6 +16,8 @@ from kama_claude.core.events.journal import EventJournalCoordinator
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.memory.loader import load_context_file
 from kama_claude.core.runs import new_run_id
+from kama_claude.core.sandbox.executors import build_executor
+from kama_claude.core.sandbox.manager import SandboxManager
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.tools.builtin.bash import BashTool
@@ -138,6 +140,7 @@ class SpawnAgentTool(BaseTool):
         depth: int = 0,
         journal: EventJournalCoordinator | None = None,
         background_tasks: _BackgroundTaskOwners | None = None,
+        sandbox_manager: SandboxManager | None = None,
     ) -> None:
         self._provider = provider
         self._path_resolver = WorkspacePathResolver(workspace_root)
@@ -153,6 +156,7 @@ class SpawnAgentTool(BaseTool):
         self._session_id = session_id
         self._depth = depth
         self._journal = journal
+        self._sandbox_manager = sandbox_manager
         self._background_tasks = background_tasks if background_tasks is not None else {}
 
     # 派生子 agent，前台时阻塞直到完成并返回结果，后台时立即返回 run_id
@@ -376,7 +380,12 @@ class SpawnAgentTool(BaseTool):
         registry = ToolRegistry()
         _all_tools = [
             ReadFileTool(self._path_resolver, self._access_policy),
-            BashTool(self._workspace_root),
+            BashTool(
+                build_executor(
+                    self._sandbox_manager, workspace_root=self._workspace_root
+                ),
+                workspace_root=self._workspace_root,
+            ),
             WriteFileTool(self._path_resolver, self._access_policy),
             ListDirTool(self._path_resolver, self._access_policy),
             SearchCodeTool(self._path_resolver, self._access_policy),
@@ -409,6 +418,7 @@ class SpawnAgentTool(BaseTool):
                 depth=self._depth + 1,
                 journal=self._journal,
                 background_tasks=self._background_tasks,
+                sandbox_manager=self._sandbox_manager,
             )
             if _allowed("spawn_agent"):
                 registry.register(nested)
