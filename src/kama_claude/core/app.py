@@ -40,6 +40,7 @@ from kama_claude.core.bus.envelope import INVALID_PARAMS, HandlerError
 from kama_claude.core.config import KamaConfig, get_config
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.events.journal import EventJournalCoordinator
+from kama_claude.core.git.manager import GitManager
 from kama_claude.core.llm.provider import AnthropicProvider
 from kama_claude.core.logging_setup import setup_logging
 from kama_claude.core.mcp.server import McpServerManager
@@ -57,6 +58,7 @@ from kama_claude.core.transport.socket_server import (
     SocketServer,
     get_connection_context,
 )
+from kama_claude.core.workspace.context import WorkspaceContext
 from kama_claude.core.workspace.errors import INVALID_WORKSPACE, InvalidWorkspaceError
 from kama_claude.core.workspace.validation import validate_workspace_root
 
@@ -81,7 +83,7 @@ class CoreApp:
         self._sessions: SessionManager | None = None
         self._permission_manager: PermissionManager | None = None
         self._mcp_manager: McpServerManager | None = None
-        self._sandbox_managers: dict[Path, SandboxManager] = {}
+        self._contexts: dict[Path, WorkspaceContext] = {}
 
     # 处理 core.ping 请求，返回服务版本、运行时长和接收时间
     async def _ping_handler(self, params: dict[str, Any]) -> PongResult:
@@ -198,19 +200,32 @@ class CoreApp:
         close_task = asyncio.create_task(self._sessions.close(session_id))
         await self._await_secondary_task(close_task, role="session_startup_cleanup")
 
-    # 返回 workspace 对应的沙箱管理器；sandbox 关闭时返回 None，同 workspace 复用实例
-    def _sandbox_manager_for(self, workspace_root: Path) -> SandboxManager | None:
+    # 返回 workspace 对应的运行时上下文（sandbox + git 管理器）；按配置启停，同 workspace 复用实例
+    def _workspace_context_for(self, workspace_root: Path) -> WorkspaceContext:
         assert self._config is not None
-        if not self._config.sandbox.enabled:
-            return None
-        manager = self._sandbox_managers.get(workspace_root)
-        if manager is None:
-            manager = SandboxManager(
-                config=self._config.sandbox,
-                workspace_root=workspace_root,
+        context = self._contexts.get(workspace_root)
+        if context is None:
+            context = WorkspaceContext(
+                root=workspace_root,
+                sandbox=(
+                    SandboxManager(
+                        config=self._config.sandbox,
+                        workspace_root=workspace_root,
+                    )
+                    if self._config.sandbox.enabled
+                    else None
+                ),
+                git=(
+                    GitManager(
+                        config=self._config.git,
+                        workspace_root=workspace_root,
+                    )
+                    if self._config.git.enabled
+                    else None
+                ),
             )
-            self._sandbox_managers[workspace_root] = manager
-        return manager
+            self._contexts[workspace_root] = context
+        return context
 
     @staticmethod
     # 屏蔽重复取消并等待 cleanup task 终态，失败时只记录脱敏 secondary
@@ -362,8 +377,8 @@ class CoreApp:
         await server.stop()
         if self._mcp_manager is not None:
             await self._mcp_manager.stop_all()
-        for manager in self._sandbox_managers.values():
-            await manager.close()
+        for context in self._contexts.values():
+            await context.close()
         if self._journal is not None:
             await self._journal.close()
         if self._trace is not None:
@@ -424,7 +439,8 @@ class CoreApp:
                 permission_manager=self._permission_manager,
                 mcp_manager=self._mcp_manager,
                 journal=self._journal,
-                sandbox_manager=self._sandbox_manager_for(workspace_root),
+                sandbox_manager=self._workspace_context_for(workspace_root).sandbox,
+                git_manager=self._workspace_context_for(workspace_root).git,
             ),
             bus=self._bus,
             provider=compact_provider,

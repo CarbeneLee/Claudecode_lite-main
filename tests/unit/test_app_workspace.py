@@ -10,10 +10,13 @@ import kama_claude.core.app as app_module
 from kama_claude.core.app import CoreApp
 from kama_claude.core.bus.envelope import HandlerError
 from kama_claude.core.config import KamaConfig
+from kama_claude.core.git.config import GitConfig
+from kama_claude.core.git.manager import GitManager
 from kama_claude.core.sandbox.config import SandboxConfig
 from kama_claude.core.sandbox.executors import ExecResult
 from kama_claude.core.sandbox.manager import SandboxManager
 from kama_claude.core.session.model import Session, SessionMode
+from kama_claude.core.workspace.context import WorkspaceContext
 from kama_claude.core.workspace.errors import INVALID_WORKSPACE
 
 
@@ -333,8 +336,8 @@ async def test_core_app_runner_factory_no_sandbox_when_disabled(
     assert captured == [None]
 
 
-# 功能：验证 _shutdown 遍历关闭所有已注册 sandbox manager
-# 设计：预置两个真实 SandboxManager（注入记录型 runtime），断言 close 各被调用一次
+# 功能：验证 _shutdown 遍历关闭所有已注册 workspace context 的 sandbox manager
+# 设计：预置两个 WorkspaceContext（真实 SandboxManager + 记录型 runtime），断言 close 各一次
 async def test_core_app_shutdown_closes_sandbox_managers(tmp_path: Path) -> None:
     class _Server:
         # 记录型 socket server 替身，只提供 stop
@@ -346,16 +349,24 @@ async def test_core_app_shutdown_closes_sandbox_managers(tmp_path: Path) -> None
     workspace_a = tmp_path / "a"
     workspace_b = tmp_path / "b"
     app = CoreApp()
-    app._sandbox_managers = {
-        workspace_a: SandboxManager(
-            config=SandboxConfig(),
-            workspace_root=workspace_a,
-            runtime=first_runtime,  # type: ignore[arg-type]
+    app._contexts = {
+        workspace_a: WorkspaceContext(
+            root=workspace_a,
+            sandbox=SandboxManager(
+                config=SandboxConfig(),
+                workspace_root=workspace_a,
+                runtime=first_runtime,  # type: ignore[arg-type]
+            ),
+            git=None,
         ),
-        workspace_b: SandboxManager(
-            config=SandboxConfig(),
-            workspace_root=workspace_b,
-            runtime=second_runtime,  # type: ignore[arg-type]
+        workspace_b: WorkspaceContext(
+            root=workspace_b,
+            sandbox=SandboxManager(
+                config=SandboxConfig(),
+                workspace_root=workspace_b,
+                runtime=second_runtime,  # type: ignore[arg-type]
+            ),
+            git=None,
         ),
     }
 
@@ -363,3 +374,153 @@ async def test_core_app_shutdown_closes_sandbox_managers(tmp_path: Path) -> None
 
     assert first_runtime.close_calls == 1
     assert second_runtime.close_calls == 1
+
+
+# 功能：验证 git 启用时 runner_factory 注入 per-workspace GitManager
+# 设计：捕获 runner_factory 对同一 workspace 的两次调用，断言注入 GitManager 且复用同一实例（注册表）
+async def test_core_app_runner_factory_injects_git_manager(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path.resolve()
+    captured: list[object] = []
+    config = KamaConfig()
+    config.trace.enabled = False
+
+    class _StopAfterWiring(Exception):
+        pass
+
+    class _SessionManager:
+        # 同一 workspace 调用两次 runner_factory，验证注册表复用
+        def __init__(
+            self,
+            store: object,
+            runner_factory: Callable[[Path], object],
+            bus: object,
+            provider: object,
+        ) -> None:
+            runner_factory(workspace)
+            runner_factory(workspace)
+            raise _StopAfterWiring
+
+    # 捕获 CoreApp 构造 AgentRunner 时传入的 git_manager 参数
+    def fake_agent_runner(
+        config_arg: KamaConfig,
+        *,
+        workspace_root: Path,
+        **kwargs: object,
+    ) -> object:
+        captured.append(kwargs.get("git_manager"))
+        return object()
+
+    monkeypatch.setattr(app_module, "get_config", lambda: config)
+    monkeypatch.setattr(app_module, "setup_logging", lambda config_arg: None)
+    monkeypatch.setattr(app_module, "SessionStore", lambda root: object())
+    monkeypatch.setattr(app_module, "AnthropicProvider", lambda model: object())
+    monkeypatch.setattr(app_module, "SessionManager", _SessionManager)
+    monkeypatch.setattr(app_module, "AgentRunner", fake_agent_runner)
+
+    with pytest.raises(_StopAfterWiring):
+        await CoreApp().run()
+
+    assert len(captured) == 2
+    manager = captured[0]
+    assert isinstance(manager, GitManager)
+    assert manager.config is config.git  # 同一配置对象
+    assert captured[1] is manager  # 注册表按 workspace 复用同一实例
+
+
+# 功能：验证 git 关闭时 runner_factory 注入 None（无 git 能力路径）
+# 设计：config.git.enabled=False，断言 git_manager 参数为 None 且不触发管理器创建
+async def test_core_app_runner_factory_no_git_when_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path.resolve()
+    captured: list[object] = []
+    config = KamaConfig()
+    config.trace.enabled = False
+    config.git = GitConfig(enabled=False)
+
+    class _StopAfterWiring(Exception):
+        pass
+
+    class _SessionManager:
+        def __init__(
+            self,
+            store: object,
+            runner_factory: Callable[[Path], object],
+            bus: object,
+            provider: object,
+        ) -> None:
+            runner_factory(workspace)
+            raise _StopAfterWiring
+
+    def fake_agent_runner(
+        config_arg: KamaConfig,
+        *,
+        workspace_root: Path,
+        **kwargs: object,
+    ) -> object:
+        captured.append(kwargs.get("git_manager"))
+        return object()
+
+    monkeypatch.setattr(app_module, "get_config", lambda: config)
+    monkeypatch.setattr(app_module, "setup_logging", lambda config_arg: None)
+    monkeypatch.setattr(app_module, "SessionStore", lambda root: object())
+    monkeypatch.setattr(app_module, "AnthropicProvider", lambda model: object())
+    monkeypatch.setattr(app_module, "SessionManager", _SessionManager)
+    monkeypatch.setattr(app_module, "AgentRunner", fake_agent_runner)
+
+    with pytest.raises(_StopAfterWiring):
+        await CoreApp().run()
+
+    assert captured == [None]
+
+
+# 功能：验证 _shutdown 级联关闭所有已注册 workspace context（sandbox + git 各一次）
+# 设计：预置两个 WorkspaceContext（真实 SandboxManager + 真实 GitManager），断言运行时
+#       close 各一次、git manager 进入 CLOSED 终态，且重复 close 幂等
+async def test_core_app_shutdown_closes_contexts(tmp_path: Path) -> None:
+    class _Server:
+        # 记录型 socket server 替身，只提供 stop
+        async def stop(self) -> None:
+            pass
+
+    first_runtime = _FakeRuntime()
+    second_runtime = _FakeRuntime()
+    workspace_a = tmp_path / "a"
+    workspace_b = tmp_path / "b"
+    app = CoreApp()
+    app._contexts = {
+        workspace_a: WorkspaceContext(
+            root=workspace_a,
+            sandbox=SandboxManager(
+                config=SandboxConfig(),
+                workspace_root=workspace_a,
+                runtime=first_runtime,  # type: ignore[arg-type]
+            ),
+            git=GitManager(config=GitConfig(), workspace_root=workspace_a),
+        ),
+        workspace_b: WorkspaceContext(
+            root=workspace_b,
+            sandbox=SandboxManager(
+                config=SandboxConfig(),
+                workspace_root=workspace_b,
+                runtime=second_runtime,  # type: ignore[arg-type]
+            ),
+            git=GitManager(config=GitConfig(), workspace_root=workspace_b),
+        ),
+    }
+
+    await app._shutdown(_Server())
+
+    assert first_runtime.close_calls == 1
+    assert second_runtime.close_calls == 1
+    assert app._contexts[workspace_a].git is not None
+    assert app._contexts[workspace_a].git.state == "closed"
+    assert app._contexts[workspace_b].git.state == "closed"
+
+    # 幂等：shutdown 后重复 close 不报错、不重复 close 底层
+    await app._contexts[workspace_a].close()
+    assert first_runtime.close_calls == 1

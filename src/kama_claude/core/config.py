@@ -5,10 +5,11 @@ import os
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from dotenv import load_dotenv
 
+from kama_claude.core.git.config import GitConfig
 from kama_claude.core.sandbox.config import SandboxConfig
 
 _DEFAULT_HOST = "127.0.0.1"
@@ -20,6 +21,34 @@ _DEFAULT_CONFIG_PATH = "~/.kama/config.toml"
 _DEFAULT_MAX_STEPS = 20
 _DEFAULT_MODEL = "claude-sonnet-4-6"
 _DEFAULT_TRACE_FILE = "~/.kama/traces/daemon.jsonl"
+
+# [git] TOML 组允许的 key 与类型约束（严格校验，与其他配置组一致）
+_GIT_TOML_KEYS = frozenset(
+    {
+        "enabled",
+        "checkpoint_mode",
+        "branch_prefix",
+        "mode",
+        "auto_rollback_on_fail",
+        "author",
+        "checkpoint_namespace",
+        "squash_on_finalize",
+        "keep_checkpoint_refs",
+        "rollback_strategy",
+    }
+)
+_GIT_TOML_TYPES: dict[str, type] = {
+    "enabled": bool,
+    "checkpoint_mode": str,
+    "branch_prefix": str,
+    "mode": str,
+    "auto_rollback_on_fail": bool,
+    "author": str,
+    "checkpoint_namespace": str,
+    "squash_on_finalize": bool,
+    "keep_checkpoint_refs": bool,
+    "rollback_strategy": str,
+}
 
 
 @dataclass
@@ -87,6 +116,7 @@ class KamaConfig:
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
+    git: GitConfig = field(default_factory=GitConfig)
 
 
 # 构建并返回运行时配置：默认值 → 全局 TOML → 项目本地 TOML → .env → 系统环境变量（后者优先级最高）
@@ -131,6 +161,7 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
         "compaction",
         "mcp",
         "sandbox",
+        "git",
     }
     if unknown:
         raise SystemExit(f"Unknown top-level config keys: {', '.join(sorted(unknown))}")
@@ -344,6 +375,32 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
                 )
             config.sandbox = dataclasses.replace(config.sandbox, exec_timeout_s=val)
 
+    if "git" in data:
+        git_data = data["git"]
+        if not isinstance(git_data, dict):
+            raise SystemExit("Config error: [git] must be a table")
+        unknown_git: set[str] = set(git_data.keys()) - _GIT_TOML_KEYS
+        if unknown_git:
+            raise SystemExit(f"Unknown [git] keys: {', '.join(sorted(unknown_git))}")
+        for key, expected_type in _GIT_TOML_TYPES.items():
+            if key not in git_data:
+                continue
+            val = git_data[key]
+            if not isinstance(val, expected_type):
+                type_label = {bool: "boolean", str: "string"}.get(
+                    expected_type, expected_type.__name__
+                )
+                raise SystemExit(
+                    f"Config error: git.{key} must be a {type_label}"
+                )
+            try:
+                config.git = dataclasses.replace(
+                    config.git, **cast(dict[str, Any], {key: val})
+                )
+            except ValueError as exc:
+                # 枚举约束（checkpoint_mode/mode/rollback_strategy）由 GitConfig 校验
+                raise SystemExit(f"Config error: {exc}")
+
 
 # 用 KAMA_* 环境变量覆盖 config 中对应字段（若变量已设置）
 def _apply_env(config: KamaConfig) -> None:
@@ -497,3 +554,37 @@ def _apply_env(config: KamaConfig) -> None:
                 "Config error: KAMA_SANDBOX_EXEC_TIMEOUT_S must be an integer,"
                 f" got: {sandbox_timeout!r}"
             )
+
+    git_enabled = os.environ.get("KAMA_GIT_ENABLED")
+    if git_enabled is not None:
+        config.git = dataclasses.replace(
+            config.git,
+            enabled=git_enabled.lower() not in ("0", "false", "no"),
+        )
+
+    git_checkpoint_mode = os.environ.get("KAMA_GIT_CHECKPOINT_MODE")
+    if git_checkpoint_mode is not None:
+        try:
+            config.git = dataclasses.replace(
+                config.git, checkpoint_mode=git_checkpoint_mode
+            )
+        except ValueError as exc:
+            raise SystemExit(f"Config error: KAMA_GIT_CHECKPOINT_MODE {exc}")
+
+    git_branch_prefix = os.environ.get("KAMA_GIT_BRANCH_PREFIX")
+    if git_branch_prefix is not None:
+        config.git = dataclasses.replace(config.git, branch_prefix=git_branch_prefix)
+
+    git_mode = os.environ.get("KAMA_GIT_MODE")
+    if git_mode is not None:
+        try:
+            config.git = dataclasses.replace(config.git, mode=git_mode)
+        except ValueError as exc:
+            raise SystemExit(f"Config error: KAMA_GIT_MODE {exc}")
+
+    git_rollback = os.environ.get("KAMA_GIT_AUTO_ROLLBACK_ON_FAIL")
+    if git_rollback is not None:
+        config.git = dataclasses.replace(
+            config.git,
+            auto_rollback_on_fail=git_rollback.lower() not in ("0", "false", "no"),
+        )
