@@ -5,6 +5,13 @@ import logging
 
 from pydantic import BaseModel, ValidationError
 
+from kama_claude.core.sandbox.errors import (
+    ContainerNotReadyError,
+    SandboxCreationFailedError,
+    SandboxImageError,
+    SandboxTimeoutError,
+    SandboxUnavailableError,
+)
 from kama_claude.core.workspace.errors import (
     InvalidWorkspacePathError,
     SensitivePathError,
@@ -30,10 +37,15 @@ _STABLE_ERROR_TYPES: frozenset[str] = frozenset(
         "execution_error",
         "transient_error",
         "rate_limited",
+        "sandbox_unavailable",
+        "sandbox_image_error",
+        "sandbox_creation_failed",
+        "container_not_ready",
+        "sandbox_timeout",
     }
 )
 RETRYABLE_ERROR_TYPES: frozenset[str] = frozenset(
-    {"transient_error", "rate_limited"}
+    {"transient_error", "rate_limited", "container_not_ready"}
 )
 _SAFE_ERROR_MESSAGES: dict[str, str] = {
     "execution_error": "tool execution failed",
@@ -213,6 +225,16 @@ def classify_tool_exception(
         return "transient_error", "temporary tool failure"
     if isinstance(exc, RateLimitedError):
         return "rate_limited", "tool rate limit exceeded"
+    if isinstance(exc, SandboxUnavailableError):
+        return "sandbox_unavailable", "sandbox is unavailable"
+    if isinstance(exc, SandboxImageError):
+        return "sandbox_image_error", "sandbox image unavailable"
+    if isinstance(exc, SandboxCreationFailedError):
+        return "sandbox_creation_failed", "sandbox container creation failed"
+    if isinstance(exc, ContainerNotReadyError):
+        return "container_not_ready", "sandbox container not ready"
+    if isinstance(exc, SandboxTimeoutError):
+        return "sandbox_timeout", "sandbox command timed out"
     if isinstance(exc, TimeoutError):
         return "timeout", "tool execution timed out"
 

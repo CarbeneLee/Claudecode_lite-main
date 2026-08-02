@@ -1,32 +1,15 @@
 from __future__ import annotations
 
-import asyncio
-import logging
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from kama_claude.core.sandbox.executors import CommandExecutor
 from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.workspace.resolver import WorkspacePathResolver
 
 _MAX_OUTPUT_BYTES = 64 * 1024  # 64 KB
 _DEFAULT_TIMEOUT = 60
-_LOGGER = logging.getLogger(__name__)
-
-
-# 终止仍在运行的子进程并完成 reap；清理失败记日志但不覆盖调用方原始异常
-async def _kill_and_reap(proc: asyncio.subprocess.Process) -> None:
-    if proc.returncode is None:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        except (Exception, asyncio.CancelledError):
-            _LOGGER.exception("failed to terminate bash subprocess during cleanup")
-    try:
-        await proc.communicate()
-    except (Exception, asyncio.CancelledError):
-        _LOGGER.exception("failed to reap bash subprocess during cleanup")
 
 
 class BashParams(BaseModel):
@@ -58,49 +41,33 @@ class BashTool(BaseTool):
         "required": ["command"],
     }
 
-    # 绑定 shell 子进程的 canonical 启动 workspace
-    def __init__(self, workspace_root: Path) -> None:
+    # 绑定执行器（宿主或容器）与 canonical 启动 workspace；执行细节全部委托
+    def __init__(self, executor: CommandExecutor, *, workspace_root: Path) -> None:
+        self._executor = executor
         self._workspace_root = WorkspacePathResolver(workspace_root).root
 
-    # 从 workspace 启动 shell，合并 stdout/stderr，处理超时与非零退出码
+    # 委托 executor 执行，只保留展示逻辑：截断、超时与非零退出码分类
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         p = BashParams.model_validate(params)
-        command = p.command
-        timeout = p.timeout
-
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            cwd=str(self._workspace_root),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+        result = await self._executor.exec(
+            p.command, cwd=self._workspace_root, timeout=p.timeout
         )
-        try:
-            stdout_bytes, _ = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
-            )
-        except TimeoutError:
-            await _kill_and_reap(proc)
+
+        if result.timed_out:
             return ToolResult(
-                content=f"[timeout after {timeout}s]",
+                content=f"[timeout after {p.timeout}s]",
                 is_error=True,
                 error_type="timeout",
             )
-        except asyncio.CancelledError:
-            await _kill_and_reap(proc)
-            raise
-        except Exception:
-            await _kill_and_reap(proc)
-            raise
 
-        output = stdout_bytes.decode("utf-8", errors="replace")
-        truncated = len(stdout_bytes) > _MAX_OUTPUT_BYTES
+        output = result.output.decode("utf-8", errors="replace")
+        truncated = len(result.output) > _MAX_OUTPUT_BYTES
         if truncated:
             output = output[:_MAX_OUTPUT_BYTES] + "\n[truncated]"
 
-        returncode = proc.returncode or 0
-        if returncode != 0:
+        if result.returncode != 0:
             return ToolResult(
-                content=f"[exit {returncode}]\n{output}",
+                content=f"[exit {result.returncode}]\n{output}",
                 is_error=True,
                 error_type="command_failed",
             )

@@ -8,6 +8,13 @@ import pytest
 from pydantic import BaseModel, Field, ValidationError, create_model, model_validator
 
 import kama_claude.core.tools.errors as error_mod
+from kama_claude.core.sandbox.errors import (
+    ContainerNotReadyError,
+    SandboxCreationFailedError,
+    SandboxImageError,
+    SandboxTimeoutError,
+    SandboxUnavailableError,
+)
 from kama_claude.core.tools.errors import (
     RateLimitedError,
     TransientToolError,
@@ -734,6 +741,68 @@ def test_unknown_exception_uses_safe_execution_error_message() -> None:
     assert error_type == "execution_error"
     assert message == "tool execution failed"
     assert secret not in message
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected_error_type", "expected_message"),
+    [
+        (
+            SandboxUnavailableError("no daemon"),
+            "sandbox_unavailable",
+            "sandbox is unavailable",
+        ),
+        (
+            SandboxImageError("no image"),
+            "sandbox_image_error",
+            "sandbox image unavailable",
+        ),
+        (
+            SandboxCreationFailedError("create failed"),
+            "sandbox_creation_failed",
+            "sandbox container creation failed",
+        ),
+        (
+            ContainerNotReadyError("not running"),
+            "container_not_ready",
+            "sandbox container not ready",
+        ),
+        (SandboxTimeoutError("slow"), "sandbox_timeout", "sandbox command timed out"),
+    ],
+)
+# 功能：验证五个沙箱 domain 异常映射为独立稳定 error_type 而非落入 execution_error
+# 设计：参数化覆盖全部沙箱异常，断言与内置 TimeoutError 的 timeout 分支互不混淆
+def test_classifies_sandbox_errors(
+    exc: Exception,
+    expected_error_type: str,
+    expected_message: str,
+) -> None:
+    error_type, message = classify_tool_exception(exc)
+
+    assert error_type == expected_error_type
+    assert message == expected_message
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        "sandbox_unavailable",
+        "sandbox_image_error",
+        "sandbox_creation_failed",
+        "container_not_ready",
+        "sandbox_timeout",
+    ],
+)
+# 功能：验证沙箱 error_type 经 normalize 后内容原样透传（仅瞬态/execution 类才净化）
+# 设计：参数化全部沙箱类型，用含诊断信息的 content 断言不落入安全摘要兜底
+def test_normalize_sandbox_error_passes_content_through(error_type: str) -> None:
+    content = "docker stderr diagnostic"
+
+    normalized_type, normalized_content = error_mod.normalize_tool_error(
+        error_type, content
+    )
+
+    assert normalized_type == error_type
+    assert normalized_content == content
 
 
 # 功能：验证显式 execution_error ToolResult 内容始终归一化为固定安全摘要

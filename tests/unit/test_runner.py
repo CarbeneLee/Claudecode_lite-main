@@ -21,6 +21,14 @@ from kama_claude.core.events.writer import EventWriter
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.runner import AgentRunner
+from kama_claude.core.sandbox.config import SandboxConfig
+from kama_claude.core.sandbox.executors import (
+    ContainerExecutor,
+    ExecResult,
+    HostExecutor,
+)
+from kama_claude.core.sandbox.manager import SandboxManager
+from kama_claude.core.sandbox.runtime import ContainerRuntime
 from kama_claude.core.subagent.tool import SpawnAgentTool
 from kama_claude.core.task.manager import TaskManager
 from kama_claude.core.tools.builtin.bash import BashTool
@@ -187,6 +195,111 @@ def test_runner_passes_workspace_to_spawn_agent(tmp_path: Path) -> None:
 
     assert spawn_tool is not None
     assert spawn_tool._workspace_root == tmp_path.resolve(strict=True)  # type: ignore[attr-defined]
+
+
+class _RecordingRuntime(ContainerRuntime):
+    # 进程内 fake runtime：记录 exec 调用，验证 bash 经容器路径执行
+    def __init__(self) -> None:
+        self.ensure_calls = 0
+        self.exec_calls = 0
+        self.close_calls = 0
+        self.calls: list[tuple[str, str, float]] = []
+
+    async def ensure_running(self) -> None:
+        self.ensure_calls += 1
+
+    async def exec(self, command: str, *, cwd: str, timeout: float) -> ExecResult:
+        self.exec_calls += 1
+        self.calls.append((command, cwd, timeout))
+        return ExecResult(output=b"fake-out", returncode=0, timed_out=False)
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+def _sandbox_manager(workspace: Path, runtime: ContainerRuntime) -> SandboxManager:
+    return SandboxManager(
+        config=SandboxConfig(image="python:3.12-slim"),
+        workspace_root=workspace,
+        runtime=runtime,
+    )
+
+
+# 功能：验证注入 sandbox_manager 后 registry 的 bash 工具改用容器执行器
+# 设计：检查 bash 工具持有的 executor 类型与绑定的 workspace，不执行命令
+def test_runner_bash_uses_container_executor_when_sandbox_injected(
+    tmp_path: Path,
+) -> None:
+    runtime = _RecordingRuntime()
+    manager = _sandbox_manager(tmp_path.resolve(), runtime)
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        sandbox_manager=manager,
+    )
+
+    registry = runner._build_registry(TaskManager(tmp_path / "tasks"))
+    bash_tool = registry.get("bash")
+
+    assert isinstance(bash_tool, BashTool)
+    assert isinstance(bash_tool._executor, ContainerExecutor)
+    assert runtime.ensure_calls == 0  # 懒创建：装配不触发容器启动
+
+
+# 功能：验证未注入 sandbox_manager 时 bash 工具保持宿主执行器
+# 设计：默认装配路径断言 HostExecutor，防止沙箱关闭场景误入容器路径
+def test_runner_bash_uses_host_executor_without_sandbox(tmp_path: Path) -> None:
+    runner = AgentRunner(_config(), workspace_root=tmp_path.resolve())
+
+    registry = runner._build_registry(TaskManager(tmp_path / "tasks"))
+    bash_tool = registry.get("bash")
+
+    assert isinstance(bash_tool, BashTool)
+    assert isinstance(bash_tool._executor, HostExecutor)
+
+
+# 功能：验证注入沙箱后 bash 调用经容器路径转发（映射 cwd + 透传命令）
+# 设计：真实 invoke 走 runner 装配链，断言 fake runtime 收到容器内路径与命令
+async def test_runner_bash_invokes_through_container(tmp_path: Path) -> None:
+    runtime = _RecordingRuntime()
+    manager = _sandbox_manager(tmp_path.resolve(), runtime)
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        sandbox_manager=manager,
+    )
+    registry = runner._build_registry(TaskManager(tmp_path / "tasks"))
+
+    result = await registry.get("bash").invoke({"command": "echo hi"})  # type: ignore[union-attr]
+
+    assert not result.is_error
+    assert result.content == "fake-out"
+    assert runtime.ensure_calls == 1
+    assert runtime.exec_calls == 1
+    assert runtime.calls == [("echo hi", "/workspace", 60)]
+
+
+# 功能：验证 AgentRunner 把 sandbox_manager 传递给顶层 SpawnAgentTool
+# 设计：沿 registry 组装路径检查 spawn 工具持有同一 manager 实例
+def test_runner_passes_sandbox_manager_to_spawn_agent(tmp_path: Path) -> None:
+    runtime = _RecordingRuntime()
+    manager = _sandbox_manager(tmp_path.resolve(), runtime)
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        sandbox_manager=manager,
+    )
+
+    registry = runner._build_registry(
+        TaskManager(tmp_path / "tasks"),
+        run_id="run-1",
+        provider=_EndTurnProvider(),
+        bus=EventBus(),
+    )
+    spawn_tool = registry.get("spawn_agent")
+
+    assert spawn_tool is not None
+    assert spawn_tool._sandbox_manager is manager  # type: ignore[attr-defined]
 
 
 # 功能：验证 Runner registry 的 read/list 工具绑定 Runner workspace

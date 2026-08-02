@@ -47,6 +47,7 @@ from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.permissions.storage import load_policy_file
 from kama_claude.core.runner import AgentRunner
 from kama_claude.core.runs import new_run_id
+from kama_claude.core.sandbox.manager import SandboxManager
 from kama_claude.core.session import SessionManager, SessionStore
 from kama_claude.core.trace.record import TraceRecord
 from kama_claude.core.trace.writer import TraceWriter
@@ -80,6 +81,7 @@ class CoreApp:
         self._sessions: SessionManager | None = None
         self._permission_manager: PermissionManager | None = None
         self._mcp_manager: McpServerManager | None = None
+        self._sandbox_managers: dict[Path, SandboxManager] = {}
 
     # 处理 core.ping 请求，返回服务版本、运行时长和接收时间
     async def _ping_handler(self, params: dict[str, Any]) -> PongResult:
@@ -195,6 +197,20 @@ class CoreApp:
         assert self._sessions is not None
         close_task = asyncio.create_task(self._sessions.close(session_id))
         await self._await_secondary_task(close_task, role="session_startup_cleanup")
+
+    # 返回 workspace 对应的沙箱管理器；sandbox 关闭时返回 None，同 workspace 复用实例
+    def _sandbox_manager_for(self, workspace_root: Path) -> SandboxManager | None:
+        assert self._config is not None
+        if not self._config.sandbox.enabled:
+            return None
+        manager = self._sandbox_managers.get(workspace_root)
+        if manager is None:
+            manager = SandboxManager(
+                config=self._config.sandbox,
+                workspace_root=workspace_root,
+            )
+            self._sandbox_managers[workspace_root] = manager
+        return manager
 
     @staticmethod
     # 屏蔽重复取消并等待 cleanup task 终态，失败时只记录脱敏 secondary
@@ -346,6 +362,8 @@ class CoreApp:
         await server.stop()
         if self._mcp_manager is not None:
             await self._mcp_manager.stop_all()
+        for manager in self._sandbox_managers.values():
+            await manager.close()
         if self._journal is not None:
             await self._journal.close()
         if self._trace is not None:
@@ -406,6 +424,7 @@ class CoreApp:
                 permission_manager=self._permission_manager,
                 mcp_manager=self._mcp_manager,
                 journal=self._journal,
+                sandbox_manager=self._sandbox_manager_for(workspace_root),
             ),
             bus=self._bus,
             provider=compact_provider,
