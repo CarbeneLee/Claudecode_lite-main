@@ -7,7 +7,11 @@ from pathlib import Path
 import pytest
 
 from kama_claude.core.git.config import GitConfig
-from kama_claude.core.git.errors import MergeConflictError, RollbackFailedError
+from kama_claude.core.git.errors import (
+    CommitFailedError,
+    MergeConflictError,
+    RollbackFailedError,
+)
 from kama_claude.core.git.manager import GitManager
 from kama_claude.core.git.runtime import GitCliRuntime
 from kama_claude.core.git.tools import (
@@ -234,6 +238,8 @@ case "$cmd" in
     if [ "$FAKE_GIT_DIRTY" = "1" ]; then echo " M f.txt"; fi ;;
   rev-parse)
     if [ "$2" = "HEAD" ]; then printf '%s\\n' "$FAKE_GIT_HEAD"; fi ;;
+  diff)
+    printf '%s\\n' "$FAKE_GIT_DIFF" ;;
 esac
 exit 0
 """
@@ -270,3 +276,45 @@ async def test_finalize_call_order(
     assert lines[i_reset + 1] == "--soft"
     assert lines[i_commit + 1] == "-m"
     assert lines[i_commit + 2] == "kama: ship it"
+
+
+# 功能：验证 finalize 提交前扫描 staged diff，命中 secret 时拒绝提交且不泄漏值
+# 设计：fake git 的 diff --cached 输出含 AWS key；断言 CommitFailedError 的
+#       detail 含 file+line 与规则名、不含 secret 值，且 git commit 未被执行
+async def test_finalize_rejects_secret_in_staged_diff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script = tmp_path / "git"
+    script.write_text(_FAKE_GIT_SCRIPT, encoding="utf-8")
+    script.chmod(0o755)
+    log = tmp_path / "log.txt"
+    monkeypatch.setenv("FAKE_GIT_LOG", str(log))
+    monkeypatch.setenv("FAKE_GIT_BRANCH", "agent/t1")
+    monkeypatch.setenv("FAKE_GIT_DIRTY", "1")
+    monkeypatch.setenv("FAKE_GIT_HEAD", "a" * 40)
+    monkeypatch.setenv(
+        "FAKE_GIT_DIFF",
+        "diff --git a/creds.py b/creds.py\n"
+        "--- a/creds.py\n"
+        "+++ b/creds.py\n"
+        "@@ -1 +1,2 @@\n"
+        " ok\n"
+        "+AKIAIOSFODNN7EXAMPLE\n",
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    manager = GitManager(
+        config=GitConfig(),
+        workspace_root=workspace,
+        runtime=GitCliRuntime(git_executable=str(script), workspace_root=workspace),
+    )
+    tool = GitCommitTool(manager, "r1")
+
+    with pytest.raises(CommitFailedError) as exc:
+        await tool.invoke({"summary": "ship it"})
+
+    assert "creds.py" in exc.value.detail
+    assert ":2" in exc.value.detail  # 命中行号
+    assert "AKIAIOSFODNN7EXAMPLE" not in exc.value.detail  # 不泄漏 secret 值
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert "commit" not in lines  # 拒绝提交：git commit 未执行

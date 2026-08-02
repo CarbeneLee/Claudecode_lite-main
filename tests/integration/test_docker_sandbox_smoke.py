@@ -69,3 +69,24 @@ async def test_sandbox_close_idempotent_and_rejects_exec(tmp_path: Path) -> None
     assert manager.state == SandboxManager.CLOSED
     with pytest.raises(RuntimeError, match="closed"):
         await manager.exec("echo after-close", cwd="/workspace", timeout=30)
+
+
+# 功能：验证容器内 /workspace/.git 为只读子挂载（git 状态所有权归宿主运行时）
+# 设计：宿主 git init 产生真实 .git 目录；容器内可读 .git/config 但写入失败
+#       （ro 子挂载覆盖主 bind mount，更深路径者生效）
+async def test_sandbox_git_dir_readonly(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path)], check=True)
+    manager = SandboxManager(config=SandboxConfig(), workspace_root=tmp_path)
+    try:
+        read = await manager.exec(
+            "cat /workspace/.git/config", cwd="/workspace", timeout=120
+        )
+        write = await manager.exec(
+            "touch /workspace/.git/probe", cwd="/workspace", timeout=120
+        )
+
+        assert read.returncode == 0
+        assert write.returncode != 0
+        assert b"read-only" in write.output.lower()
+    finally:
+        await manager.close()

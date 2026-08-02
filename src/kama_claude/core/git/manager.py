@@ -23,6 +23,7 @@ from kama_claude.core.git.errors import (
     RollbackFailedError,
 )
 from kama_claude.core.git.runtime import GitCliRuntime
+from kama_claude.core.git.secrets import RegexScanner, SecretScanner
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -100,11 +101,13 @@ class GitManager:
         config: GitConfig,
         workspace_root: Path,
         runtime: GitCliRuntime | None = None,
+        scanner: SecretScanner | None = None,
     ) -> None:
         self._config = config
         self._state = self.IDLE
         self._lock = asyncio.Lock()
         self._runtime = runtime or GitCliRuntime(workspace_root=workspace_root)
+        self._scanner = scanner or RegexScanner()
 
     @property
     def state(self) -> str:
@@ -297,6 +300,19 @@ class GitManager:
                     detail="\n".join(foreign[:10]),
                 )
             await self._runtime.run_check(["reset", "--soft", baseline_sha])
+            # 提交前扫描即将入库的 staged diff；命中 secret 拒绝 finalize
+            # （detail 只含 file:line + 规则名，绝不携带 secret 值）
+            scan_result = await self._runtime.run_check(["diff", "--cached"])
+            findings = self._scanner.scan_diff(
+                scan_result.output.decode("utf-8", errors="replace")
+            )
+            if findings:
+                raise CommitFailedError(
+                    "finalize refused: secrets found in staged changes",
+                    detail="\n".join(
+                        f"{f.file}:{f.line} ({f.rule})" for f in findings
+                    ),
+                )
             await self._runtime.run_check(
                 ["commit", "-m", f"kama: {summary}"], env=self._author_env()
             )

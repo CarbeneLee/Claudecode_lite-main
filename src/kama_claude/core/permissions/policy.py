@@ -38,7 +38,11 @@ class ToolPolicy:
 
 
 DEFAULT_POLICIES: dict[str, ToolPolicy] = {
-    "bash":       ToolPolicy(default=PermissionDecision.ASK),
+    # git 命令直接 DENY：git 状态读写权归宿主运行时（GitManager），禁 agent 直连
+    "bash":       ToolPolicy(
+        default=PermissionDecision.ASK,
+        deny_patterns=[r"\bgit\b"],
+    ),
     "write_file": ToolPolicy(default=PermissionDecision.ASK),
     "read_file":  ToolPolicy(default=PermissionDecision.ALLOW),
     "list_dir":   ToolPolicy(default=PermissionDecision.ALLOW),

@@ -119,6 +119,11 @@ class DockerCliRuntime(ContainerRuntime):
             "--workdir",
             self._mount,
         ]
+        # git 状态所有权归宿主运行时：.git 以只读子挂载覆盖主挂载（更深路径者生效），
+        # 容器内可读不可写，杜绝 agent 在沙箱里篡改 git 元数据
+        git_dir = self._workspace_root / ".git"
+        if git_dir.is_dir():
+            args += ["--volume", f"{git_dir}:{self._mount}/.git:ro"]
         if not self._network:
             args += ["--network", "none"]
         args += [self._image, "sleep", "infinity"]
