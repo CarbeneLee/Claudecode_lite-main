@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import threading
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -216,15 +217,27 @@ async def _run_cleanup(
         raise
 
 
-# 停止消费 stdin 结果并关闭当前连接；无法强制终止已阻塞的 executor input 线程
+# 停止消费 stdin 结果、尽力关闭 daemon 侧会话并关闭当前连接
 async def _cleanup_chat_resources(
     owner: _OwnedConnection,
     input_task: asyncio.Task[str] | None,
+    session_id: str,
 ) -> None:
     if input_task is not None and not input_task.done():
         input_task.cancel()
     if input_task is not None:
         await asyncio.gather(input_task, return_exceptions=True)
+    if session_id:
+        # 尽力而为：让 daemon 取消后台 run 并关闭会话；失败仅依赖连接断开兜底
+        try:
+            await asyncio.wait_for(
+                owner.client.send_command(
+                    "session.close", {"session_id": session_id}
+                ),
+                timeout=_RPC_TIMEOUT_S,
+            )
+        except (ConnectionError, OSError, TimeoutError, IpcError):
+            log.warning("session.close interrupted during chat cleanup")
     await owner.close()
 
 
@@ -311,10 +324,32 @@ async def _activate_connection(
     return gate
 
 
-# 在线程池中读取 stdin，避免阻塞 socket event loop
+# 在 daemon 线程中读取 stdin，避免阻塞 socket event loop；
+# daemon 线程保证退出时解释器不会 join 阻塞的 input() 而挂死
+def _spawn_stdin_reader(prompt: str, future: asyncio.Future[str]) -> threading.Thread:
+    def worker() -> None:
+        try:
+            value = input(prompt)
+        except (EOFError, KeyboardInterrupt):
+            if not future.done():
+                future.set_exception(EOFError())
+        except Exception as exc:
+            if not future.done():
+                future.set_exception(exc)
+        else:
+            if not future.done():
+                future.set_result(value)
+
+    thread = threading.Thread(target=worker, daemon=True, name="kama-chat-stdin")
+    thread.start()
+    return thread
+
+
 async def _readline(prompt: str) -> str:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, input, prompt)
+    future: asyncio.Future[str] = loop.create_future()
+    _spawn_stdin_reader(prompt, future)
+    return await future
 
 
 # 异步核心：以显式 phase 和 RPC outcome 管理 session-scoped chat 的有界重连
@@ -605,7 +640,9 @@ async def _chat_async(config: KamaConfig) -> int:
                 return 1
     except asyncio.CancelledError:
         cleanup_claimed = True
-        cleanup_task = asyncio.create_task(_cleanup_chat_resources(owner, input_task))
+        cleanup_task = asyncio.create_task(
+            _cleanup_chat_resources(owner, input_task, session_id)
+        )
         await _await_cleanup_task(cleanup_task, role="chat_cancelled")
         raise
     except Exception:
@@ -615,7 +652,7 @@ async def _chat_async(config: KamaConfig) -> int:
         if not cleanup_claimed:
             cleanup_claimed = True
             await _run_cleanup(
-                _cleanup_chat_resources(owner, input_task),
+                _cleanup_chat_resources(owner, input_task, session_id),
                 role="chat_final",
             )
 

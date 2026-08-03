@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import io
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -195,3 +197,65 @@ async def test_send_rpc_timeout_returns_disconnected(
     )
 
     assert result.outcome == "disconnected"
+
+
+# 功能：验证 stdin 读取线程是 daemon 线程——退出时解释器不会 join 阻塞的 input()
+#       线程而挂死（修复前 run_in_executor 的默认线程池是非 daemon，Ctrl+C 后进程无法退出）
+# 设计：patch sys.stdin 让 input() 立即返回，断言线程 daemon 标记并正常完成
+def test_stdin_reader_thread_is_daemon() -> None:
+    loop = asyncio.new_event_loop()
+    future = loop.create_future()
+    try:
+        with patch("sys.stdin", io.StringIO("x\n")):
+            thread = chat_module._spawn_stdin_reader("> ", future)
+            assert thread.daemon is True
+            thread.join(timeout=2)
+            assert not thread.is_alive()
+        assert loop.run_until_complete(asyncio.wait_for(future, timeout=2)) == "x"
+    finally:
+        loop.close()
+
+
+# 功能：验证 _readline 从 stdin 读取一行（回归保护：readline 改为 daemon 线程实现后行为不变）
+async def test_readline_returns_line_from_stdin() -> None:
+    with patch("sys.stdin", io.StringIO("hello world\n")):
+        value = await asyncio.wait_for(chat_module._readline("> "), timeout=5)
+    assert value == "hello world"
+
+
+# 功能：验证 Ctrl+C（CancelledError 取消 _chat_async）时向 daemon 发送 session.close——
+#       让 daemon 取消后台 run 并关闭会话，而不是仅断开 socket 留下僵尸 run
+# 设计：订阅完成后阻塞 readline（模拟用户未输入时按 Ctrl+C），取消 chat task，
+#       断言 session.close RPC 已发出且连接已关闭
+async def test_ctrl_c_cancellation_sends_session_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeClient()
+    readline_started = asyncio.Event()
+
+    async def fake_readline(prompt: str) -> str:
+        await client.subscribed.wait()
+        readline_started.set()
+        await asyncio.Event().wait()
+
+    def make_client(host: str, port: int) -> _FakeClient:
+        return client
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(chat_module, "SocketClient", make_client)
+    monkeypatch.setattr(chat_module, "_readline", fake_readline)
+
+    chat_task = asyncio.create_task(chat_module._chat_async(KamaConfig()))
+    await readline_started.wait()
+    await asyncio.sleep(0.05)  # 主循环已进入 interactive 等待
+
+    chat_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(chat_task, timeout=5)
+
+    close_commands = [p for m, p in client.commands if m == "session.close"]
+    assert close_commands == [{"session_id": "sess-old"}]
+    assert client.closed
