@@ -334,18 +334,27 @@ async def _activate_connection(
 # 在 daemon 线程中读取 stdin，避免阻塞 socket event loop；
 # daemon 线程保证退出时解释器不会 join 阻塞的 input() 而挂死
 def _spawn_stdin_reader(prompt: str, future: asyncio.Future[str]) -> threading.Thread:
+    loop = future.get_loop()
+
+    def set_result(value: str) -> None:
+        if not future.done():
+            future.set_result(value)
+
+    def set_error(exc: BaseException) -> None:
+        if not future.done():
+            future.set_exception(exc)
+
     def worker() -> None:
         try:
             value = input(prompt)
         except (EOFError, KeyboardInterrupt):
-            if not future.done():
-                future.set_exception(EOFError())
+            loop.call_soon_threadsafe(set_error, EOFError())
         except Exception as exc:
-            if not future.done():
-                future.set_exception(exc)
+            loop.call_soon_threadsafe(set_error, exc)
         else:
-            if not future.done():
-                future.set_result(value)
+            # 必须经 call_soon_threadsafe（写自管道唤醒 select）：直接
+            # set_result 只入就绪队列，事件循环空闲阻塞时输入会被吞掉
+            loop.call_soon_threadsafe(set_result, value)
 
     thread = threading.Thread(target=worker, daemon=True, name="kama-chat-stdin")
     thread.start()

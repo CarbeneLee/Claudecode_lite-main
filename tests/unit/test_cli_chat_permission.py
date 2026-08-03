@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -221,6 +223,59 @@ async def test_readline_returns_line_from_stdin() -> None:
     with patch("sys.stdin", io.StringIO("hello world\n")):
         value = await asyncio.wait_for(chat_module._readline("> "), timeout=5)
     assert value == "hello world"
+
+
+# 功能：回归保护——事件循环空闲阻塞（select 无事件、无定时器）时，stdin 线程
+#       晚到的输入必须唤醒循环。直接跨线程 set_result 只入就绪队列不唤醒 select，
+#       输入会被永久吞掉（真实故障：chat 输入任务后毫无响应、无 send_message）。
+# 设计：子进程内用无数据的管道 fd 让 select() 阻塞，父进程延迟 1s 写入 stdin；
+#       修复前 _readline 永远不返回（超时强杀），修复后 ~1s 内返回
+def test_readline_wakes_idle_event_loop_from_stdin_thread() -> None:
+    import subprocess
+    import sys
+    import textwrap
+
+    child = textwrap.dedent(
+        r"""
+        import asyncio
+        import os
+        import time
+
+        from kama_claude.cli.commands.chat import _readline
+
+        async def main() -> None:
+            loop = asyncio.get_running_loop()
+            rr, _ = os.pipe()  # 让 select() 有 fd 可阻塞但永远无事件
+            loop.add_reader(rr, lambda: None)
+            print("READY", flush=True)
+            t0 = time.monotonic()
+            value = await _readline("> ")
+            print(f"GOT {value} {time.monotonic() - t0:.2f}s", flush=True)
+
+        asyncio.run(main())
+        """
+    )
+    read_fd, write_fd = os.pipe()
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child],
+        stdin=read_fd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    os.close(read_fd)
+    assert proc.stdout is not None
+    assert proc.stdout.readline().strip() == "READY"
+    time.sleep(1.0)  # 等子进程进入空闲 select()
+    os.write(write_fd, b"hello task\n")
+    os.close(write_fd)
+    try:
+        out, _ = proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, _ = proc.communicate()
+        pytest.fail(f"空闲事件循环未收到 stdin 输入（跨线程唤醒失效）: {out}")
+    assert "GOT hello task" in out
 
 
 # 功能：验证 Ctrl+C（CancelledError 取消 _chat_async）时向 daemon 发送 session.close——
