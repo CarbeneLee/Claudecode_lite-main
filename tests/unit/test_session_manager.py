@@ -73,11 +73,12 @@ class _Runner:
 
 class _GatedRunner(_Runner):
     # 可控 gate 的 runner：send_message 解耦后用于断言"run 在后台执行、close 可取消"
-    def __init__(self) -> None:
+    def __init__(self, *, fail_with: Exception | None = None) -> None:
         super().__init__()
         self.gate = asyncio.Event()
         self.started = asyncio.Event()
         self.cancelled = False
+        self.fail_with = fail_with
 
     async def run_and_capture(
         self,
@@ -90,6 +91,8 @@ class _GatedRunner(_Runner):
         except asyncio.CancelledError:
             self.cancelled = True
             raise
+        if self.fail_with is not None:
+            raise self.fail_with
         return await super().run_and_capture(goal, **kwargs)
 
 
@@ -540,3 +543,27 @@ async def test_close_cancels_active_run(tmp_path: Path) -> None:
     assert runner.cancelled
     assert store.read_meta(session.id).status == "closed"
     await _await_no_active_runs(manager)
+
+
+# 功能：验证 run 执行失败（runner 抛异常）后会话状态仍收敛到 waiting_for_input——
+#       _run_and_finalize 不得吞掉异常后静默结束，失败 run 后用户仍能继续输入
+# 设计：runner 配置 fail_with 抛 RuntimeError，等后台任务收敛后断言会话回到
+#       waiting_for_input（修复前 except 分支直接 return，状态卡在 active）
+async def test_run_failure_still_finalizes_session_state(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    runner = _GatedRunner(fail_with=RuntimeError("boom"))
+    manager = SessionManager(
+        store,
+        lambda _workspace_root: runner,
+        EventBus(),
+    )  # type: ignore[arg-type]
+    session = await manager.create("chat", workspace_root=tmp_path.resolve())
+
+    await asyncio.wait_for(
+        manager.send_message(session.id, "hello"), timeout=0.5
+    )
+    await asyncio.wait_for(runner.started.wait(), timeout=2)
+    runner.gate.set()
+    await _await_no_active_runs(manager)
+
+    assert store.read_meta(session.id).status == "waiting_for_input"

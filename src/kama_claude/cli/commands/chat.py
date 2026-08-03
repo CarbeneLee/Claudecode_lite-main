@@ -72,7 +72,14 @@ class ChatPrinter:
         elif t == "run.started":
             self.active_run = True
         elif t == "run.finished":
+            self._ensure_newline()
             self.active_run = False
+            status = str(event.get("status", ""))
+            if status == "cancelled":
+                print("[run cancelled]")
+            elif status not in ("", "success"):
+                reason = str(event.get("reason") or "unknown")
+                print(f"[run failed: {reason}]")
         elif t == "session.waiting_for_input":
             self._ensure_newline()
             self.pending_permission_id = None

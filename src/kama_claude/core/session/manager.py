@@ -203,8 +203,9 @@ class SessionManager:
                 # close()/shutdown 已收敛状态，不再发布 waiting_for_input
                 raise
             except Exception:
+                # runner 已在失败路径发布 run.finished(status=failed)，这里仅记录日志，
+                # 并继续下方状态收敛，让失败后的会话恢复正常交互（不静默卡在 active）
                 logger.exception("run failed sid=%s run_id=%s", sid, run_id)
-                return
             session = self._get_session(sid)
             lock = self._locks[sid]
             async with lock:

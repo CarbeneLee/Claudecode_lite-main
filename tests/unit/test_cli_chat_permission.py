@@ -259,3 +259,72 @@ async def test_ctrl_c_cancellation_sends_session_close(
     close_commands = [p for m, p in client.commands if m == "session.close"]
     assert close_commands == [{"session_id": "sess-old"}]
     assert client.closed
+
+
+# 功能：验证 run 失败（status=failed）会向用户显示失败原因——
+#       LLM 失败（如 key 错误）不能被静默吞掉，用户必须能看到 run 没成功
+# 设计：发送消息后推送 run.finished(status=failed, reason=llm_error)，
+#       断言终端输出包含 [run failed: llm_error]
+async def test_run_failure_is_displayed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client = _FakeClient()
+    lines = ["把任务做完"]
+    second_readline_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_readline(prompt: str) -> str:
+        await client.subscribed.wait()
+        if not lines:
+            second_readline_started.set()
+            await release.wait()
+            raise EOFError
+        return lines.pop(0)
+
+    def make_client(host: str, port: int) -> _FakeClient:
+        return client
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(chat_module, "SocketClient", make_client)
+    monkeypatch.setattr(chat_module, "_readline", fake_readline)
+
+    chat_task = asyncio.create_task(chat_module._chat_async(KamaConfig()))
+
+    while not any(m == "session.send_message" for m, _ in client.commands):
+        await asyncio.sleep(0.005)
+    await client.push("run.started", run_id="run-test")
+    await client.push(
+        "run.finished",
+        run_id="run-test",
+        status="failed",
+        reason="llm_error",
+        steps=1,
+    )
+
+    # 输出已渲染后才让 chat 退出（轮询收集，避免与 chat_task 取消竞争）
+    deadline = asyncio.get_running_loop().time() + 2
+    captured = ""
+    while "[run failed: llm_error]" not in captured:
+        assert asyncio.get_running_loop().time() < deadline, "failure not displayed"
+        captured += capsys.readouterr().out
+        await asyncio.sleep(0.005)
+
+    release.set()
+    await asyncio.wait_for(chat_task, timeout=5)
+    assert chat_task.result() == 0
+
+
+# 功能：验证 run 被取消时显示 [run cancelled]（区别于失败，文案友好）
+async def test_printer_shows_run_cancelled(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    printer = chat_module.ChatPrinter()
+    await printer.handle(
+        {"type": "run.finished", "status": "cancelled", "reason": "cancelled", "steps": 1}
+    )
+    out = capsys.readouterr().out
+    assert "[run cancelled]" in out
