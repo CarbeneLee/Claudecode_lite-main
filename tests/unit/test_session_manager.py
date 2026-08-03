@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any, cast
 
@@ -10,7 +11,12 @@ from kama_claude.core.config import KamaConfig
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse
 from kama_claude.core.runner import AgentRunner, RunOutcome
-from kama_claude.core.session.manager import SESSION_CLOSED, SESSION_NOT_FOUND, SessionManager
+from kama_claude.core.session.manager import (
+    SESSION_BUSY,
+    SESSION_CLOSED,
+    SESSION_NOT_FOUND,
+    SessionManager,
+)
 from kama_claude.core.session.model import Session
 from kama_claude.core.session.store import SessionStore
 
@@ -63,6 +69,37 @@ class _Runner:
             run_id,
         )
         return RunOutcome(status="success", result="done", reason=None)
+
+
+class _GatedRunner(_Runner):
+    # 可控 gate 的 runner：send_message 解耦后用于断言"run 在后台执行、close 可取消"
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = asyncio.Event()
+        self.started = asyncio.Event()
+        self.cancelled = False
+
+    async def run_and_capture(
+        self,
+        goal: str,
+        **kwargs: Any,
+    ) -> RunOutcome:
+        self.started.set()
+        try:
+            await self.gate.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return await super().run_and_capture(goal, **kwargs)
+
+
+# 等待 manager 的活跃 run 任务全部收敛（后台任务完成）
+async def _await_no_active_runs(manager: SessionManager, timeout: float = 2.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while manager.active_run_tasks() and loop.time() < deadline:
+        await asyncio.sleep(0.005)
+    assert not manager.active_run_tasks(), "run task did not finish within timeout"
 
 
 class _RecordingJournal:
@@ -189,6 +226,7 @@ async def test_run_stream_registers_before_skill_invoked_event(tmp_path: Path) -
     session = await manager.create("chat", workspace_root=workspace.resolve())
 
     run_id = await manager.send_message(session.id, "/demo now")
+    await _await_no_active_runs(manager)
 
     assert order.index(f"register:run:{run_id}:{session.id}") < order.index(
         "event:skill.invoked"
@@ -224,6 +262,7 @@ async def test_normal_session_inherits_v1_and_v2(
     session = await manager.create("chat", workspace_root=workspace.resolve())
 
     await manager.send_message(session.id, "Implement behavior A.")
+    await _await_no_active_runs(manager)
 
     assert provider.messages == [{"role": "user", "content": "Implement behavior A."}]
     assert provider.system is not None
@@ -250,6 +289,7 @@ async def test_slash_skill_override_excludes_default_v1_and_v2(tmp_path: Path) -
     session = await manager.create("chat", workspace_root=workspace.resolve())
 
     await manager.send_message(session.id, "/custom alpha")
+    await _await_no_active_runs(manager)
 
     assert runner.seen_goals == ["Custom override alpha"]
     assert runner.seen_system_prompt_overrides == ["Custom override $ARGUMENTS"]
@@ -271,6 +311,7 @@ async def test_send_message_chat_enters_waiting_and_writes_thread(tmp_path: Path
     session = await manager.create("chat", workspace_root=tmp_path.resolve())
 
     run_id = await manager.send_message(session.id, "hello")
+    await _await_no_active_runs(manager)
 
     loaded = store.read_meta(session.id)
     assert loaded.status == "waiting_for_input"
@@ -292,6 +333,7 @@ async def test_one_shot_auto_closes(tmp_path: Path) -> None:
     session = await manager.create("one_shot", workspace_root=tmp_path.resolve())
 
     await manager.send_message(session.id, "hello")
+    await _await_no_active_runs(manager)
 
     assert store.read_meta(session.id).status == "closed"
 
@@ -346,6 +388,7 @@ async def test_runner_factory_receives_session_workspace(tmp_path: Path) -> None
     session = await manager.create("chat", workspace_root=workspace)
 
     await manager.send_message(session.id, "hello")
+    await _await_no_active_runs(manager)
 
     assert received == [workspace]
 
@@ -380,6 +423,8 @@ async def test_runner_factory_isolated_between_session_workspaces(
 
     await manager.send_message(session_a.id, "from a")
     await manager.send_message(session_b.id, "from b")
+    await _await_no_active_runs(manager)
+    await _await_no_active_runs(manager)
 
     assert received == [workspace_a, workspace_b]
 
@@ -407,8 +452,91 @@ async def test_slash_skills_are_isolated_by_session_workspace(tmp_path: Path) ->
 
     await manager.send_message(session_a.id, "/local alpha")
     await manager.send_message(session_b.id, "/local beta")
+    await _await_no_active_runs(manager)
+    await _await_no_active_runs(manager)
 
     message_a = store.read_messages(session_a.id)[1]["content"][0]["text"]
     message_b = store.read_messages(session_b.id)[1]["content"][0]["text"]
     assert message_a == "done prompt-a alpha"
     assert message_b == "done prompt-b beta"
+
+
+# ── 新契约（权限性能 bug 修复）：send_message 只入队，run 在后台执行 ─────────────
+
+# 功能：验证 send_message 立即返回 run_id，run 在后台任务执行、状态与 thread 在完成时收敛
+# 设计：gate 卡住 run_and_capture，断言 send_message 返回时 session 仍 active 且无 assistant 消息；
+#       释放 gate 后进入 waiting_for_input 且 assistant 消息落盘
+async def test_send_message_returns_before_run_completes(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    runner = _GatedRunner()
+    manager = SessionManager(
+        store,
+        lambda _workspace_root: runner,
+        EventBus(),
+    )  # type: ignore[arg-type]
+    session = await manager.create("chat", workspace_root=tmp_path.resolve())
+
+    # 有界等待：修复前 send_message 会阻塞到 run 完成（gate 卡住 → 超时失败）
+    await asyncio.wait_for(
+        manager.send_message(session.id, "hello"), timeout=0.5
+    )
+
+    # 新契约：send_message 不阻塞到 run 完成
+    assert store.read_meta(session.id).status == "active"
+    assert manager.active_run_tasks()
+    assert store.read_messages(session.id) == [{"role": "user", "content": "hello"}]
+
+    runner.gate.set()
+    await _await_no_active_runs(manager)
+
+    assert store.read_meta(session.id).status == "waiting_for_input"
+    messages = store.read_messages(session.id)
+    assert messages[1]["role"] == "assistant"
+
+
+# 功能：验证 run 激活期间第二条消息被拒绝（保持单 run 契约）
+# 设计：gate 卡住第一个 run，再次 send_message 断言 SESSION_BUSY
+async def test_send_message_rejects_while_run_active(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    runner = _GatedRunner()
+    manager = SessionManager(
+        store,
+        lambda _workspace_root: runner,
+        EventBus(),
+    )  # type: ignore[arg-type]
+    session = await manager.create("chat", workspace_root=tmp_path.resolve())
+
+    await asyncio.wait_for(
+        manager.send_message(session.id, "hello"), timeout=0.5
+    )
+
+    with pytest.raises(HandlerError) as exc:
+        await manager.send_message(session.id, "again")
+    assert exc.value.code == SESSION_BUSY
+
+    runner.gate.set()
+    await _await_no_active_runs(manager)
+
+
+# 功能：验证 close 会取消激活中的 run（Ctrl+C 后 session.close 必须真正终止 run）
+# 设计：gate 卡住 run，close 后断言 runner 收到 CancelledError 且 session 终态 closed
+async def test_close_cancels_active_run(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    runner = _GatedRunner()
+    manager = SessionManager(
+        store,
+        lambda _workspace_root: runner,
+        EventBus(),
+    )  # type: ignore[arg-type]
+    session = await manager.create("chat", workspace_root=tmp_path.resolve())
+
+    await asyncio.wait_for(
+        manager.send_message(session.id, "hello"), timeout=0.5
+    )
+    await asyncio.wait_for(runner.started.wait(), timeout=2)
+
+    await manager.close(session.id)
+
+    assert runner.cancelled
+    assert store.read_meta(session.id).status == "closed"
+    await _await_no_active_runs(manager)

@@ -374,6 +374,8 @@ class CoreApp:
             run_task.cancel()
         if self._running_runs:
             await asyncio.gather(*self._running_runs, return_exceptions=True)
+        if self._sessions is not None:
+            await self._sessions.cancel_active_runs()
         await server.stop()
         if self._mcp_manager is not None:
             await self._mcp_manager.stop_all()

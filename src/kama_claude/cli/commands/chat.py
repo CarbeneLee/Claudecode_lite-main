@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -18,6 +18,9 @@ from kama_claude.core.transport.socket_client import (
 _CHAT_TOPICS = ["session.*", "run.*", "tool.*", "llm.token", "permission.*"]
 _MAX_RECONNECT_ATTEMPTS = 3
 _RECONNECT_DELAY_S = 0.1
+# 单次 RPC 的最长等待：daemon 侧 send_message 不再阻塞到 run 完成，
+# 此超时仅作为断线兜底，避免主循环无限冻结
+_RPC_TIMEOUT_S = 5.0
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +41,9 @@ class ChatPrinter:
     def __init__(self) -> None:
         self._inline = False
         self.pending_permission_id: str | None = None
+        # run 激活期间输入 y/a/n/d 会被缓冲，等待下一条权限请求自动生效
+        self.active_run = False
+        self.buffered_decision: str | None = None
 
     # 若当前 LLM token 尚未换行，则补一个换行
     def _ensure_newline(self) -> None:
@@ -62,12 +68,21 @@ class ChatPrinter:
             print(f"[permission] {tool_name}  {param_preview}")
             print("  y=allow once  a=always allow  n=deny once  d=always deny")
             self.pending_permission_id = tool_use_id
+        elif t == "run.started":
+            self.active_run = True
+        elif t == "run.finished":
+            self.active_run = False
         elif t == "session.waiting_for_input":
             self._ensure_newline()
             self.pending_permission_id = None
+            self.active_run = False
+            self.buffered_decision = None
             print("[waiting for input]")
         elif t == "session.closed":
             self._ensure_newline()
+            self.pending_permission_id = None
+            self.active_run = False
+            self.buffered_decision = None
             print("session closed.")
 
 
@@ -77,6 +92,7 @@ class _ChatDeliveryState:
     stream_id: str
     daemon_instance_id: str | None
     daemon_changed: asyncio.Event
+    permission_arrived: asyncio.Event
     cursor: int = 0
 
     # 校验 delivery 身份，成功渲染后才原子推进当前 session cursor
@@ -89,6 +105,8 @@ class _ChatDeliveryState:
         if delivery.stream_id != self.stream_id:
             return
         await self.printer.handle(delivery.event)
+        if delivery.event.get("type") == "permission.requested":
+            self.permission_arrived.set()
         if delivery.seq is not None:
             self.cursor = max(self.cursor, delivery.seq)
 
@@ -217,41 +235,55 @@ async def _send_rpc(
     params: dict[str, Any],
 ) -> _RpcResult:
     try:
-        return _RpcResult("ok", await client.send_command(method, params))
+        value = await asyncio.wait_for(
+            client.send_command(method, params),
+            timeout=_RPC_TIMEOUT_S,
+        )
+        return _RpcResult("ok", value)
     except asyncio.CancelledError:
         if _caller_is_cancelling():
             raise
         return _RpcResult("disconnected")
     except (ConnectionError, OSError):
         return _RpcResult("disconnected")
+    except TimeoutError:
+        return _RpcResult("disconnected")
     except IpcError:
         return _RpcResult("ipc_error")
 
 
-# 等待 socket 断线、daemon 身份异常或一行用户输入，断线语义优先
+# 等待 socket 断线、daemon 身份异常、权限请求或一行用户输入，断线语义优先
 async def _wait_for_chat_activity(
     loop_task: asyncio.Task[None],
     input_task: asyncio.Task[str],
     daemon_changed: asyncio.Event,
+    extra_events: Sequence[asyncio.Event] = (),
 ) -> str:
     daemon_changed_task = asyncio.create_task(daemon_changed.wait())
+    extra_tasks = [asyncio.create_task(ev.wait()) for ev in extra_events]
     cancellation_seen = False
     try:
         await asyncio.wait(
-            {loop_task, input_task, daemon_changed_task},
+            {loop_task, input_task, daemon_changed_task, *extra_tasks},
             return_when=asyncio.FIRST_COMPLETED,
         )
         if daemon_changed.is_set():
             return "daemon_changed"
         if loop_task.done():
             return "disconnected"
+        for event in extra_events:
+            if event.is_set():
+                return "permission"
         return "input"
     except asyncio.CancelledError:
         cancellation_seen = True
         if not daemon_changed_task.done():
             daemon_changed_task.cancel()
+        for extra_task in extra_tasks:
+            if not extra_task.done():
+                extra_task.cancel()
         cleanup_task = asyncio.ensure_future(
-            asyncio.gather(daemon_changed_task, return_exceptions=True)
+            asyncio.gather(daemon_changed_task, *extra_tasks, return_exceptions=True)
         )
         await _await_cleanup_task(cleanup_task, role="chat_activity_waiter")
         raise
@@ -259,7 +291,10 @@ async def _wait_for_chat_activity(
         if not cancellation_seen:
             if not daemon_changed_task.done():
                 daemon_changed_task.cancel()
-            await asyncio.gather(daemon_changed_task, return_exceptions=True)
+            for extra_task in extra_tasks:
+                if not extra_task.done():
+                    extra_task.cancel()
+            await asyncio.gather(daemon_changed_task, *extra_tasks, return_exceptions=True)
 
 
 # 建立 owner 的 socket、delivery gate 与读循环
@@ -269,6 +304,7 @@ async def _activate_connection(
 ) -> _DeliveryGate:
     await owner.client.connect()
     state.daemon_changed = asyncio.Event()
+    state.permission_arrived = asyncio.Event()
     gate = _DeliveryGate(state.handle)
     owner.client.on_delivery(gate.handle)
     owner.loop_task = asyncio.create_task(owner.client.run_event_loop())
@@ -284,7 +320,7 @@ async def _readline(prompt: str) -> str:
 # 异步核心：以显式 phase 和 RPC outcome 管理 session-scoped chat 的有界重连
 async def _chat_async(config: KamaConfig) -> int:
     printer = ChatPrinter()
-    state = _ChatDeliveryState(printer, "", None, asyncio.Event())
+    state = _ChatDeliveryState(printer, "", None, asyncio.Event(), asyncio.Event())
     owner = _OwnedConnection(SocketClient(config.host, config.port))
     gate: _DeliveryGate | None = None
     input_task: asyncio.Task[str] | None = None
@@ -325,6 +361,8 @@ async def _chat_async(config: KamaConfig) -> int:
         fresh_view_fallbacks += 1
         print(notice)
         printer.pending_permission_id = None
+        printer.active_run = False
+        printer.buffered_decision = None
         if input_task is not None:
             discard_pending_input = True
         session_id = ""
@@ -435,7 +473,33 @@ async def _chat_async(config: KamaConfig) -> int:
                 owner.loop_task,
                 input_task,
                 state.daemon_changed,
+                extra_events=[state.permission_arrived],
             )
+            if outcome == "permission":
+                state.permission_arrived.clear()
+                if (
+                    printer.buffered_decision is not None
+                    and printer.pending_permission_id is not None
+                ):
+                    queued_decision = printer.buffered_decision
+                    printer.buffered_decision = None
+                    tool_use_id = printer.pending_permission_id
+                    printer.pending_permission_id = None
+                    sent = await _send_rpc(
+                        owner.client,
+                        "permission.respond",
+                        {"tool_use_id": tool_use_id, "decision": queued_decision},
+                    )
+                    if sent.outcome == "ok":
+                        continue
+                    print("[permission] response interrupted; not retried")
+                    if sent.outcome == "ipc_error":
+                        continue
+                    phase = "subscribe"
+                    if not await reconnect():
+                        print("error: reconnect attempts exhausted", file=sys.stderr)
+                        return 1
+                continue
             if outcome != "input":
                 if owner.loop_task.done() and not owner.loop_task.cancelled():
                     if owner.loop_task.exception() is not None:
@@ -509,12 +573,28 @@ async def _chat_async(config: KamaConfig) -> int:
                     return 1
                 continue
 
+            if printer.active_run:
+                decision = _DECISION_MAP.get(content.lower())
+                if decision is not None:
+                    printer.buffered_decision = decision
+                    print(
+                        f"  [{decision} queued; applied to the next permission prompt]"
+                    )
+                    continue
+                print(
+                    "[run in progress] only y/a/n/d can be queued while "
+                    "the agent is running",
+                    file=sys.stderr,
+                )
+                continue
+
             sent = await _send_rpc(
                 owner.client,
                 "session.send_message",
                 {"session_id": session_id, "content": content},
             )
             if sent.outcome == "ok":
+                printer.active_run = True
                 continue
             print("[message] delivery interrupted; not retried")
             if sent.outcome == "ipc_error":
