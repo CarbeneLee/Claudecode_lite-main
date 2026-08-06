@@ -243,7 +243,7 @@ async def _cleanup_chat_resources(
                 ),
                 timeout=_RPC_TIMEOUT_S,
             )
-        except (ConnectionError, OSError, TimeoutError, IpcError):
+        except (ConnectionError, OSError, TimeoutError, IpcError, RuntimeError):
             log.warning("session.close interrupted during chat cleanup")
     await owner.close()
 
