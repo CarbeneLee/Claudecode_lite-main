@@ -143,8 +143,17 @@ async def test_binary_files_skipped(tmp_path) -> None:
     assert service.stats().indexed_files == 1
 
 
+# root 无视文件权限位（可读 chmod 000 文件/目录），CI 的 Dockerfile test stage
+# 以 root 运行，chmod fault injection 在 root 下无法构造权限拒绝
+_root_skips_permissions = pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root bypasses file permission bits",
+)
+
+
 # 功能：验证不可读文件跳过（fault injection：chmod 000）
 # 设计：权限拒绝不中断构建，计入 skipped_unreadable
+@_root_skips_permissions
 async def test_unreadable_file_skipped(tmp_path) -> None:
     ws = _write_workspace(tmp_path, {"auth.py": AUTH_PY, "secret.py": "def s():\n    pass\n"})
     secret = ws / "secret.py"
@@ -212,6 +221,7 @@ async def test_concurrent_ensure_serialized(tmp_path, monkeypatch) -> None:
 
 # 功能：验证 workspace 根扫描失败 → IndexUnavailableError（工具层据此降级）
 # 设计：fault injection——根目录 chmod 000，ensure_ready 上抛语义化异常
+@_root_skips_permissions
 async def test_scan_root_failure_raises_index_unavailable(tmp_path) -> None:
     ws = _write_workspace(tmp_path, {"auth.py": AUTH_PY})
     service = _make_service(tmp_path)
