@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -113,6 +114,7 @@ async def test_session_runner_uses_workspace_context_not_daemon_cwd(
     session = await manager.create("chat", workspace_root=workspace.resolve())
 
     await manager.send_message(session.id, "inspect")
+    await asyncio.gather(*manager.active_run_tasks())
 
     assert "workspace-context" in provider.systems[0]
     assert "daemon-context" not in provider.systems[0]
@@ -142,7 +144,9 @@ async def test_two_sessions_build_runners_with_distinct_workspaces(tmp_path: Pat
     session_b = await manager.create("chat", workspace_root=workspace_b.resolve())
 
     await manager.send_message(session_a.id, "from a")
+    await asyncio.gather(*manager.active_run_tasks())
     await manager.send_message(session_b.id, "from b")
+    await asyncio.gather(*manager.active_run_tasks())
 
     assert roots == [workspace_a.resolve(), workspace_b.resolve()]
     assert "context-a" in provider.systems[0]
@@ -177,8 +181,10 @@ async def test_chat_multiround_keeps_session_workspace(
     session = await manager.create("chat", workspace_root=workspace.resolve())
     monkeypatch.chdir(daemon_a)
     await manager.send_message(session.id, "first")
+    await asyncio.gather(*manager.active_run_tasks())
     monkeypatch.chdir(daemon_b)
     await manager.send_message(session.id, "second")
+    await asyncio.gather(*manager.active_run_tasks())
 
     assert roots == [workspace.resolve(), workspace.resolve()]
     assert len(provider.systems) == 2
