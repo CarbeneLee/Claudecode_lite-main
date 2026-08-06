@@ -1377,16 +1377,22 @@ async def test_run_start_creates_baseline_in_order(tmp_path: Path) -> None:
 
 
 # 功能：验证 dirty 工作树且用户批准时调用 snapshot_pre_run（含用户修改的 baseline）
-# 设计：dirty=True + 批准 → ASK 记录与 snapshot 调用，且仍建立 task 分支与 baseline
+# 设计：dirty=True + 批准 → ASK 记录；先切 task 分支再固化快照（pre-run 提交
+# 落在 agent 分支而非 main），随后建立 baseline
 async def test_dirty_run_approves_snapshot(tmp_path: Path) -> None:
     git = _FakeGitManager(dirty=True)
     perm = _FakePermissionManager(allowed=True)
     runner, _collected = _git_runner(tmp_path, git, permission_manager=perm)
     await runner.run_and_capture("goal", run_id="r1")
     assert perm.asked and perm.asked[0][0] == "git_pre_run_snapshot"
-    assert "snapshot_pre_run:r1" in git.calls
-    assert "ensure_task_branch:r1" in git.calls
-    assert "create_checkpoint:r1:0:baseline" in git.calls
+    assert git.calls == [
+        "ensure_ready",
+        "status",
+        "ensure_task_branch:r1",
+        "snapshot_pre_run:r1",
+        "create_checkpoint:r1:0:baseline",
+        "diff",
+    ]
 
 
 # 功能：验证 dirty 工作树且用户拒绝时抛 DirtyWorkspaceError 且不触碰工作树

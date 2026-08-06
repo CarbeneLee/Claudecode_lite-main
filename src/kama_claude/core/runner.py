@@ -289,7 +289,8 @@ class AgentRunner:
             gm = git_manager
             try:
                 status = await gm.status()
-                if status.dirty:
+                dirty = status.dirty
+                if dirty:
                     allowed = await self._request_git_snapshot(
                         bus, run_id, session_id_str
                     )
@@ -298,9 +299,13 @@ class AgentRunner:
                             "workspace has uncommitted changes; approve snapshot "
                             "baseline or handle manually"
                         )
-                    await gm.snapshot_pre_run(run_id)
+                # 先切 task 分支再固化快照：dirty 改动随 checkout 带到 agent 分支，
+                # pre-run 提交不再落在 main（零污染）；快照后树干净，baseline 用
+                # force 让 ref 指向 HEAD（不产生空提交），保证 step-0 始终存在
                 await gm.ensure_task_branch(run_id)
-                await gm.create_checkpoint(run_id, 0, "baseline")
+                if dirty:
+                    await gm.snapshot_pre_run(run_id)
+                await gm.create_checkpoint(run_id, 0, "baseline", force=True)
             except DirtyWorkspaceError:
                 # 用户拒绝快照：run 直接失败，工作树保持原样
                 await bus.publish(
