@@ -27,6 +27,11 @@ FROM builder AS test
 
 ENV UV_PROJECT_ENVIRONMENT=/opt/test-venv
 
+# slim 基础镜像不含 git；git 模块与 git_head_provider 测试需要真实 CLI
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY tests ./tests
 COPY scripts ./scripts
 COPY WIRE_PROTOCOL.md README.md ./
