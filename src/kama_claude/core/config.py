@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 
 from kama_claude.core.git.config import GitConfig
 from kama_claude.core.sandbox.config import SandboxConfig
+from kama_claude.core.semantic.config import SemanticConfig
 
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 7437
@@ -48,6 +49,40 @@ _GIT_TOML_TYPES: dict[str, type] = {
     "squash_on_finalize": bool,
     "keep_checkpoint_refs": bool,
     "rollback_strategy": str,
+}
+
+# [semantic] TOML 组允许的 key 与类型约束（严格校验，与其他配置组一致）
+_SEMANTIC_TOML_KEYS = frozenset(
+    {
+        "enabled",
+        "strategy",
+        "index_dir",
+        "chunk_size",
+        "min_chunk_lines",
+        "ngram_n",
+        "default_top_k",
+        "similarity_threshold",
+        "max_index_files",
+        "max_file_bytes",
+        "total_index_bytes",
+        "degradation",
+        "max_query_chars",
+    }
+)
+_SEMANTIC_TOML_TYPES: dict[str, type] = {
+    "enabled": bool,
+    "strategy": str,
+    "index_dir": str,
+    "chunk_size": int,
+    "min_chunk_lines": int,
+    "ngram_n": int,
+    "default_top_k": int,
+    "similarity_threshold": float,
+    "max_index_files": int,
+    "max_file_bytes": int,
+    "total_index_bytes": int,
+    "degradation": str,
+    "max_query_chars": int,
 }
 
 
@@ -117,6 +152,7 @@ class KamaConfig:
     mcp: McpConfig = field(default_factory=McpConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     git: GitConfig = field(default_factory=GitConfig)
+    semantic: SemanticConfig = field(default_factory=SemanticConfig)
 
 
 # 构建并返回运行时配置：默认值 → 全局 TOML → 项目本地 TOML → .env → 系统环境变量（后者优先级最高）
@@ -162,6 +198,7 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
         "mcp",
         "sandbox",
         "git",
+        "semantic",
     }
     if unknown:
         raise SystemExit(f"Unknown top-level config keys: {', '.join(sorted(unknown))}")
@@ -401,6 +438,38 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
                 # 枚举约束（checkpoint_mode/mode/rollback_strategy）由 GitConfig 校验
                 raise SystemExit(f"Config error: {exc}")
 
+    if "semantic" in data:
+        semantic_data = data["semantic"]
+        if not isinstance(semantic_data, dict):
+            raise SystemExit("Config error: [semantic] must be a table")
+        unknown_semantic: set[str] = set(semantic_data.keys()) - _SEMANTIC_TOML_KEYS
+        if unknown_semantic:
+            raise SystemExit(f"Unknown [semantic] keys: {', '.join(sorted(unknown_semantic))}")
+        for key, expected_type in _SEMANTIC_TOML_TYPES.items():
+            if key not in semantic_data:
+                continue
+            val = semantic_data[key]
+            # TOML 整数 1 与 1.0 视为同一阈值取值，统一转 float 后校验
+            if key == "similarity_threshold" and isinstance(val, int) and not isinstance(val, bool):
+                val = float(val)
+            if not isinstance(val, expected_type):
+                type_label = {
+                    bool: "a boolean",
+                    str: "a string",
+                    int: "an integer",
+                    float: "a number",
+                }.get(expected_type, expected_type.__name__)
+                raise SystemExit(
+                    f"Config error: semantic.{key} must be {type_label}"
+                )
+            try:
+                config.semantic = dataclasses.replace(
+                    config.semantic, **cast(dict[str, Any], {key: val})
+                )
+            except ValueError as exc:
+                # 枚举与数值约束（strategy/degradation/ngram_n/阈值等）由 SemanticConfig 校验
+                raise SystemExit(f"Config error: {exc}")
+
 
 # 用 KAMA_* 环境变量覆盖 config 中对应字段（若变量已设置）
 def _apply_env(config: KamaConfig) -> None:
@@ -588,3 +657,66 @@ def _apply_env(config: KamaConfig) -> None:
             config.git,
             auto_rollback_on_fail=git_rollback.lower() not in ("0", "false", "no"),
         )
+
+    semantic_enabled = os.environ.get("KAMA_SEMANTIC_ENABLED")
+    if semantic_enabled is not None:
+        config.semantic = dataclasses.replace(
+            config.semantic,
+            enabled=semantic_enabled.lower() not in ("0", "false", "no"),
+        )
+
+    semantic_strategy = os.environ.get("KAMA_SEMANTIC_STRATEGY")
+    if semantic_strategy is not None:
+        try:
+            config.semantic = dataclasses.replace(
+                config.semantic, strategy=semantic_strategy
+            )
+        except ValueError as exc:
+            raise SystemExit(f"Config error: KAMA_SEMANTIC_STRATEGY {exc}")
+
+    semantic_degradation = os.environ.get("KAMA_SEMANTIC_DEGRADATION")
+    if semantic_degradation is not None:
+        try:
+            config.semantic = dataclasses.replace(
+                config.semantic, degradation=semantic_degradation
+            )
+        except ValueError as exc:
+            raise SystemExit(f"Config error: KAMA_SEMANTIC_DEGRADATION {exc}")
+
+    semantic_index_dir = os.environ.get("KAMA_SEMANTIC_INDEX_DIR")
+    if semantic_index_dir is not None:
+        config.semantic = dataclasses.replace(config.semantic, index_dir=semantic_index_dir)
+
+    semantic_top_k = os.environ.get("KAMA_SEMANTIC_DEFAULT_TOP_K")
+    if semantic_top_k is not None:
+        try:
+            semantic_top_k_val = int(semantic_top_k)
+            if semantic_top_k_val <= 0:
+                raise SystemExit(
+                    "Config error: KAMA_SEMANTIC_DEFAULT_TOP_K must be a positive integer,"
+                    f" got: {semantic_top_k!r}"
+                )
+            config.semantic = dataclasses.replace(
+                config.semantic, default_top_k=semantic_top_k_val
+            )
+        except ValueError:
+            raise SystemExit(
+                f"Config error: KAMA_SEMANTIC_DEFAULT_TOP_K must be an integer,"
+                f" got: {semantic_top_k!r}"
+            )
+
+    semantic_threshold = os.environ.get("KAMA_SEMANTIC_SIMILARITY_THRESHOLD")
+    if semantic_threshold is not None:
+        try:
+            semantic_threshold_val = float(semantic_threshold)
+        except ValueError:
+            raise SystemExit(
+                "Config error: KAMA_SEMANTIC_SIMILARITY_THRESHOLD must be a number,"
+                f" got: {semantic_threshold!r}"
+            )
+        try:
+            config.semantic = dataclasses.replace(
+                config.semantic, similarity_threshold=semantic_threshold_val
+            )
+        except ValueError as exc:
+            raise SystemExit(f"Config error: KAMA_SEMANTIC_SIMILARITY_THRESHOLD {exc}")
