@@ -98,6 +98,11 @@ class SemanticRetrievalService:
     def stats(self) -> IndexStats:
         return self._stats
 
+    def degraded_query(self, query: str) -> bool:
+        """查询是否退化（过短/无 gram）——工具层据此提示字面量降级"""
+        strategy = self._state[1] if self._state is not None else self._strategy
+        return strategy.degraded_query(query)
+
     async def ensure_ready(self) -> None:
         await self.refresh()
 

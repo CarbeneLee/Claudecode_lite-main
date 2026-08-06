@@ -22,6 +22,7 @@ from kama_claude.core.sandbox.errors import (
     SandboxTimeoutError,
     SandboxUnavailableError,
 )
+from kama_claude.core.semantic.errors import IndexUnavailableError
 from kama_claude.core.workspace.errors import (
     InvalidWorkspacePathError,
     SensitivePathError,
@@ -60,6 +61,7 @@ _STABLE_ERROR_TYPES: frozenset[str] = frozenset(
         "commit_failed",
         "rollback_failed",
         "merge_conflict",
+        "semantic_index_unavailable",
     }
 )
 RETRYABLE_ERROR_TYPES: frozenset[str] = frozenset(
@@ -71,6 +73,7 @@ RETRYABLE_ERROR_TYPES: frozenset[str] = frozenset(
         "git_lock",
         "checkpoint_failed",
         "commit_failed",
+        "semantic_index_unavailable",
     }
 )
 _SAFE_ERROR_MESSAGES: dict[str, str] = {
@@ -280,6 +283,8 @@ def classify_tool_exception(
         return "rollback_failed", "git rollback failed"
     if isinstance(exc, MergeConflictError):
         return "merge_conflict", "git merge conflict; human decision required"
+    if isinstance(exc, IndexUnavailableError):
+        return "semantic_index_unavailable", "semantic index unavailable"
     if isinstance(exc, TimeoutError):
         return "timeout", "tool execution timed out"
 

@@ -39,6 +39,7 @@ def test_only_explicit_transient_errors_are_retryable() -> None:
             "git_lock",
             "checkpoint_failed",
             "commit_failed",
+            "semantic_index_unavailable",
         }
     )
 
