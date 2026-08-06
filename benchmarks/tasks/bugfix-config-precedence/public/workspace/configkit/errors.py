@@ -1,0 +1,2 @@
+class UnknownSettingError(ValueError):
+    pass

@@ -1,0 +1,93 @@
+diff --git a/inventory/reservations.py b/inventory/reservations.py
+index 85ea03b..5b8062e 100644
+--- a/inventory/reservations.py
++++ b/inventory/reservations.py
+@@ -1,7 +1,13 @@
+ from __future__ import annotations
+ 
+-from inventory.errors import UnknownReservation
+-from inventory.models import Reservation
++from inventory.errors import (
++    InsufficientStock,
++    InvalidQuantity,
++    InvalidTransition,
++    RequestConflict,
++    UnknownReservation,
++)
++from inventory.models import Reservation, ReservationStatus
+ from inventory.store import InventoryStore
+ 
+ 
+@@ -19,6 +25,26 @@ class ReservationService:
+         except KeyError as exc:
+             raise UnknownReservation(reservation_id) from exc
+ 
++    # 解析 request key 并验证重复请求参数一致
++    def _existing(
++        self,
++        request_key: str,
++        sku: str,
++        quantity: int,
++    ) -> Reservation | None:
++        reservation_id = self._by_request.get(request_key)
++        if reservation_id is None:
++            return None
++        reservation = self._reservations[reservation_id]
++        if (reservation.sku, reservation.quantity) != (sku, quantity):
++            raise RequestConflict(request_key)
++        return reservation
++
++    # 验证只允许 pending 进入指定终态
++    def _require_pending(self, reservation: Reservation) -> None:
++        if reservation.status is not ReservationStatus.PENDING:
++            raise InvalidTransition("reservation is already terminal")
++
+     # 预留库存并保证 request key 幂等
+     def reserve(
+         self,
+@@ -27,12 +53,42 @@ class ReservationService:
+         sku: str,
+         quantity: int,
+     ) -> Reservation:
+-        raise NotImplementedError
++        if quantity <= 0:
++            raise InvalidQuantity("quantity must be positive")
++        existing = self._existing(request_key, sku, quantity)
++        if existing is not None:
++            return existing
++        if self._store.get(sku).available < quantity:
++            raise InsufficientStock(sku)
++
++        reservation_id = f"r-{self._next_id}"
++        reservation = Reservation(
++            reservation_id=reservation_id,
++            request_key=request_key,
++            sku=sku,
++            quantity=quantity,
++        )
++        self._store.adjust(sku, -quantity)
++        self._reservations[reservation_id] = reservation
++        self._by_request[request_key] = reservation_id
++        self._next_id += 1
++        return reservation
+ 
+     # 确认一个待处理 reservation
+     def confirm(self, reservation_id: str) -> Reservation:
+-        raise NotImplementedError
++        reservation = self.get(reservation_id)
++        if reservation.status is ReservationStatus.CONFIRMED:
++            return reservation
++        self._require_pending(reservation)
++        reservation.status = ReservationStatus.CONFIRMED
++        return reservation
+ 
+     # 释放一个待处理 reservation 并恢复库存
+     def release(self, reservation_id: str) -> Reservation:
+-        raise NotImplementedError
++        reservation = self.get(reservation_id)
++        if reservation.status is ReservationStatus.RELEASED:
++            return reservation
++        self._require_pending(reservation)
++        self._store.adjust(reservation.sku, reservation.quantity)
++        reservation.status = ReservationStatus.RELEASED
++        return reservation

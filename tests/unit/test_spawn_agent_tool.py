@@ -19,6 +19,9 @@ from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock, UsageStats
 from kama_claude.core.loop import AgentLoop
+from kama_claude.core.sandbox.config import SandboxConfig
+from kama_claude.core.sandbox.executors import ContainerExecutor, HostExecutor
+from kama_claude.core.sandbox.manager import SandboxManager
 from kama_claude.core.subagent import tool as subagent_tool_module
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.subagent.tool import AgentResultTool, SpawnAgentTool
@@ -30,6 +33,26 @@ from kama_claude.core.tools.builtin.search_code import SearchCodeTool
 from kama_claude.core.tools.builtin.write_file import WriteFileTool
 from kama_claude.core.tools.invocation import invoke_tool
 from kama_claude.core.tools.registry import ToolRegistry
+
+_REQUIREMENT_CONTRACT = (
+    "Before changing the workspace, create a concise requirement contract from every "
+    "explicit acceptance criterion. For each item, record the required observable "
+    "behavior, relevant failure or invalid-input behavior, any side-effect or state "
+    "invariant, and the evidence you plan to use for verification. Keep this checklist "
+    "visible in the conversation as you work, and update each item as implemented, "
+    "verified, or unchecked. Before finishing, review every item. Do not assume unchecked "
+    "items are complete: verify them when possible, otherwise clearly report the "
+    "limitation. Keep the contract brief and auditable; do not expose private "
+    "chain-of-thought or force any particular tool."
+)
+_STATE_TRANSITION_PROTOCOL = (
+    "When a task changes persistent or shared state through multiple operations, briefly "
+    "map the pre-state, each mutation point, every later operation that can fail, and the "
+    "required post-state after success or failure. Before finishing, exercise at least "
+    "one failure after an earlier mutation succeeds, and verify that rollback or "
+    "compensation preserves the stated invariant. Do not apply this protocol to tasks "
+    "without multi-step side effects."
+)
 
 
 def _make_provider(result_text: str = "child done") -> Any:
@@ -56,6 +79,7 @@ def _make_tool(
     provider: Any = None,
     depth: int = 0,
     journal: Any = None,
+    sandbox_manager: SandboxManager | None = None,
 ) -> tuple[SpawnAgentTool, BackgroundTaskRegistry, EventBus]:
     bus = EventBus()
     registry = BackgroundTaskRegistry()
@@ -71,6 +95,7 @@ def _make_tool(
         session_id="sess-test",
         depth=depth,
         journal=journal,
+        sandbox_manager=sandbox_manager,
     )
     return tool, registry, bus
 
@@ -150,6 +175,38 @@ def test_nested_spawn_agent_inherits_workspace(tmp_path: Path) -> None:
 
     assert isinstance(nested, SpawnAgentTool)
     assert nested._workspace_root == tmp_path.resolve(strict=True)
+
+
+# 功能：验证注入 sandbox_manager 后 child registry 的 bash 使用容器执行器
+# 设计：沿 child registry 组装路径检查 bash executor 类型，不执行命令
+def test_child_registry_bash_uses_container_executor_when_sandbox_injected(
+    tmp_path: Path,
+) -> None:
+    manager = SandboxManager(
+        config=SandboxConfig(image="python:3.12-slim"),
+        workspace_root=tmp_path.resolve(),
+    )
+    tool, _, _ = _make_tool(tmp_path, sandbox_manager=manager)
+
+    registry = tool._build_child_registry(EventBus(), "child-run", None)
+    bash_tool = registry.get("bash")
+
+    assert isinstance(bash_tool, BashTool)
+    assert isinstance(bash_tool._executor, ContainerExecutor)
+
+
+# 功能：验证未注入 sandbox_manager 时 child registry 的 bash 保持宿主执行器
+# 设计：默认路径断言 HostExecutor，防止子 agent 沙箱决策与顶层漂移
+def test_child_registry_bash_uses_host_executor_without_sandbox(
+    tmp_path: Path,
+) -> None:
+    tool, _, _ = _make_tool(tmp_path)
+
+    registry = tool._build_child_registry(EventBus(), "child-run", None)
+    bash_tool = registry.get("bash")
+
+    assert isinstance(bash_tool, BashTool)
+    assert isinstance(bash_tool._executor, HostExecutor)
 
 
 # 功能：验证 child registry 的 read/list 工具绑定 parent workspace
@@ -290,6 +347,30 @@ async def test_subagents_isolate_profile_and_context_by_workspace(tmp_path: Path
     assert "context-b" in systems[1]
     assert "profile-a" not in systems[1]
     assert "context-a" not in systems[1]
+    assert _REQUIREMENT_CONTRACT not in systems[0]
+    assert _REQUIREMENT_CONTRACT not in systems[1]
+    assert _STATE_TRANSITION_PROTOCOL not in systems[0]
+    assert _STATE_TRANSITION_PROTOCOL not in systems[1]
+
+
+# 功能：验证未指定 profile 的 subagent 各继承一次 repaired default v1 与 v2
+# 设计：执行真实前台 child loop 并捕获 provider system，区别于 profile override 的完全替换路径
+async def test_unprofiled_subagent_inherits_v1_and_v2(tmp_path: Path) -> None:
+    provider = _make_provider()
+    tool, _, _ = _make_tool(tmp_path, provider)
+
+    result = await tool.invoke(
+        {
+            "description": "inspect requirements",
+            "prompt": "Implement behavior A and preserve invariant B.",
+        }
+    )
+
+    assert result.is_error is False
+    system = provider.chat.await_args.kwargs["system"]
+    assert isinstance(system, str)
+    assert system.count(_REQUIREMENT_CONTRACT) == 1
+    assert system.count(_STATE_TRANSITION_PROTOCOL) == 1
 
 
 # 功能：验证 subagent 模块不保留绑定项目目录的全局 profile loader

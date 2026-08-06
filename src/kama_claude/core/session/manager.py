@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -26,6 +27,8 @@ if TYPE_CHECKING:
     from kama_claude.core.events.journal import EventJournalCoordinator
     from kama_claude.core.llm.base import LLMProvider
     from kama_claude.core.runner import AgentRunner
+
+logger = logging.getLogger(__name__)
 
 SESSION_NOT_FOUND = -32010
 SESSION_CLOSED = -32011
@@ -54,6 +57,8 @@ class SessionManager:
         self._journal = journal
         self._sessions: dict[str, Session] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        # 每个 session 至多一个后台 run task；send_message 注册后立即返回
+        self._running_runs: dict[str, asyncio.Task[None]] = {}
 
     # 在 daemon wiring 完成且任何 session 创建前注入 shared journal coordinator
     def attach_journal(self, journal: EventJournalCoordinator) -> None:
@@ -101,10 +106,12 @@ class SessionManager:
     ) -> str:
         session = self._get_session(sid)
         lock = self._locks[sid]
-        if lock.locked():
+        if lock.locked() or sid in self._running_runs:
             raise HandlerError(SESSION_BUSY, "session busy")
 
         async with lock:
+            if sid in self._running_runs:
+                raise HandlerError(SESSION_BUSY, "session busy")
             if session.status == "closed":
                 raise HandlerError(SESSION_CLOSED, "session already closed")
 
@@ -157,33 +164,73 @@ class SessionManager:
                         )
                     )
 
-            runner = self._runner_factory(session.workspace_root)
-            await runner.run_and_capture(
-                goal,
-                run_id=run_id,
-                session=session,
-                store=self._store,
-                system_prompt_override=system_prompt_override,
-                tool_whitelist=tool_whitelist,
-            )
-
-            session.updated_at = _now()
-            if session.mode == "one_shot":
-                session.status = "closed"
-                await self._bus.publish(SessionClosedEvent(session_id=sid, ts=session.updated_at))
-            else:
-                session.status = "waiting_for_input"
-                await self._bus.publish(
-                    SessionWaitingForInputEvent(
-                        session_id=sid,
-                        last_run_id=run_id,
-                        ts=session.updated_at,
-                    )
+            # run 在后台 task 中执行：send_message 立即返回，CLI 主循环不再被阻塞
+            task = asyncio.create_task(
+                self._run_and_finalize(
+                    sid,
+                    run_id,
+                    goal,
+                    system_prompt_override=system_prompt_override,
+                    tool_whitelist=tool_whitelist,
                 )
-            self._store.write_meta(session)
+            )
+            self._running_runs[sid] = task
             return run_id
 
-    # 关闭指定 session 并更新 meta.json
+    # 在后台执行 agent run；完成后在 lock 内收敛 session 状态并发布事件
+    async def _run_and_finalize(
+        self,
+        sid: str,
+        run_id: str,
+        goal: str,
+        *,
+        system_prompt_override: str | None,
+        tool_whitelist: list[str] | None,
+    ) -> None:
+        try:
+            try:
+                session = self._get_session(sid)
+                runner = self._runner_factory(session.workspace_root)
+                await runner.run_and_capture(
+                    goal,
+                    run_id=run_id,
+                    session=session,
+                    store=self._store,
+                    system_prompt_override=system_prompt_override,
+                    tool_whitelist=tool_whitelist,
+                )
+            except asyncio.CancelledError:
+                # close()/shutdown 已收敛状态，不再发布 waiting_for_input
+                raise
+            except Exception:
+                # runner 已在失败路径发布 run.finished(status=failed)，这里仅记录日志，
+                # 并继续下方状态收敛，让失败后的会话恢复正常交互（不静默卡在 active）
+                logger.exception("run failed sid=%s run_id=%s", sid, run_id)
+            session = self._get_session(sid)
+            lock = self._locks[sid]
+            async with lock:
+                if session.status == "closed":
+                    return
+                session.updated_at = _now()
+                if session.mode == "one_shot":
+                    session.status = "closed"
+                    await self._bus.publish(
+                        SessionClosedEvent(session_id=sid, ts=session.updated_at)
+                    )
+                else:
+                    session.status = "waiting_for_input"
+                    await self._bus.publish(
+                        SessionWaitingForInputEvent(
+                            session_id=sid,
+                            last_run_id=run_id,
+                            ts=session.updated_at,
+                        )
+                    )
+                self._store.write_meta(session)
+        finally:
+            self._running_runs.pop(sid, None)
+
+    # 关闭指定 session 并更新 meta.json；取消仍在执行的后台 run
     async def close(self, sid: str) -> None:
         session = self._get_session(sid)
         lock = self._locks[sid]
@@ -194,6 +241,22 @@ class SessionManager:
             session.updated_at = _now()
             self._store.write_meta(session)
             await self._bus.publish(SessionClosedEvent(session_id=sid, ts=session.updated_at))
+        run_task = self._running_runs.get(sid)
+        if run_task is not None and not run_task.done():
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
+
+    # 当前仍有未完成 run 的 task 列表（测试与 shutdown 使用）
+    def active_run_tasks(self) -> list[asyncio.Task[None]]:
+        return [t for t in self._running_runs.values() if not t.done()]
+
+    # 取消全部后台 run（daemon shutdown 路径）
+    async def cancel_active_runs(self) -> None:
+        tasks = self.active_run_tasks()
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     # 手动压缩指定 session 的 thread，将摘要持久化写入 thread.jsonl
     async def compact(self, sid: str, focus: str = "") -> Any:

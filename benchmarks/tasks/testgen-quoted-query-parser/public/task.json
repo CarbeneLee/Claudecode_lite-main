@@ -1,0 +1,6 @@
+{
+  "id": "testgen-quoted-query-parser",
+  "goal": "Expand the query parser tests for the documented quoted-value grammar and malformed-input behavior. Add meaningful boundary and error assertions beyond the existing happy path. Do not add, remove, or modify production files under querylang/. All tests must pass.",
+  "workspace_fixture": "public/workspace",
+  "timeout_s": 180.0
+}

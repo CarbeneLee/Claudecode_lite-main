@@ -1,0 +1,26 @@
+diff --git a/retryjobs/scheduler.py b/retryjobs/scheduler.py
+index d102da4..e29dd41 100644
+--- a/retryjobs/scheduler.py
++++ b/retryjobs/scheduler.py
+@@ -27,8 +27,9 @@ class JobScheduler:
+         if job.is_terminal():
+             return job
+ 
+-        while job.attempts < self._policy.max_attempts:
++        while job.attempts <= self._policy.max_attempts:
+             job.state = JobState.RUNNING
++            job.attempts += 1
+             result = self._executor.execute(job.job_id)
+             if result.success:
+                 job.state = JobState.SUCCEEDED
+@@ -36,9 +37,8 @@ class JobScheduler:
+                 self._store.save(job)
+                 return job
+ 
+-            job.attempts += 1
+             job.last_error = result.error
+-            if not result.retryable or job.attempts >= self._policy.max_attempts:
++            if not result.retryable or job.attempts > self._policy.max_attempts:
+                 job.state = JobState.FAILED
+                 self._store.save(job)
+                 return job

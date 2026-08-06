@@ -1,0 +1,6 @@
+{
+  "id": "testgen-normalize-username",
+  "goal": "Expand tests/test_text_utils.py without changing text_utils.py. Add tests for empty input, internal spaces, and underscore normalization. All tests must pass.",
+  "workspace_fixture": "public/workspace",
+  "timeout_s": 120.0
+}

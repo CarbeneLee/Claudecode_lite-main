@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from dotenv import load_dotenv
+
+from kama_claude.core.git.config import GitConfig
+from kama_claude.core.sandbox.config import SandboxConfig
+from kama_claude.core.semantic.config import SemanticConfig
 
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 7437
@@ -17,6 +22,68 @@ _DEFAULT_CONFIG_PATH = "~/.kama/config.toml"
 _DEFAULT_MAX_STEPS = 20
 _DEFAULT_MODEL = "claude-sonnet-4-6"
 _DEFAULT_TRACE_FILE = "~/.kama/traces/daemon.jsonl"
+
+# [git] TOML 组允许的 key 与类型约束（严格校验，与其他配置组一致）
+_GIT_TOML_KEYS = frozenset(
+    {
+        "enabled",
+        "checkpoint_mode",
+        "branch_prefix",
+        "mode",
+        "auto_rollback_on_fail",
+        "author",
+        "checkpoint_namespace",
+        "squash_on_finalize",
+        "keep_checkpoint_refs",
+        "rollback_strategy",
+    }
+)
+_GIT_TOML_TYPES: dict[str, type] = {
+    "enabled": bool,
+    "checkpoint_mode": str,
+    "branch_prefix": str,
+    "mode": str,
+    "auto_rollback_on_fail": bool,
+    "author": str,
+    "checkpoint_namespace": str,
+    "squash_on_finalize": bool,
+    "keep_checkpoint_refs": bool,
+    "rollback_strategy": str,
+}
+
+# [semantic] TOML 组允许的 key 与类型约束（严格校验，与其他配置组一致）
+_SEMANTIC_TOML_KEYS = frozenset(
+    {
+        "enabled",
+        "strategy",
+        "index_dir",
+        "chunk_size",
+        "min_chunk_lines",
+        "ngram_n",
+        "default_top_k",
+        "similarity_threshold",
+        "max_index_files",
+        "max_file_bytes",
+        "total_index_bytes",
+        "degradation",
+        "max_query_chars",
+    }
+)
+_SEMANTIC_TOML_TYPES: dict[str, type] = {
+    "enabled": bool,
+    "strategy": str,
+    "index_dir": str,
+    "chunk_size": int,
+    "min_chunk_lines": int,
+    "ngram_n": int,
+    "default_top_k": int,
+    "similarity_threshold": float,
+    "max_index_files": int,
+    "max_file_bytes": int,
+    "total_index_bytes": int,
+    "degradation": str,
+    "max_query_chars": int,
+}
 
 
 @dataclass
@@ -83,6 +150,9 @@ class KamaConfig:
     permission: PermissionConfig = field(default_factory=PermissionConfig)
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
     mcp: McpConfig = field(default_factory=McpConfig)
+    sandbox: SandboxConfig = field(default_factory=SandboxConfig)
+    git: GitConfig = field(default_factory=GitConfig)
+    semantic: SemanticConfig = field(default_factory=SemanticConfig)
 
 
 # 构建并返回运行时配置：默认值 → 全局 TOML → 项目本地 TOML → .env → 系统环境变量（后者优先级最高）
@@ -126,6 +196,9 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
         "permission",
         "compaction",
         "mcp",
+        "sandbox",
+        "git",
+        "semantic",
     }
     if unknown:
         raise SystemExit(f"Unknown top-level config keys: {', '.join(sorted(unknown))}")
@@ -309,6 +382,94 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
                 s.port = val
             config.mcp.servers.append(s)
 
+    if "sandbox" in data:
+        sb = data["sandbox"]
+        if not isinstance(sb, dict):
+            raise SystemExit("Config error: [sandbox] must be a table")
+        unknown_sb: set[str] = set(sb.keys()) - {"enabled", "image", "network", "exec_timeout_s"}
+        if unknown_sb:
+            raise SystemExit(f"Unknown [sandbox] keys: {', '.join(sorted(unknown_sb))}")
+        if "enabled" in sb:
+            val = sb["enabled"]
+            if not isinstance(val, bool):
+                raise SystemExit("Config error: sandbox.enabled must be a boolean")
+            config.sandbox = dataclasses.replace(config.sandbox, enabled=val)
+        if "image" in sb:
+            val = sb["image"]
+            if not isinstance(val, str):
+                raise SystemExit("Config error: sandbox.image must be a string")
+            config.sandbox = dataclasses.replace(config.sandbox, image=val)
+        if "network" in sb:
+            val = sb["network"]
+            if not isinstance(val, bool):
+                raise SystemExit("Config error: sandbox.network must be a boolean")
+            config.sandbox = dataclasses.replace(config.sandbox, network=val)
+        if "exec_timeout_s" in sb:
+            val = sb["exec_timeout_s"]
+            if not isinstance(val, int) or val <= 0:
+                raise SystemExit(
+                    "Config error: sandbox.exec_timeout_s must be a positive integer"
+                )
+            config.sandbox = dataclasses.replace(config.sandbox, exec_timeout_s=val)
+
+    if "git" in data:
+        git_data = data["git"]
+        if not isinstance(git_data, dict):
+            raise SystemExit("Config error: [git] must be a table")
+        unknown_git: set[str] = set(git_data.keys()) - _GIT_TOML_KEYS
+        if unknown_git:
+            raise SystemExit(f"Unknown [git] keys: {', '.join(sorted(unknown_git))}")
+        for key, expected_type in _GIT_TOML_TYPES.items():
+            if key not in git_data:
+                continue
+            val = git_data[key]
+            if not isinstance(val, expected_type):
+                type_label = {bool: "boolean", str: "string"}.get(
+                    expected_type, expected_type.__name__
+                )
+                raise SystemExit(
+                    f"Config error: git.{key} must be a {type_label}"
+                )
+            try:
+                config.git = dataclasses.replace(
+                    config.git, **cast(dict[str, Any], {key: val})
+                )
+            except ValueError as exc:
+                # 枚举约束（checkpoint_mode/mode/rollback_strategy）由 GitConfig 校验
+                raise SystemExit(f"Config error: {exc}")
+
+    if "semantic" in data:
+        semantic_data = data["semantic"]
+        if not isinstance(semantic_data, dict):
+            raise SystemExit("Config error: [semantic] must be a table")
+        unknown_semantic: set[str] = set(semantic_data.keys()) - _SEMANTIC_TOML_KEYS
+        if unknown_semantic:
+            raise SystemExit(f"Unknown [semantic] keys: {', '.join(sorted(unknown_semantic))}")
+        for key, expected_type in _SEMANTIC_TOML_TYPES.items():
+            if key not in semantic_data:
+                continue
+            val = semantic_data[key]
+            # TOML 整数 1 与 1.0 视为同一阈值取值，统一转 float 后校验
+            if key == "similarity_threshold" and isinstance(val, int) and not isinstance(val, bool):
+                val = float(val)
+            if not isinstance(val, expected_type):
+                type_label = {
+                    bool: "a boolean",
+                    str: "a string",
+                    int: "an integer",
+                    float: "a number",
+                }.get(expected_type, expected_type.__name__)
+                raise SystemExit(
+                    f"Config error: semantic.{key} must be {type_label}"
+                )
+            try:
+                config.semantic = dataclasses.replace(
+                    config.semantic, **cast(dict[str, Any], {key: val})
+                )
+            except ValueError as exc:
+                # 枚举与数值约束（strategy/degradation/ngram_n/阈值等）由 SemanticConfig 校验
+                raise SystemExit(f"Config error: {exc}")
+
 
 # 用 KAMA_* 环境变量覆盖 config 中对应字段（若变量已设置）
 def _apply_env(config: KamaConfig) -> None:
@@ -426,3 +587,136 @@ def _apply_env(config: KamaConfig) -> None:
                 "Config error: KAMA_COMPACT_TOOL_KEEP must be an integer,"
                 f" got: {compact_tool_keep!r}"
             )
+
+    sandbox_enabled = os.environ.get("KAMA_SANDBOX_ENABLED")
+    if sandbox_enabled is not None:
+        config.sandbox = dataclasses.replace(
+            config.sandbox,
+            enabled=sandbox_enabled.lower() not in ("0", "false", "no"),
+        )
+
+    sandbox_image = os.environ.get("KAMA_SANDBOX_IMAGE")
+    if sandbox_image is not None:
+        config.sandbox = dataclasses.replace(config.sandbox, image=sandbox_image)
+
+    sandbox_network = os.environ.get("KAMA_SANDBOX_NETWORK")
+    if sandbox_network is not None:
+        config.sandbox = dataclasses.replace(
+            config.sandbox,
+            network=sandbox_network.lower() not in ("0", "false", "no"),
+        )
+
+    sandbox_timeout = os.environ.get("KAMA_SANDBOX_EXEC_TIMEOUT_S")
+    if sandbox_timeout is not None:
+        try:
+            sandbox_timeout_val = int(sandbox_timeout)
+            if sandbox_timeout_val <= 0:
+                raise SystemExit(
+                    "Config error: KAMA_SANDBOX_EXEC_TIMEOUT_S must be a positive integer,"
+                    f" got: {sandbox_timeout!r}"
+                )
+            config.sandbox = dataclasses.replace(
+                config.sandbox, exec_timeout_s=sandbox_timeout_val
+            )
+        except ValueError:
+            raise SystemExit(
+                "Config error: KAMA_SANDBOX_EXEC_TIMEOUT_S must be an integer,"
+                f" got: {sandbox_timeout!r}"
+            )
+
+    git_enabled = os.environ.get("KAMA_GIT_ENABLED")
+    if git_enabled is not None:
+        config.git = dataclasses.replace(
+            config.git,
+            enabled=git_enabled.lower() not in ("0", "false", "no"),
+        )
+
+    git_checkpoint_mode = os.environ.get("KAMA_GIT_CHECKPOINT_MODE")
+    if git_checkpoint_mode is not None:
+        try:
+            config.git = dataclasses.replace(
+                config.git, checkpoint_mode=git_checkpoint_mode
+            )
+        except ValueError as exc:
+            raise SystemExit(f"Config error: KAMA_GIT_CHECKPOINT_MODE {exc}")
+
+    git_branch_prefix = os.environ.get("KAMA_GIT_BRANCH_PREFIX")
+    if git_branch_prefix is not None:
+        config.git = dataclasses.replace(config.git, branch_prefix=git_branch_prefix)
+
+    git_mode = os.environ.get("KAMA_GIT_MODE")
+    if git_mode is not None:
+        try:
+            config.git = dataclasses.replace(config.git, mode=git_mode)
+        except ValueError as exc:
+            raise SystemExit(f"Config error: KAMA_GIT_MODE {exc}")
+
+    git_rollback = os.environ.get("KAMA_GIT_AUTO_ROLLBACK_ON_FAIL")
+    if git_rollback is not None:
+        config.git = dataclasses.replace(
+            config.git,
+            auto_rollback_on_fail=git_rollback.lower() not in ("0", "false", "no"),
+        )
+
+    semantic_enabled = os.environ.get("KAMA_SEMANTIC_ENABLED")
+    if semantic_enabled is not None:
+        config.semantic = dataclasses.replace(
+            config.semantic,
+            enabled=semantic_enabled.lower() not in ("0", "false", "no"),
+        )
+
+    semantic_strategy = os.environ.get("KAMA_SEMANTIC_STRATEGY")
+    if semantic_strategy is not None:
+        try:
+            config.semantic = dataclasses.replace(
+                config.semantic, strategy=semantic_strategy
+            )
+        except ValueError as exc:
+            raise SystemExit(f"Config error: KAMA_SEMANTIC_STRATEGY {exc}")
+
+    semantic_degradation = os.environ.get("KAMA_SEMANTIC_DEGRADATION")
+    if semantic_degradation is not None:
+        try:
+            config.semantic = dataclasses.replace(
+                config.semantic, degradation=semantic_degradation
+            )
+        except ValueError as exc:
+            raise SystemExit(f"Config error: KAMA_SEMANTIC_DEGRADATION {exc}")
+
+    semantic_index_dir = os.environ.get("KAMA_SEMANTIC_INDEX_DIR")
+    if semantic_index_dir is not None:
+        config.semantic = dataclasses.replace(config.semantic, index_dir=semantic_index_dir)
+
+    semantic_top_k = os.environ.get("KAMA_SEMANTIC_DEFAULT_TOP_K")
+    if semantic_top_k is not None:
+        try:
+            semantic_top_k_val = int(semantic_top_k)
+            if semantic_top_k_val <= 0:
+                raise SystemExit(
+                    "Config error: KAMA_SEMANTIC_DEFAULT_TOP_K must be a positive integer,"
+                    f" got: {semantic_top_k!r}"
+                )
+            config.semantic = dataclasses.replace(
+                config.semantic, default_top_k=semantic_top_k_val
+            )
+        except ValueError:
+            raise SystemExit(
+                f"Config error: KAMA_SEMANTIC_DEFAULT_TOP_K must be an integer,"
+                f" got: {semantic_top_k!r}"
+            )
+
+    semantic_threshold = os.environ.get("KAMA_SEMANTIC_SIMILARITY_THRESHOLD")
+    if semantic_threshold is not None:
+        try:
+            semantic_threshold_val = float(semantic_threshold)
+        except ValueError:
+            raise SystemExit(
+                "Config error: KAMA_SEMANTIC_SIMILARITY_THRESHOLD must be a number,"
+                f" got: {semantic_threshold!r}"
+            )
+        try:
+            config.semantic = dataclasses.replace(
+                config.semantic, similarity_threshold=semantic_threshold_val
+            )
+        except ValueError as exc:
+            raise SystemExit(f"Config error: KAMA_SEMANTIC_SIMILARITY_THRESHOLD {exc}")

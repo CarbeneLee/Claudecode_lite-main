@@ -540,6 +540,7 @@ async def test_chat_buffered_handler_failure_is_redacted_and_cursor_atomic(
         stream_id="session:sess-new",
         daemon_instance_id="daemon-a",
         daemon_changed=asyncio.Event(),
+        permission_arrived=asyncio.Event(),
     )
     with pytest.raises(RuntimeError):
         await state.handle(

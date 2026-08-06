@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from kama_claude.core.permissions.policy import (
+    DEFAULT_POLICIES,
     PermissionDecision,
     ToolPolicy,
     evaluate,
@@ -31,6 +32,26 @@ def test_deny_pattern_no_match_falls_through() -> None:
     )
     result = evaluate("bash", {"command": "echo hi"}, policy)
     assert result == PermissionDecision.ALLOW
+
+
+# 功能：验证默认 bash 策略拒绝 git 命令（防 agent 绕过 GitManager 直接操作仓库）
+# 设计：\bgit\b 是 DEFAULT_POLICIES["bash"].deny_patterns；git status 必为 DENY，
+#       不落入 ASK 审批流——git 状态读写权归属宿主运行时（P6 §10.3）
+def test_default_bash_denies_git_commands() -> None:
+    policy = DEFAULT_POLICIES["bash"]
+    assert r"\bgit\b" in policy.deny_patterns
+
+    result = evaluate("bash", {"command": "git status"}, policy)
+
+    assert result == PermissionDecision.DENY
+
+
+# 功能：验证 \bgit\b 只拦截独立单词 git，不误伤含 git 子串的命令
+# 设计：gitx/target 不含独立 git 单词，走默认 ASK 而非 DENY
+def test_default_bash_deny_git_is_word_boundary() -> None:
+    policy = DEFAULT_POLICIES["bash"]
+    assert evaluate("bash", {"command": "echo gitx"}, policy) == PermissionDecision.ASK
+    assert evaluate("bash", {"command": "echo target"}, policy) == PermissionDecision.ASK
 
 
 # ── Tier 2: OUTSIDE_CWD_HEURISTICS ───────────────────────────────────────────
@@ -174,3 +195,10 @@ def test_param_preview_truncates_long_value() -> None:
     preview = param_preview("bash", {"command": long_cmd})
     assert len(preview) <= 75  # key='<60 chars>…' overhead ~11 chars
     assert "…" in preview
+
+
+# 功能：验证 search_semantic 默认 ALLOW 且审批卡片展示查询词
+# 设计：只读检索工具与 search_code 同权（默认不打扰用户），预览键为 query
+def test_semantic_search_default_allow_and_preview() -> None:
+    assert evaluate("search_semantic", {"query": "token"}) == PermissionDecision.ALLOW
+    assert param_preview("search_semantic", {"query": "needle"}) == "query='needle'"

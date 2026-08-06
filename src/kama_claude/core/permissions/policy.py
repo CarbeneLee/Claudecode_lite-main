@@ -14,11 +14,11 @@ class PermissionDecision(StrEnum):
 
 # 检测 bash 命令是否操作 cwd 之外路径的正则规则列表（强制触发 ASK，不可被 allow_patterns 绕过）
 OUTSIDE_CWD_HEURISTICS: list[str] = [
-    r"(^|\s)/[^\s]",              # absolute path
-    r"(^|\s)~",                   # tilde home
-    r"(^|\s)\.\.(/|$|\s)",        # parent traversal
-    r"\$\{?HOME\b",               # $HOME variable
-    r"\$\{?PWD\b",                # $PWD variable
+    r"(^|\s)/[^\s]",  # absolute path
+    r"(^|\s)~",  # tilde home
+    r"(^|\s)\.\.(/|$|\s)",  # parent traversal
+    r"\$\{?HOME\b",  # $HOME variable
+    r"\$\{?PWD\b",  # $PWD variable
     r"(^|\s|;|&&|\|\|)cd(\s|$)",  # explicit cd
 ]
 
@@ -38,12 +38,23 @@ class ToolPolicy:
 
 
 DEFAULT_POLICIES: dict[str, ToolPolicy] = {
-    "bash":       ToolPolicy(default=PermissionDecision.ASK),
+    # git 命令直接 DENY：git 状态读写权归宿主运行时（GitManager），禁 agent 直连
+    "bash": ToolPolicy(
+        default=PermissionDecision.ASK,
+        deny_patterns=[r"\bgit\b"],
+    ),
     "write_file": ToolPolicy(default=PermissionDecision.ASK),
-    "read_file":  ToolPolicy(default=PermissionDecision.ALLOW),
-    "list_dir":   ToolPolicy(default=PermissionDecision.ALLOW),
+    "read_file": ToolPolicy(default=PermissionDecision.ALLOW),
+    "list_dir": ToolPolicy(default=PermissionDecision.ALLOW),
     "search_code": ToolPolicy(default=PermissionDecision.ALLOW),
-    "note_save":  ToolPolicy(default=PermissionDecision.ALLOW),
+    "search_semantic": ToolPolicy(default=PermissionDecision.ALLOW),
+    "note_save": ToolPolicy(default=PermissionDecision.ALLOW),
+    # git 工具：只读 auto_allow，写操作 ASK（设计 §7.1）
+    "git_status": ToolPolicy(default=PermissionDecision.ALLOW),
+    "git_diff": ToolPolicy(default=PermissionDecision.ALLOW),
+    "git_checkpoint": ToolPolicy(default=PermissionDecision.ASK),
+    "git_commit": ToolPolicy(default=PermissionDecision.ASK),
+    "git_rollback": ToolPolicy(default=PermissionDecision.ASK),
 }
 
 # 未在 DEFAULT_POLICIES 中登记的工具的兜底策略
@@ -51,12 +62,16 @@ _UNKNOWN_TOOL_DEFAULT = PermissionDecision.ASK
 
 # bash 参数中展示用的关键字段映射
 _PREVIEW_KEY: dict[str, str] = {
-    "bash":       "command",
-    "read_file":  "path",
+    "bash": "command",
+    "read_file": "path",
     "write_file": "path",
-    "list_dir":   "path",
+    "list_dir": "path",
     "search_code": "query",
-    "note_save":  "content",
+    "search_semantic": "query",
+    "note_save": "content",
+    "git_checkpoint": "label",
+    "git_commit": "summary",
+    "git_rollback": "step",
 }
 _PREVIEW_MAX = 60
 

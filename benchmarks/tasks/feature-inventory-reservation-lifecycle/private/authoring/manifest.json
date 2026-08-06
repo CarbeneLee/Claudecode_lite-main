@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "task_id": "feature-inventory-reservation-lifecycle",
+  "review_status": "author_validated_pending_external_review",
+  "difficulty": {
+    "level": "challenging",
+    "axes": {
+      "localization": 2,
+      "change_breadth": 2,
+      "contract_complexity": 2,
+      "oracle_depth": 2,
+      "issue_abstraction": 1
+    },
+    "total": 9
+  },
+  "requirement_test_matrix": [
+    {
+      "requirement_id": "atomic-reservation",
+      "public_contract": "reserve creates a pending record and reduces stock atomically; invalid or insufficient requests leave no partial state",
+      "criterion_ids": ["target-tests"],
+      "hidden_evidence": [
+        "hidden_tests/test_target.py::test_reserve_reduces_available_and_creates_pending_record",
+        "hidden_tests/test_target.py::test_failed_reserve_has_no_partial_mutation"
+      ],
+      "out_of_scope": "database transactions or concurrent requests"
+    },
+    {
+      "requirement_id": "request-idempotency",
+      "public_contract": "same key and arguments reuse one reservation while changed arguments conflict without mutation",
+      "criterion_ids": ["target-tests"],
+      "hidden_evidence": [
+        "hidden_tests/test_target.py::test_request_key_idempotency_and_conflict"
+      ],
+      "out_of_scope": "request-key expiry"
+    },
+    {
+      "requirement_id": "terminal-lifecycle",
+      "public_contract": "confirm and release are same-state idempotent, release restores once, and confirmed cannot release",
+      "criterion_ids": ["target-tests"],
+      "hidden_evidence": [
+        "hidden_tests/test_target.py::test_confirm_is_idempotent_without_stock_change",
+        "hidden_tests/test_target.py::test_release_is_idempotent_and_restores_exactly_once",
+        "hidden_tests/test_target.py::test_confirmed_reservation_cannot_be_released"
+      ],
+      "out_of_scope": "reservation expiry or cancellation after confirmation"
+    },
+    {
+      "requirement_id": "cross-entity-isolation",
+      "public_contract": "reservations for different requests and SKUs do not share state",
+      "criterion_ids": ["target-tests"],
+      "hidden_evidence": [
+        "hidden_tests/test_target.py::test_reservations_keep_skus_and_requests_independent"
+      ],
+      "out_of_scope": "multi-warehouse allocation"
+    },
+    {
+      "requirement_id": "existing-inventory-contract",
+      "public_contract": "inventory query, positive adjustment, unknown SKU, and negative-stock protection remain stable",
+      "criterion_ids": ["regression-tests"],
+      "hidden_evidence": [
+        "hidden_tests/test_regression.py::test_existing_query_and_adjustment_contract",
+        "hidden_tests/test_regression.py::test_existing_error_contract"
+      ],
+      "out_of_scope": "redesigning InventoryStore or InventoryService"
+    }
+  ],
+  "alternative_patch": "authoring/alternative.patch",
+  "wrong_patch_probes": [
+    {
+      "id": "wrong-key-conflict-ignored",
+      "patch": "authoring/wrong-key-conflict-ignored.patch",
+      "expected_failing_groups": ["target_behavior"]
+    },
+    {
+      "id": "wrong-double-release",
+      "patch": "authoring/wrong-double-release.patch",
+      "expected_failing_groups": ["target_behavior"]
+    },
+    {
+      "id": "wrong-ghost-on-insufficient",
+      "patch": "authoring/wrong-ghost-on-insufficient.patch",
+      "expected_failing_groups": ["target_behavior"]
+    },
+    {
+      "id": "wrong-release-confirmed",
+      "patch": "authoring/wrong-release-confirmed.patch",
+      "expected_failing_groups": ["target_behavior"]
+    }
+  ],
+  "forbidden_public_markers": [
+    "wrong-key-conflict-ignored",
+    "wrong-double-release",
+    "wrong-ghost-on-insufficient",
+    "wrong-release-confirmed"
+  ],
+  "forbidden_issue_markers": [
+    "_by_request",
+    "_reservations",
+    "authoring/alternative.patch"
+  ],
+  "environment_file": "environment.json",
+  "determinism_runs": 3,
+  "security": {
+    "trusted_fixture": true,
+    "offline": true,
+    "data_flow_isolation_only": true,
+    "process_isolation_is_sandbox": false
+  }
+}

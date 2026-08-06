@@ -1,0 +1,6 @@
+{
+  "id": "bugfix-config-precedence",
+  "goal": "Fix settings resolution so the public resolve_settings API consistently applies defaults < user < project < environment precedence. timeout_s=0 and verbose=False are valid explicit overrides. A missing key or a value of None must inherit the lower-precedence value. Preserve validation, defaults, and existing truthy override behavior.",
+  "workspace_fixture": "public/workspace",
+  "timeout_s": 180.0
+}

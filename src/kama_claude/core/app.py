@@ -4,6 +4,7 @@ import asyncio
 import datetime
 import logging
 import signal
+import subprocess
 import time
 import uuid
 from datetime import UTC
@@ -40,6 +41,7 @@ from kama_claude.core.bus.envelope import INVALID_PARAMS, HandlerError
 from kama_claude.core.config import KamaConfig, get_config
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.events.journal import EventJournalCoordinator
+from kama_claude.core.git.manager import GitManager
 from kama_claude.core.llm.provider import AnthropicProvider
 from kama_claude.core.logging_setup import setup_logging
 from kama_claude.core.mcp.server import McpServerManager
@@ -47,6 +49,8 @@ from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.permissions.storage import load_policy_file
 from kama_claude.core.runner import AgentRunner
 from kama_claude.core.runs import new_run_id
+from kama_claude.core.sandbox.manager import SandboxManager
+from kama_claude.core.semantic.service import SemanticRetrievalService
 from kama_claude.core.session import SessionManager, SessionStore
 from kama_claude.core.trace.record import TraceRecord
 from kama_claude.core.trace.writer import TraceWriter
@@ -56,6 +60,7 @@ from kama_claude.core.transport.socket_server import (
     SocketServer,
     get_connection_context,
 )
+from kama_claude.core.workspace.context import WorkspaceContext
 from kama_claude.core.workspace.errors import INVALID_WORKSPACE, InvalidWorkspaceError
 from kama_claude.core.workspace.validation import validate_workspace_root
 
@@ -64,6 +69,23 @@ logger = logging.getLogger(__name__)
 
 def _now() -> str:
     return datetime.datetime.now(UTC).isoformat()
+
+
+# 供语义索引检测分支切换：返回当前 HEAD sha；非 git 目录/异常返回 None（跳过检查）
+def git_head_provider(root: Path) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
 
 
 class CoreApp:
@@ -80,6 +102,7 @@ class CoreApp:
         self._sessions: SessionManager | None = None
         self._permission_manager: PermissionManager | None = None
         self._mcp_manager: McpServerManager | None = None
+        self._contexts: dict[Path, WorkspaceContext] = {}
 
     # 处理 core.ping 请求，返回服务版本、运行时长和接收时间
     async def _ping_handler(self, params: dict[str, Any]) -> PongResult:
@@ -196,6 +219,51 @@ class CoreApp:
         close_task = asyncio.create_task(self._sessions.close(session_id))
         await self._await_secondary_task(close_task, role="session_startup_cleanup")
 
+    # 返回 workspace 对应的运行时上下文（sandbox + git 管理器）；按配置启停，同 workspace 复用实例
+    def _workspace_context_for(self, workspace_root: Path) -> WorkspaceContext:
+        assert self._config is not None
+        context = self._contexts.get(workspace_root)
+        if context is None:
+            context = WorkspaceContext(
+                root=workspace_root,
+                sandbox=(
+                    SandboxManager(
+                        config=self._config.sandbox,
+                        workspace_root=workspace_root,
+                    )
+                    if self._config.sandbox.enabled
+                    else None
+                ),
+                git=(
+                    GitManager(
+                        config=self._config.git,
+                        workspace_root=workspace_root,
+                    )
+                    if self._config.git.enabled
+                    else None
+                ),
+                semantic=(
+                    SemanticRetrievalService(
+                        config=self._config.semantic,
+                        workspace_root=workspace_root,
+                        git_head_provider=git_head_provider,
+                    )
+                    if self._config.semantic.enabled
+                    else None
+                ),
+            )
+            self._contexts[workspace_root] = context
+        return context
+
+    # 从 workspace context 取全部管理器（单次构建 context，供 runner_factory 展开注入）
+    def _workspace_managers_for(self, workspace_root: Path) -> dict[str, Any]:
+        context = self._workspace_context_for(workspace_root)
+        return {
+            "sandbox_manager": context.sandbox,
+            "git_manager": context.git,
+            "semantic_service": context.semantic,
+        }
+
     @staticmethod
     # 屏蔽重复取消并等待 cleanup task 终态，失败时只记录脱敏 secondary
     async def _await_secondary_task(
@@ -257,7 +325,8 @@ class CoreApp:
         cmd = PermissionRespondCommand.model_validate(params)
         logger.info(
             "permission.respond received tool_use_id=%s decision=%s",
-            cmd.tool_use_id, cmd.decision,
+            cmd.tool_use_id,
+            cmd.decision,
         )
         if self._permission_manager is None:
             logger.error("permission.respond: PermissionManager not initialized")
@@ -343,9 +412,13 @@ class CoreApp:
             run_task.cancel()
         if self._running_runs:
             await asyncio.gather(*self._running_runs, return_exceptions=True)
+        if self._sessions is not None:
+            await self._sessions.cancel_active_runs()
         await server.stop()
         if self._mcp_manager is not None:
             await self._mcp_manager.stop_all()
+        for context in self._contexts.values():
+            await context.close()
         if self._journal is not None:
             await self._journal.close()
         if self._trace is not None:
@@ -406,6 +479,7 @@ class CoreApp:
                 permission_manager=self._permission_manager,
                 mcp_manager=self._mcp_manager,
                 journal=self._journal,
+                **self._workspace_managers_for(workspace_root),
             ),
             bus=self._bus,
             provider=compact_provider,

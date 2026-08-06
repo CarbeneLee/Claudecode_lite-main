@@ -1,0 +1,30 @@
+diff --git a/inventory/__init__.py b/inventory/__init__.py
+--- a/inventory/__init__.py
++++ b/inventory/__init__.py
+@@ -1,4 +1,4 @@
+ from inventory.models import Product
+-from inventory.service import total_units
++from inventory.service import low_stock_names, total_units
+ 
+-__all__ = ["Product", "total_units"]
++__all__ = ["Product", "low_stock_names", "total_units"]
+diff --git a/inventory/service.py b/inventory/service.py
+--- a/inventory/service.py
++++ b/inventory/service.py
+@@ -5,3 +5,16 @@ from inventory.models import Product
+ 
+ def total_units(products: Iterable[Product]) -> int:
+     return sum(product.quantity for product in products)
++
++
++def low_stock_names(
++    products: Iterable[Product],
++    threshold: int,
++) -> list[str]:
++    if threshold < 0:
++        raise ValueError("negative threshold")
++    names = [
++        product.name for product in products if product.quantity < threshold
++    ]
++    names.sort()
++    return names

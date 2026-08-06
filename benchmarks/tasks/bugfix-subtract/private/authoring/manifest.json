@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "task_id": "bugfix-subtract",
+  "review_status": "author_validated_pending_external_review",
+  "difficulty": {
+    "level": "easy",
+    "axes": {
+      "localization": 0,
+      "change_breadth": 0,
+      "contract_complexity": 1,
+      "oracle_depth": 1,
+      "issue_abstraction": 0
+    },
+    "total": 2
+  },
+  "requirement_test_matrix": [
+    {
+      "requirement_id": "subtract-semantics",
+      "public_contract": "subtract returns left minus right for positive and signed inputs",
+      "criterion_ids": [
+        "target-tests"
+      ],
+      "hidden_evidence": [
+        "hidden_tests/test_target.py::test_subtract_positive_and_negative_values"
+      ],
+      "out_of_scope": "numeric types beyond the annotated integer contract"
+    },
+    {
+      "requirement_id": "existing-operations",
+      "public_contract": "add and multiply behavior remains unchanged",
+      "criterion_ids": [
+        "regression-tests"
+      ],
+      "hidden_evidence": [
+        "hidden_tests/test_regression.py::test_existing_operations_remain_unchanged"
+      ],
+      "out_of_scope": "new calculator operations"
+    }
+  ],
+  "alternative_patch": "authoring/alternative.patch",
+  "wrong_patch_probes": [
+    {
+      "id": "wrong-reversed-operands",
+      "patch": "authoring/wrong-reversed-operands.patch",
+      "expected_failing_groups": [
+        "target_behavior"
+      ]
+    },
+    {
+      "id": "wrong-absolute-difference",
+      "patch": "authoring/wrong-absolute-difference.patch",
+      "expected_failing_groups": [
+        "target_behavior"
+      ]
+    }
+  ],
+  "forbidden_public_markers": [
+    "return left - right",
+    "return left + (-right)",
+    "return right - left",
+    "return abs(left - right)",
+    "test_subtract_positive_and_negative_values"
+  ],
+  "forbidden_issue_markers": [
+    "left + right",
+    "wrong-reversed-operands",
+    "wrong-absolute-difference"
+  ],
+  "environment_file": "environment.json",
+  "determinism_runs": 3,
+  "security": {
+    "trusted_fixture": true,
+    "offline": true,
+    "data_flow_isolation_only": true,
+    "process_isolation_is_sandbox": false
+  }
+}

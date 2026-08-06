@@ -1,0 +1,18 @@
+{
+  "criteria": [
+    {
+      "id": "target-tests",
+      "kind": "command_exit",
+      "argv": ["python", "-m", "pytest", "-q", "hidden_tests/test_target.py"],
+      "expected_exit_code": 0,
+      "timeout_s": 30.0
+    },
+    {
+      "id": "regression-tests",
+      "kind": "command_exit",
+      "argv": ["python", "-m", "pytest", "-q", "tests", "hidden_tests/test_regression.py"],
+      "expected_exit_code": 0,
+      "timeout_s": 30.0
+    }
+  ]
+}

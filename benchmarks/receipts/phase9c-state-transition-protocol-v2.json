@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "receipt_id": "phase9c-state-transition-protocol-v2-preregistration",
+  "status": "preregistered_before_real_model_execution",
+  "review_base_commit": "966cfa4072c63fd8abc05870a57f0dd8f6a1ab8a",
+  "implementation_commit": "4699f65e103c2e4df41ac1b1cb77e3dcef924a02",
+  "control_profile_id": "kama-coding-mvp-v1-deepseek-v4-pro-requirement-contract-v1",
+  "treatment": {
+    "profile_path": "benchmarks/experiments/kama-coding-mvp-v1-deepseek-v4-pro-requirement-contract-v2.json",
+    "profile_sha256": "5b29ee53229f89fac9fd7298f38f92122b8fe24bb2284f459185af8b5136c4ef",
+    "addition_words": 65,
+    "addition_utf8_bytes": 440,
+    "addition_sha256": "310b308df8cad96fc20ff63b7f50f799ed717a16a65f67db392ca4f6eb7762a3",
+    "effective_prompt_sha256": "bc9d1a2fbcc3458efb5b153f4ff539050c96e28a9c76f3fcd8823588933eb6c0"
+  },
+  "local_evidence": {
+    "implementation": {
+      "path": "docs/learning/devlog/phase9c-state-transition-protocol-implementation.md",
+      "bytes": 22577,
+      "sha256": "40036097b501d2101f9d2eabb062775d2e028d67ebcdc5c0a2732a682e1c0d62"
+    },
+    "preregistration": {
+      "path": "docs/learning/devlog/phase9c-state-transition-protocol-preregistration.md",
+      "bytes": 8906,
+      "sha256": "18347bad852ec084b8ed810d6138798d6f0fb6e4dc0b2e354d36e721a51526b8",
+      "criteria_section_sha256": "2e49ad3cd06c50550a9cde5e5c375bbd5943813a8baf362348c995f2ef538a50"
+    },
+    "external_review": {
+      "verdict": "PASS",
+      "patch_bytes": 61779,
+      "patch_sha256": "c7f212c3423546bcb6722711a60b5bd82f3bade4420dc8e250097a317ef59ebc",
+      "report_bytes": 11143,
+      "report_sha256": "857538a9c1f42dc0c68042c6ac8323f59e18e3ecb6aa86d3cbe6f125ee8c06c1"
+    }
+  },
+  "primary_thresholds": {
+    "inventory_lifecycle": {
+      "minimum_successes": 1,
+      "attempts": 3
+    },
+    "feature_implementation": {
+      "minimum_successes": 6,
+      "attempts": 9
+    },
+    "overall": {
+      "minimum_successes": 20,
+      "attempts": 27
+    }
+  },
+  "secondary_targeted": {
+    "atomic_plus_inventory": {
+      "minimum_successes": 3,
+      "attempts": 6
+    },
+    "analysis_only_tasks": [
+      "feature-atomic-bulk-import",
+      "feature-inventory-reservation-lifecycle",
+      "bugfix-retry-state-idempotency"
+    ]
+  },
+  "hard_guardrails": {
+    "bug_fixing_successes": 9,
+    "bug_fixing_attempts": 9,
+    "maximum_timeouts": 3,
+    "maximum_runtime_failures": 0,
+    "maximum_infrastructure_failures": 0,
+    "maximum_trace_failures": 0,
+    "maximum_grader_failures": 0,
+    "required_experiment_status": "VALID",
+    "planned": 27,
+    "started": 27,
+    "completed": 27
+  },
+  "efficiency_guardrails": {
+    "maximum_complete_median_latency_ms": 88061.8772,
+    "maximum_complete_median_input_output_tokens": 11976.25,
+    "median_algorithm": "python.statistics.median",
+    "exclude_timeout_zero_token_placeholders": true,
+    "report_total_experiment_wall": true,
+    "wall_definition": "same_as_phase9b"
+  },
+  "atomic_oracle_disposition": "CONTRACT_AMBIGUITY_NOTE",
+  "decision_labels": [
+    "ACCEPT",
+    "MIXED",
+    "REJECT",
+    "INVALID"
+  ],
+  "real_model_experiment_authorized": false
+}

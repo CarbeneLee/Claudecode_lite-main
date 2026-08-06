@@ -1,0 +1,71 @@
+diff --git a/tests/test_dependency_planner_contract.py b/tests/test_dependency_planner_contract.py
+new file mode 100644
+index 0000000..16b7557
+--- /dev/null
++++ b/tests/test_dependency_planner_contract.py
+@@ -0,0 +1,65 @@
++import pytest
++
++from dependency_planner import (
++    DependencyCycleError,
++    DuplicateTaskError,
++    Task,
++    UnknownDependencyError,
++    plan,
++)
++
++
++# 功能：验证依赖在前且 ready ties 保持输入顺序
++# 设计：把独立、依赖和后续 ready 节点放入同一输入序列
++def test_dependencies_precede_dependents_with_stable_ready_order() -> None:
++    tasks = [
++        Task("lint"),
++        Task("compile"),
++        Task("package", ("compile",)),
++        Task("docs"),
++    ]
++
++    assert plan(tasks) == ["lint", "compile", "package", "docs"]
++
++
++# 功能：验证断开的任务不会被依赖图过滤
++# 设计：组合一个独立节点与一条依赖边并断言完整顺序
++def test_disconnected_tasks_remain_in_plan() -> None:
++    tasks = [
++        Task("standalone"),
++        Task("compile"),
++        Task("package", ("compile",)),
++    ]
++
++    assert plan(tasks) == ["standalone", "compile", "package"]
++
++
++# 功能：验证重复任务名称被明确拒绝
++# 设计：用最小两节点输入隔离 duplicate validation
++def test_duplicate_names_are_rejected() -> None:
++    with pytest.raises(DuplicateTaskError):
++        plan([Task("build"), Task("build")])
++
++
++# 功能：验证未知依赖使用专用异常
++# 设计：只提供一个缺失名称以区分 cycle error
++def test_unknown_dependencies_are_rejected() -> None:
++    with pytest.raises(UnknownDependencyError):
++        plan([Task("deploy", ("missing",))])
++
++
++# 功能：验证闭合依赖环被拒绝
++# 设计：使用两个互相依赖的节点触发 no-progress 分支
++def test_cycles_are_rejected() -> None:
++    with pytest.raises(DependencyCycleError):
++        plan([Task("alpha", ("beta",)), Task("beta", ("alpha",))])
++
++
++# 功能：验证 ready ties 稳定且 caller list 不被修改
++# 设计：使用非字母序列表并保存调用前副本
++def test_input_order_is_stable_and_caller_list_is_unchanged() -> None:
++    tasks = [Task("zeta"), Task("alpha")]
++    original = list(tasks)
++
++    assert plan(tasks) == ["zeta", "alpha"]
++    assert tasks == original

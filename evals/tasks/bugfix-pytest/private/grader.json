@@ -1,0 +1,10 @@
+{
+  "criteria": [
+    {
+      "id": "hidden-tests-pass",
+      "kind": "command_exit",
+      "argv": ["python", "-m", "pytest", "-q"],
+      "expected_exit_code": 0
+    }
+  ]
+}

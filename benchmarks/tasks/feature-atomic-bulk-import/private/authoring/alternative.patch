@@ -1,0 +1,68 @@
+diff --git a/orders/__init__.py b/orders/__init__.py
+--- a/orders/__init__.py
++++ b/orders/__init__.py
+@@ -1,12 +1,14 @@
+ from orders.errors import DuplicateOrderError, StoreCapacityError
+-from orders.models import Order
+-from orders.service import create_order
++from orders.models import ImportSummary, Order
++from orders.service import create_order, import_orders
+ from orders.store import InMemoryOrderStore
+ 
+ __all__ = [
+     "DuplicateOrderError",
++    "ImportSummary",
+     "InMemoryOrderStore",
+     "Order",
+     "StoreCapacityError",
+     "create_order",
++    "import_orders",
+ ]
+diff --git a/orders/models.py b/orders/models.py
+--- a/orders/models.py
++++ b/orders/models.py
+@@ -6,3 +6,9 @@ class Order:
+     order_id: str
+     sku: str
+     quantity: int
++
++
++@dataclass(frozen=True)
++class ImportSummary:
++    imported_count: int
++    order_ids: tuple[str, ...]
+diff --git a/orders/service.py b/orders/service.py
+--- a/orders/service.py
++++ b/orders/service.py
+@@ -1,6 +1,6 @@
+-from collections.abc import Mapping
++from collections.abc import Iterable, Mapping
+ 
+-from orders.models import Order
++from orders.models import ImportSummary, Order
+ from orders.parser import parse_order_row
+ from orders.store import InMemoryOrderStore
+ 
+@@ -12,2 +12,22 @@ def create_order(
+     store.add(order)
+     return order
++
++
++def import_orders(
++    store: InMemoryOrderStore,
++    rows: Iterable[Mapping[str, str]],
++) -> ImportSummary:
++    before = store.all_orders()
++    imported: list[Order] = []
++    try:
++        for row in rows:
++            order = parse_order_row(row)
++            store.add(order)
++            imported.append(order)
++    except Exception:
++        store.replace_all(before)
++        raise
++    return ImportSummary(
++        imported_count=len(imported),
++        order_ids=tuple(order.order_id for order in imported),
++    )

@@ -1,0 +1,44 @@
+diff --git a/tests/test_querylang.py b/tests/test_querylang.py
+--- a/tests/test_querylang.py
++++ b/tests/test_querylang.py
+@@ -1,8 +1,39 @@
+-from querylang import Term, parse_query
++import pytest
++
++from querylang import QuerySyntaxError, Term, parse_query
+ 
+ 
+ def test_parse_query_keeps_unquoted_and_quoted_terms_in_order() -> None:
+     assert parse_query('status:open owner:"Ada Lovelace"') == (
+         Term(field="status", value="open"),
+         Term(field="owner", value="Ada Lovelace"),
+     )
++
++
++def test_quoted_values_keep_delimiters_and_may_be_empty() -> None:
++    assert parse_query('note:"a:b c" tag:""') == (
++        Term(field="note", value="a:b c"),
++        Term(field="tag", value=""),
++    )
++
++
++def test_quoted_values_decode_escaped_quotes_and_backslashes() -> None:
++    assert parse_query(r'title:"say \"hi\" and \\ bye"') == (
++        Term(field="title", value='say "hi" and \\ bye'),
++    )
++
++
++@pytest.mark.parametrize(
++    "query",
++    [
++        'title:"unterminated',
++        "title:value\\",
++        "field:",
++        ":value",
++        'field:bad"quote',
++        "bare",
++    ],
++)
++def test_malformed_queries_raise_syntax_error(query: str) -> None:
++    with pytest.raises(QuerySyntaxError):
++        parse_query(query)

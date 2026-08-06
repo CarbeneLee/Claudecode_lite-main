@@ -6,6 +6,12 @@ from pathlib import Path
 
 import pytest
 
+from kama_claude.core.sandbox.errors import SandboxUnavailableError
+from kama_claude.core.sandbox.executors import (
+    CommandExecutor,
+    ExecResult,
+    HostExecutor,
+)
 from kama_claude.core.tools.builtin.bash import BashTool
 from kama_claude.core.tools.builtin.list_dir import ListDirTool
 from kama_claude.core.tools.builtin.write_file import WriteFileTool
@@ -34,9 +40,23 @@ def _write_tool(workspace: Path) -> WriteFileTool:
     )
 
 
-# 构造从指定 workspace 启动的 bash 工具
+# 构造从指定 workspace 启动的 bash 工具（显式注入宿主执行器）
 def _bash_tool(workspace: Path) -> BashTool:
-    return BashTool(workspace)
+    return BashTool(HostExecutor(), workspace_root=workspace)
+
+
+class _RecordingExecutor(CommandExecutor):
+    # 记录 exec 调用并返回可配置结果，隔离 BashTool 的展示逻辑
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Path, float]] = []
+        self.result = ExecResult(output=b"out", returncode=0, timed_out=False)
+        self.failure: Exception | None = None
+
+    async def exec(self, command: str, *, cwd: Path, timeout: float) -> ExecResult:
+        self.calls.append((command, cwd, timeout))
+        if self.failure is not None:
+            raise self.failure
+        return self.result
 
 # ── bash ──────────────────────────────────────────────────────────────────────
 
@@ -121,6 +141,68 @@ async def test_bash_output_truncation_unchanged(tmp_path: Path) -> None:
     assert not result.is_error
     assert result.content.endswith("[truncated]")
     assert len(result.content) < 70000
+
+
+# 功能：验证 BashTool 把命令、canonical workspace cwd 与 timeout 原样委托给 executor
+# 设计：注入记录 executor，断言委托参数与结果展示——BashTool 不再直接碰 subprocess
+@pytest.mark.asyncio
+async def test_bash_delegates_command_and_cwd(tmp_path: Path) -> None:
+    executor = _RecordingExecutor()
+    executor.result = ExecResult(output=b"echoed", returncode=0, timed_out=False)
+
+    result = await BashTool(executor, workspace_root=tmp_path).invoke(
+        {"command": "echo hi", "timeout": 7}
+    )
+
+    assert not result.is_error
+    assert result.content == "echoed"
+    assert executor.calls == [("echo hi", tmp_path.resolve(), 7)]
+
+
+# 功能：验证 executor 报告 timed_out 时映射为 timeout 错误结果
+# 设计：注入 timed_out=True 的结果，断言展示层错误类型与超时消息
+@pytest.mark.asyncio
+async def test_bash_maps_executor_timeout_to_timeout_error(tmp_path: Path) -> None:
+    executor = _RecordingExecutor()
+    executor.result = ExecResult(output=b"", returncode=-1, timed_out=True)
+
+    result = await BashTool(executor, workspace_root=tmp_path).invoke(
+        {"command": "sleep 5", "timeout": 1}
+    )
+
+    assert result.is_error
+    assert result.error_type == "timeout"
+    assert "[timeout after 1s]" in result.content
+
+
+# 功能：验证 executor 报告非零退出码时映射为 command_failed 错误结果
+# 设计：注入 returncode=2 的结果，断言展示层保留退出码标注与输出
+@pytest.mark.asyncio
+async def test_bash_maps_executor_nonzero_to_command_failed(tmp_path: Path) -> None:
+    executor = _RecordingExecutor()
+    executor.result = ExecResult(output=b"boom", returncode=2, timed_out=False)
+
+    result = await BashTool(executor, workspace_root=tmp_path).invoke(
+        {"command": "exit 2"}
+    )
+
+    assert result.is_error
+    assert result.error_type == "command_failed"
+    assert "[exit 2]" in result.content
+    assert "boom" in result.content
+
+
+# 功能：验证 executor 抛出的沙箱异常原样传播（分类是 invocation 层的职责）
+# 设计：注入 SandboxUnavailableError，断言 BashTool 不吞不转——展示层保持透明
+@pytest.mark.asyncio
+async def test_bash_propagates_executor_sandbox_error(tmp_path: Path) -> None:
+    executor = _RecordingExecutor()
+    executor.failure = SandboxUnavailableError("no daemon")
+
+    with pytest.raises(SandboxUnavailableError):
+        await BashTool(executor, workspace_root=tmp_path).invoke(
+            {"command": "echo hi"}
+        )
 
 
 # ── write_file ────────────────────────────────────────────────────────────────

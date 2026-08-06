@@ -1,0 +1,66 @@
+diff --git a/inventory/reservations.py b/inventory/reservations.py
+index 85ea03b..c66d0ce 100644
+--- a/inventory/reservations.py
++++ b/inventory/reservations.py
+@@ -1,7 +1,12 @@
+ from __future__ import annotations
+ 
+-from inventory.errors import UnknownReservation
+-from inventory.models import Reservation
++from inventory.errors import (
++    InsufficientStock,
++    InvalidQuantity,
++    InvalidTransition,
++    UnknownReservation,
++)
++from inventory.models import Reservation, ReservationStatus
+ from inventory.store import InventoryStore
+ 
+ 
+@@ -27,12 +32,43 @@ class ReservationService:
+         sku: str,
+         quantity: int,
+     ) -> Reservation:
+-        raise NotImplementedError
++        if quantity <= 0:
++            raise InvalidQuantity("quantity must be positive")
++        existing_id = self._by_request.get(request_key)
++        if existing_id is not None:
++            return self._reservations[existing_id]
++        item = self._store.get(sku)
++        if item.available < quantity:
++            raise InsufficientStock(sku)
++        self._store.adjust(sku, -quantity)
++        reservation = Reservation(
++            reservation_id=f"r-{self._next_id}",
++            request_key=request_key,
++            sku=sku,
++            quantity=quantity,
++        )
++        self._next_id += 1
++        self._reservations[reservation.reservation_id] = reservation
++        self._by_request[request_key] = reservation.reservation_id
++        return reservation
+ 
+     # 确认一个待处理 reservation
+     def confirm(self, reservation_id: str) -> Reservation:
+-        raise NotImplementedError
++        reservation = self.get(reservation_id)
++        if reservation.status is ReservationStatus.CONFIRMED:
++            return reservation
++        if reservation.status is ReservationStatus.RELEASED:
++            raise InvalidTransition("released reservation cannot be confirmed")
++        reservation.status = ReservationStatus.CONFIRMED
++        return reservation
+ 
+     # 释放一个待处理 reservation 并恢复库存
+     def release(self, reservation_id: str) -> Reservation:
+-        raise NotImplementedError
++        reservation = self.get(reservation_id)
++        if reservation.status is ReservationStatus.RELEASED:
++            return reservation
++        if reservation.status is ReservationStatus.CONFIRMED:
++            raise InvalidTransition("confirmed reservation cannot be released")
++        self._store.adjust(reservation.sku, reservation.quantity)
++        reservation.status = ReservationStatus.RELEASED
++        return reservation

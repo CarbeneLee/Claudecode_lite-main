@@ -1,0 +1,61 @@
+diff --git a/tests/test_dependency_planner_matrix.py b/tests/test_dependency_planner_matrix.py
+new file mode 100644
+index 0000000..d6c84a2
+--- /dev/null
++++ b/tests/test_dependency_planner_matrix.py
+@@ -0,0 +1,55 @@
++import pytest
++
++from dependency_planner import (
++    DependencyCycleError,
++    DuplicateTaskError,
++    Task,
++    UnknownDependencyError,
++    plan,
++)
++
++
++@pytest.mark.parametrize(
++    ("tasks", "expected"),
++    [
++        ([Task("zeta"), Task("alpha")], ["zeta", "alpha"]),
++        (
++            [Task("docs"), Task("compile"), Task("package", ("compile",))],
++            ["docs", "compile", "package"],
++        ),
++        (
++            [Task("package", ("compile",)), Task("compile")],
++            ["compile", "package"],
++        ),
++    ],
++)
++# 功能：验证多种合法图的顺序和输入不变性
++# 设计：用参数表证明 oracle 不绑定单一测试分解
++def test_valid_plans_preserve_contract(
++    tasks: list[Task],
++    expected: list[str],
++) -> None:
++    before = list(tasks)
++    assert plan(tasks) == expected
++    assert tasks == before
++
++
++@pytest.mark.parametrize(
++    ("tasks", "error"),
++    [
++        ([Task("build"), Task("build")], DuplicateTaskError),
++        ([Task("deploy", ("missing",))], UnknownDependencyError),
++        (
++            [Task("alpha", ("beta",)), Task("beta", ("alpha",))],
++            DependencyCycleError,
++        ),
++    ],
++)
++# 功能：验证三类非法图使用各自错误合同
++# 设计：以异常类型参数表覆盖 duplicate、unknown 和 cycle
++def test_invalid_graphs_raise_specific_error(
++    tasks: list[Task],
++    error: type[Exception],
++) -> None:
++    with pytest.raises(error):
++        plan(tasks)

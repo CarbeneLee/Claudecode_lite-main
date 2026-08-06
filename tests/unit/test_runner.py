@@ -9,12 +9,33 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 
+from kama_claude.core.bus.events import (
+    GitRunDiffEvent,
+    LlmModelSelectedEvent,
+    StepFinishedEvent,
+    ToolCallStartedEvent,
+)
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.events.bus import EventBus
+from kama_claude.core.events.journal import EventJournalCoordinator
 from kama_claude.core.events.writer import EventWriter
+from kama_claude.core.git.config import GitConfig
+from kama_claude.core.git.errors import DirtyWorkspaceError, GitUnavailableError
+from kama_claude.core.git.manager import GitDiff
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.runner import AgentRunner
+from kama_claude.core.sandbox.config import SandboxConfig
+from kama_claude.core.sandbox.executors import (
+    ContainerExecutor,
+    ExecResult,
+    HostExecutor,
+)
+from kama_claude.core.sandbox.manager import SandboxManager
+from kama_claude.core.sandbox.runtime import ContainerRuntime
+from kama_claude.core.semantic.config import SemanticConfig
+from kama_claude.core.semantic.service import SemanticRetrievalService
+from kama_claude.core.semantic.tools import SearchSemanticTool
 from kama_claude.core.subagent.tool import SpawnAgentTool
 from kama_claude.core.task.manager import TaskManager
 from kama_claude.core.tools.builtin.bash import BashTool
@@ -22,6 +43,7 @@ from kama_claude.core.tools.builtin.list_dir import ListDirTool
 from kama_claude.core.tools.builtin.read_file import ReadFileTool
 from kama_claude.core.tools.builtin.search_code import SearchCodeTool
 from kama_claude.core.tools.builtin.write_file import WriteFileTool
+from kama_claude.eval.graders import grade_trace
 
 # --- mock provider -----------------------------------------------------------
 
@@ -84,6 +106,29 @@ class _CapturingProvider:
         self.messages = [dict(m) for m in messages]
         self.system = system
         return self.response
+
+
+class _ModelThenErrorProvider:
+    # 发布稳定model identity后抛出无网络provider异常
+    async def chat(
+        self,
+        messages: list[dict[str, object]],
+        tool_schemas: list[dict[str, object]],
+        bus: EventBus,
+        run_id: str,
+        *,
+        step: int = 0,
+        system: str | None = None,
+    ) -> LlmResponse:
+        await bus.publish(
+            LlmModelSelectedEvent(
+                run_id=run_id,
+                model="local-test-model",
+                strategy="static",
+                ts="2026-07-29T00:00:00+00:00",
+            )
+        )
+        raise RuntimeError("local provider failure")
 
 
 # --- helpers -----------------------------------------------------------------
@@ -157,6 +202,111 @@ def test_runner_passes_workspace_to_spawn_agent(tmp_path: Path) -> None:
 
     assert spawn_tool is not None
     assert spawn_tool._workspace_root == tmp_path.resolve(strict=True)  # type: ignore[attr-defined]
+
+
+class _RecordingRuntime(ContainerRuntime):
+    # 进程内 fake runtime：记录 exec 调用，验证 bash 经容器路径执行
+    def __init__(self) -> None:
+        self.ensure_calls = 0
+        self.exec_calls = 0
+        self.close_calls = 0
+        self.calls: list[tuple[str, str, float]] = []
+
+    async def ensure_running(self) -> None:
+        self.ensure_calls += 1
+
+    async def exec(self, command: str, *, cwd: str, timeout: float) -> ExecResult:
+        self.exec_calls += 1
+        self.calls.append((command, cwd, timeout))
+        return ExecResult(output=b"fake-out", returncode=0, timed_out=False)
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+def _sandbox_manager(workspace: Path, runtime: ContainerRuntime) -> SandboxManager:
+    return SandboxManager(
+        config=SandboxConfig(image="python:3.12-slim"),
+        workspace_root=workspace,
+        runtime=runtime,
+    )
+
+
+# 功能：验证注入 sandbox_manager 后 registry 的 bash 工具改用容器执行器
+# 设计：检查 bash 工具持有的 executor 类型与绑定的 workspace，不执行命令
+def test_runner_bash_uses_container_executor_when_sandbox_injected(
+    tmp_path: Path,
+) -> None:
+    runtime = _RecordingRuntime()
+    manager = _sandbox_manager(tmp_path.resolve(), runtime)
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        sandbox_manager=manager,
+    )
+
+    registry = runner._build_registry(TaskManager(tmp_path / "tasks"))
+    bash_tool = registry.get("bash")
+
+    assert isinstance(bash_tool, BashTool)
+    assert isinstance(bash_tool._executor, ContainerExecutor)
+    assert runtime.ensure_calls == 0  # 懒创建：装配不触发容器启动
+
+
+# 功能：验证未注入 sandbox_manager 时 bash 工具保持宿主执行器
+# 设计：默认装配路径断言 HostExecutor，防止沙箱关闭场景误入容器路径
+def test_runner_bash_uses_host_executor_without_sandbox(tmp_path: Path) -> None:
+    runner = AgentRunner(_config(), workspace_root=tmp_path.resolve())
+
+    registry = runner._build_registry(TaskManager(tmp_path / "tasks"))
+    bash_tool = registry.get("bash")
+
+    assert isinstance(bash_tool, BashTool)
+    assert isinstance(bash_tool._executor, HostExecutor)
+
+
+# 功能：验证注入沙箱后 bash 调用经容器路径转发（映射 cwd + 透传命令）
+# 设计：真实 invoke 走 runner 装配链，断言 fake runtime 收到容器内路径与命令
+async def test_runner_bash_invokes_through_container(tmp_path: Path) -> None:
+    runtime = _RecordingRuntime()
+    manager = _sandbox_manager(tmp_path.resolve(), runtime)
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        sandbox_manager=manager,
+    )
+    registry = runner._build_registry(TaskManager(tmp_path / "tasks"))
+
+    result = await registry.get("bash").invoke({"command": "echo hi"})  # type: ignore[union-attr]
+
+    assert not result.is_error
+    assert result.content == "fake-out"
+    assert runtime.ensure_calls == 1
+    assert runtime.exec_calls == 1
+    assert runtime.calls == [("echo hi", "/workspace", 60)]
+
+
+# 功能：验证 AgentRunner 把 sandbox_manager 传递给顶层 SpawnAgentTool
+# 设计：沿 registry 组装路径检查 spawn 工具持有同一 manager 实例
+def test_runner_passes_sandbox_manager_to_spawn_agent(tmp_path: Path) -> None:
+    runtime = _RecordingRuntime()
+    manager = _sandbox_manager(tmp_path.resolve(), runtime)
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        sandbox_manager=manager,
+    )
+
+    registry = runner._build_registry(
+        TaskManager(tmp_path / "tasks"),
+        run_id="run-1",
+        provider=_EndTurnProvider(),
+        bus=EventBus(),
+    )
+    spawn_tool = registry.get("spawn_agent")
+
+    assert spawn_tool is not None
+    assert spawn_tool._sandbox_manager is manager  # type: ignore[attr-defined]
 
 
 # 功能：验证 Runner registry 的 read/list 工具绑定 Runner workspace
@@ -600,6 +750,423 @@ def _read_v2_events(path: Path) -> list[dict[str, Any]]:
     ]
 
 
+# 功能：验证provider异常run在真实Runner与journal中先闭合step再发布failed terminal
+# 设计：provider发布model event后抛错，读取真实v2 journal并交给complete grader验证精确序列
+async def test_provider_error_persists_complete_failed_lifecycle(
+    tmp_path: Path,
+) -> None:
+    run_id = "run-provider-error"
+    runs_dir = tmp_path / "runs"
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        provider=_ModelThenErrorProvider(),  # type: ignore[arg-type]
+        runs_dir=runs_dir,
+    )
+
+    outcome = await runner.run_and_capture("fail locally", run_id=run_id)
+    journal_path = runs_dir / run_id / "events.v2.jsonl"
+    events = _read_v2_events(journal_path)
+    grade = grade_trace(journal_path, expected_run_id=run_id)
+
+    assert [event["type"] for event in events] == [
+        "run.started",
+        "step.started",
+        "llm.model_selected",
+        "step.finished",
+        "run.finished",
+    ]
+    assert events[-1]["status"] == "failed"
+    assert events[-1]["reason"] == "llm_error"
+    assert events[-1]["steps"] == 1
+    assert outcome.status == "failed"
+    assert outcome.reason == "llm_error"
+    assert grade.passed is True
+    assert grade.errors == []
+
+
+# 功能：验证无primary的step delivery failure阻止Runner提交success并保留fail-closed journal
+# 设计：end_turn先形成pending success，再由journal前subscriber破坏finish，检查最终outcome与真实grader
+async def test_step_delivery_failure_prevents_runner_success(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    run_id = "run-step-delivery-failure"
+    runs_dir = tmp_path / "runs"
+    bus = EventBus()
+    attempts = 0
+    finalizer_sentinel = "FINALIZER_ONLY_SECRET_SENTINEL_DO_NOT_LOG"
+
+    # 只阻断step terminal到达journal，允许Runner terminal继续持久化
+    async def fail_before_journal(event: BaseModel) -> None:
+        nonlocal attempts
+        if not isinstance(event, StepFinishedEvent):
+            return
+        attempts += 1
+        raise RuntimeError(finalizer_sentinel)
+
+    bus.subscribe(fail_before_journal)
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        bus=bus,
+        provider=_EndTurnProvider(),  # type: ignore[arg-type]
+        runs_dir=runs_dir,
+    )
+
+    outcome = await runner.run_and_capture("finish locally", run_id=run_id)
+    journal_path = runs_dir / run_id / "events.v2.jsonl"
+    events = _read_v2_events(journal_path)
+    grade = grade_trace(journal_path, expected_run_id=run_id)
+    runner_records = [
+        record for record in caplog.records if record.name == "kama_claude.core.runner"
+    ]
+
+    assert attempts == 1
+    assert outcome.status == "failed"
+    assert outcome.result == ""
+    assert outcome.reason == "llm_error"
+    assert [event["type"] for event in events] == [
+        "run.started",
+        "step.started",
+        "run.finished",
+    ]
+    assert events[-1]["status"] == "failed"
+    assert events[-1]["reason"] == "llm_error"
+    assert grade.passed is False
+    assert grade.errors == ["run finished with open step"]
+    assert len(runner_records) == 1
+    assert runner_records[0].getMessage() == (
+        "agent run failed run_id=run-step-delivery-failure step=1 "
+        "failure_role=primary failure_category=propagated_exception"
+    )
+    assert runner_records[0].exc_info is None
+    assert runner_records[0].exc_text in (None, "")
+    assert finalizer_sentinel not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "RuntimeError" not in caplog.text
+    assert str(Path(__file__).resolve()) not in caplog.text
+
+
+# 功能：验证provider primary遇到step delivery secondary时保持llm_error且grader对缺帧fail closed
+# 设计：把失败subscriber注册在Runner自有journal之前，组合验证primary优先级、单次发布和真实持久化证据
+async def test_provider_primary_with_step_delivery_failure_fails_trace_closed(
+    tmp_path: Path,
+) -> None:
+    run_id = "run-provider-primary-step-secondary"
+    runs_dir = tmp_path / "runs"
+    bus = EventBus()
+    attempts = 0
+
+    # 只在step terminal阻断后续journal subscriber，保留其他事件与run terminal持久化
+    async def fail_before_journal(event: BaseModel) -> None:
+        nonlocal attempts
+        if not isinstance(event, StepFinishedEvent):
+            return
+        attempts += 1
+        raise RuntimeError("secondary step delivery failure")
+
+    bus.subscribe(fail_before_journal)
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        bus=bus,
+        provider=_ModelThenErrorProvider(),  # type: ignore[arg-type]
+        runs_dir=runs_dir,
+    )
+
+    outcome = await runner.run_and_capture("fail locally", run_id=run_id)
+    journal_path = runs_dir / run_id / "events.v2.jsonl"
+    events = _read_v2_events(journal_path)
+    grade = grade_trace(journal_path, expected_run_id=run_id)
+
+    assert attempts == 1
+    assert outcome.status == "failed"
+    assert outcome.reason == "llm_error"
+    assert [event["type"] for event in events] == [
+        "run.started",
+        "step.started",
+        "llm.model_selected",
+        "run.finished",
+    ]
+    assert events[-1]["status"] == "failed"
+    assert events[-1]["reason"] == "llm_error"
+    assert grade.passed is False
+    assert grade.errors == ["run finished with open step"]
+
+
+# 功能：验证tool-path普通异常与step delivery失败组合时Runner仍映射llm_error且grader fail closed
+# 设计：在真实ToolCallStartedEvent与StepFinishedEvent上依次抛primary/secondary，读取真实journal
+async def test_tool_path_primary_with_step_delivery_failure_fails_trace_closed(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    run_id = "run-tool-primary-step-secondary"
+    runs_dir = tmp_path / "runs"
+    bus = EventBus()
+    primary = RuntimeError("TOOL_PRIMARY_SENTINEL_DO_NOT_LOG")
+    secondary = RuntimeError("FINALIZER_SECRET_SENTINEL_DO_NOT_LOG")
+    finish_attempts = 0
+
+    # 先在真实tool invocation事件抛primary，再在唯一step terminal抛secondary
+    async def fail_tool_and_step(event: BaseModel) -> None:
+        nonlocal finish_attempts
+        if isinstance(event, ToolCallStartedEvent):
+            raise primary
+        if isinstance(event, StepFinishedEvent):
+            finish_attempts += 1
+            raise secondary
+
+    bus.subscribe(fail_tool_and_step)
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        bus=bus,
+        provider=_LoopingProvider(),  # type: ignore[arg-type]
+        runs_dir=runs_dir,
+    )
+
+    outcome = await runner.run_and_capture("fail in tool path", run_id=run_id)
+    journal_path = runs_dir / run_id / "events.v2.jsonl"
+    events = _read_v2_events(journal_path)
+    grade = grade_trace(journal_path, expected_run_id=run_id)
+    await asyncio.sleep(0)
+    orphan_publications = [
+        task
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+        and not task.done()
+        and task.get_coro().__qualname__ == "EventBus.publish"
+    ]
+    runner_records = [
+        record for record in caplog.records if record.name == "kama_claude.core.runner"
+    ]
+
+    assert finish_attempts == 1
+    assert outcome.status == "failed"
+    assert outcome.result == ""
+    assert outcome.reason == "llm_error"
+    assert [event["type"] for event in events] == [
+        "run.started",
+        "step.started",
+        "run.finished",
+    ]
+    assert events[-1]["status"] == "failed"
+    assert events[-1]["reason"] == "llm_error"
+    assert grade.passed is False
+    assert grade.errors == ["run finished with open step"]
+    assert orphan_publications == []
+    assert len(runner_records) == 1
+    assert runner_records[0].getMessage() == (
+        "agent run failed run_id=run-tool-primary-step-secondary step=1 "
+        "failure_role=primary failure_category=propagated_exception"
+    )
+    assert runner_records[0].exc_info is None
+    assert runner_records[0].exc_text in (None, "")
+    assert "TOOL_PRIMARY_SENTINEL_DO_NOT_LOG" not in caplog.text
+    assert "FINALIZER_SECRET_SENTINEL_DO_NOT_LOG" not in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "RuntimeError" not in caplog.text
+    assert str(Path(__file__).resolve()) not in caplog.text
+
+
+# 功能：验证finalizer期间取消会完成同一次journal publication再发布cancelled run terminal
+# 设计：把阻塞subscriber注册在journal之前，取消Runner后释放，确保shield而非subscriber顺序保护生命周期
+async def test_finalizer_cancellation_finishes_step_before_run_terminal(
+    tmp_path: Path,
+) -> None:
+    run_id = "run-finalizer-cancel"
+    runs_dir = tmp_path / "runs"
+    bus = EventBus()
+    journal = EventJournalCoordinator()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    completed = asyncio.Event()
+    attempts = 0
+
+    # 在journal之前阻塞step terminal，制造publication尚未到达durable subscriber的窗口
+    async def block_before_journal(event: BaseModel) -> None:
+        nonlocal attempts
+        if not isinstance(event, StepFinishedEvent):
+            return
+        attempts += 1
+        entered.set()
+        await release.wait()
+        completed.set()
+
+    bus.subscribe(block_before_journal)
+    bus.subscribe(journal.handle)
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        bus=bus,
+        provider=_EndTurnProvider(),  # type: ignore[arg-type]
+        runs_dir=runs_dir,
+        journal=journal,
+    )
+    observed_in_runner: asyncio.CancelledError | None = None
+
+    # 保存Runner边界传播出的取消对象供外层做identity比较
+    async def observe_runner_cancellation() -> None:
+        nonlocal observed_in_runner
+        try:
+            await runner.run_and_capture("cancel finalizer", run_id=run_id)
+        except asyncio.CancelledError as exc:
+            observed_in_runner = exc
+            raise
+
+    task = asyncio.create_task(observe_runner_cancellation())
+    await entered.wait()
+    task.cancel("cancel-finalizer-runner")
+    await asyncio.sleep(0)
+    release.set()
+
+    try:
+        await task
+    except asyncio.CancelledError as caught:
+        observed_by_caller = caught
+    else:
+        raise AssertionError("runner cancellation did not propagate")
+    await journal.flush_all()
+    await journal.close()
+
+    journal_path = runs_dir / run_id / "events.v2.jsonl"
+    events = _read_v2_events(journal_path)
+    grade = grade_trace(journal_path, expected_run_id=run_id)
+
+    assert attempts == 1
+    assert completed.is_set()
+    assert observed_in_runner is observed_by_caller
+    assert observed_by_caller.args == ("cancel-finalizer-runner",)
+    assert [event["type"] for event in events] == [
+        "run.started",
+        "step.started",
+        "step.finished",
+        "run.finished",
+    ]
+    assert events[-1]["status"] == "failed"
+    assert events[-1]["reason"] == "cancelled"
+    assert events[-1]["steps"] == 1
+    assert grade.passed is True
+    assert grade.errors == []
+
+
+# 功能：验证finalizer阻塞期间重复取消仍复用一次publication并传播provider捕获的首个对象
+# 设计：真实Runner/journal链路执行三次cancel，在释放subscriber后检查identity、顺序与无orphan
+async def test_repeated_cancellation_during_step_finalization_reuses_one_publication(
+    tmp_path: Path,
+) -> None:
+    run_id = "run-repeated-finalizer-cancel"
+    runs_dir = tmp_path / "runs"
+    bus = EventBus()
+    journal = EventJournalCoordinator()
+    provider = _CancellationProvider()
+    finalizer_entered = asyncio.Event()
+    release = asyncio.Event()
+    completed = asyncio.Event()
+    finish_attempts = 0
+    loop_errors: list[dict[str, Any]] = []
+    running_loop = asyncio.get_running_loop()
+    previous_handler = running_loop.get_exception_handler()
+
+    # 捕获未retrieve task异常，确保重复取消不会遗留finalizer warning
+    def capture_loop_error(
+        event_loop: asyncio.AbstractEventLoop,
+        context: dict[str, Any],
+    ) -> None:
+        loop_errors.append(context)
+
+    # 在journal之前阻塞唯一step terminal以建立两次secondary cancellation窗口
+    async def block_before_journal(event: BaseModel) -> None:
+        nonlocal finish_attempts
+        if not isinstance(event, StepFinishedEvent):
+            return
+        finish_attempts += 1
+        finalizer_entered.set()
+        await release.wait()
+        completed.set()
+
+    bus.subscribe(block_before_journal)
+    bus.subscribe(journal.handle)
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        bus=bus,
+        provider=provider,
+        runs_dir=runs_dir,
+        journal=journal,
+    )
+    observed_in_runner: asyncio.CancelledError | None = None
+
+    # 保存Runner边界传播对象，验证它仍是provider第一次捕获的X
+    async def observe_runner_cancellation() -> None:
+        nonlocal observed_in_runner
+        try:
+            await runner.run_and_capture("cancel repeatedly", run_id=run_id)
+        except asyncio.CancelledError as exc:
+            observed_in_runner = exc
+            raise
+
+    running_loop.set_exception_handler(capture_loop_error)
+    try:
+        task = asyncio.create_task(observe_runner_cancellation())
+        await provider.entered.wait()
+        assert task.cancel("primary-provider-cancel") is True
+        await finalizer_entered.wait()
+        assert task.cancel("secondary-finalizer-cancel-1") is True
+        await asyncio.sleep(0)
+        assert task.cancel("secondary-finalizer-cancel-2") is True
+        cancellation_count = task.cancelling()
+        await asyncio.sleep(0)
+        release.set()
+
+        try:
+            await task
+        except asyncio.CancelledError as caught:
+            observed_by_caller = caught
+        else:
+            raise AssertionError("repeated cancellation did not propagate")
+        await journal.flush_all()
+        await journal.close()
+        await asyncio.sleep(0)
+    finally:
+        running_loop.set_exception_handler(previous_handler)
+
+    journal_path = runs_dir / run_id / "events.v2.jsonl"
+    events = _read_v2_events(journal_path)
+    grade = grade_trace(journal_path, expected_run_id=run_id)
+    orphan_publications = [
+        pending
+        for pending in asyncio.all_tasks()
+        if pending is not asyncio.current_task()
+        and not pending.done()
+        and pending.get_coro().__qualname__ == "EventBus.publish"
+    ]
+
+    assert cancellation_count >= 3
+    assert finish_attempts == 1
+    assert completed.is_set()
+    assert provider.cancelled is observed_in_runner
+    assert observed_in_runner is observed_by_caller
+    assert observed_by_caller.args == ("primary-provider-cancel",)
+    assert [event["type"] for event in events] == [
+        "run.started",
+        "step.started",
+        "step.finished",
+        "run.finished",
+    ]
+    assert events[-1]["status"] == "failed"
+    assert events[-1]["reason"] == "cancelled"
+    assert events[-1]["steps"] == 1
+    assert grade.passed is True
+    assert grade.errors == []
+    assert orphan_publications == []
+    assert not any(
+        context.get("message") == "Task exception was never retrieved"
+        for context in loop_errors
+    )
+
+
 # 功能：验证 parent run terminal 前会 cancel/join 所有 background child 并先持久化 child finished
 # 设计：让 parent loop 启动真实 background SpawnAgentTool 后立即成功、child 永久等待，比较 task 终态和 parent journal 顺序
 async def test_parent_run_joins_background_child_before_terminal(
@@ -654,3 +1221,293 @@ async def test_parent_run_joins_background_child_before_terminal(
         if not child_task.done():
             child_task.cancel()
         await asyncio.gather(child_task, return_exceptions=True)
+
+
+# --- git lifecycle hooks (P4) -------------------------------------------------
+
+
+class _FakeGitManager:
+    # 记录 git 钩子调用；config 复用真实 GitConfig 控制行为开关
+    def __init__(
+        self,
+        *,
+        dirty: bool = False,
+        checkpoint_mode: str = "per_run",
+        auto_rollback_on_fail: bool = False,
+        ensure_fails: bool = False,
+    ) -> None:
+        self.config = GitConfig(
+            checkpoint_mode=checkpoint_mode,
+            auto_rollback_on_fail=auto_rollback_on_fail,
+        )
+        self.calls: list[str] = []
+        self.dirty = dirty
+        self.ensure_fails = ensure_fails
+
+    async def ensure_ready(self) -> None:
+        self.calls.append("ensure_ready")
+        if self.ensure_fails:
+            raise GitUnavailableError("no git")
+
+    async def status(self) -> object:
+        self.calls.append("status")
+        return type("Status", (), {"dirty": self.dirty, "entries": ()})()
+
+    async def snapshot_pre_run(self, run_id: str, label: str = "pre-run") -> None:
+        self.calls.append(f"snapshot_pre_run:{run_id}")
+        return None
+
+    async def ensure_task_branch(self, task_id: str) -> None:
+        self.calls.append(f"ensure_task_branch:{task_id}")
+
+    async def create_checkpoint(
+        self, run_id: str, step: int, label: str, *, force: bool = False
+    ) -> object:
+        self.calls.append(f"create_checkpoint:{run_id}:{step}:{label}")
+        return type("Cp", (), {"step": step})()
+
+    async def get_checkpoint(self, run_id: str, step: int) -> object:
+        self.calls.append(f"get_checkpoint:{run_id}:{step}")
+        if step == 0:
+            return type("Cp", (), {"step": 0})()
+        return None
+
+    async def restore(self, cp: object) -> None:
+        self.calls.append(f"restore:{getattr(cp, 'step', '?')}")
+
+    async def diff(self, ref: str | None = None) -> GitDiff:
+        self.calls.append("diff")
+        return GitDiff(stat="f.txt | 1 +\n", truncated=False)
+
+    async def close(self) -> None:
+        self.calls.append("close")
+
+
+class _FakePermissionManager:
+    # 记录审批请求并返回预设结果，替代真实用户应答
+    def __init__(self, allowed: bool) -> None:
+        self.allowed = allowed
+        self.asked: list[tuple[str, dict[str, Any]]] = []
+
+    async def check_and_wait(
+        self,
+        tool_use_id: str,
+        tool_name: str,
+        params: dict[str, Any],
+        session_id: str,
+        event_emitter: Any,
+    ) -> tuple[bool, str]:
+        self.asked.append((tool_name, params))
+        return self.allowed, ("allow" if self.allowed else "deny")
+
+
+class _OnceToolUseProvider:
+    # 第一步返回未知工具调用（触发失败），第二步结束
+    def __init__(self) -> None:
+        self._call = 0
+
+    async def chat(
+        self,
+        messages: list[dict[str, object]],
+        tool_schemas: list[dict[str, object]],
+        bus: EventBus,
+        run_id: str,
+        *,
+        step: int = 0,
+        system: str | None = None,
+    ) -> LlmResponse:
+        self._call += 1
+        if self._call == 1:
+            tc = ToolCallBlock(id="t1", name="unknown_tool", input={})
+            return LlmResponse(stop_reason="tool_use", tool_calls=[tc])
+        return LlmResponse(stop_reason="end_turn", text="done")
+
+
+class _CancelProvider:
+    # 模拟取消：首次 LLM 调用直接抛 CancelledError
+    async def chat(
+        self,
+        messages: list[dict[str, object]],
+        tool_schemas: list[dict[str, object]],
+        bus: EventBus,
+        run_id: str,
+        *,
+        step: int = 0,
+        system: str | None = None,
+    ) -> LlmResponse:
+        raise asyncio.CancelledError()
+
+
+def _git_runner(
+    tmp_path: Path,
+    git_manager: _FakeGitManager | None,
+    *,
+    provider: object | None = None,
+    permission_manager: object | None = None,
+) -> tuple[AgentRunner, list[BaseModel]]:
+    collected: list[BaseModel] = []
+
+    async def _collect(e: BaseModel) -> None:
+        collected.append(e)
+
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        provider=provider or _EndTurnProvider(),  # type: ignore[arg-type]
+        extra_handlers=[_collect],
+        runs_dir=tmp_path / "runs",
+        permission_manager=permission_manager,  # type: ignore[arg-type]
+        git_manager=git_manager,  # type: ignore[arg-type]
+    )
+    return runner, collected
+
+
+# 功能：验证 run start 自动建立 baseline（ensure_ready → status → task 分支 → baseline checkpoint）
+# 设计：干净工作树 + fake manager，断言调用顺序与 run end diff 事件发布
+async def test_run_start_creates_baseline_in_order(tmp_path: Path) -> None:
+    git = _FakeGitManager()
+    runner, collected = _git_runner(tmp_path, git)
+    outcome = await runner.run_and_capture("goal", run_id="r1")
+    assert outcome.status == "success"
+    assert git.calls == [
+        "ensure_ready",
+        "status",
+        "ensure_task_branch:r1",
+        "create_checkpoint:r1:0:baseline",
+        "diff",
+    ]
+    assert any(isinstance(e, GitRunDiffEvent) for e in collected)
+
+
+# 功能：验证 dirty 工作树且用户批准时调用 snapshot_pre_run（含用户修改的 baseline）
+# 设计：dirty=True + 批准 → ASK 记录；先切 task 分支再固化快照（pre-run 提交
+# 落在 agent 分支而非 main），随后建立 baseline
+async def test_dirty_run_approves_snapshot(tmp_path: Path) -> None:
+    git = _FakeGitManager(dirty=True)
+    perm = _FakePermissionManager(allowed=True)
+    runner, _collected = _git_runner(tmp_path, git, permission_manager=perm)
+    await runner.run_and_capture("goal", run_id="r1")
+    assert perm.asked and perm.asked[0][0] == "git_pre_run_snapshot"
+    assert git.calls == [
+        "ensure_ready",
+        "status",
+        "ensure_task_branch:r1",
+        "snapshot_pre_run:r1",
+        "create_checkpoint:r1:0:baseline",
+        "diff",
+    ]
+
+
+# 功能：验证 dirty 工作树且用户拒绝时抛 DirtyWorkspaceError 且不触碰工作树
+# 设计：dirty=True + 拒绝 → run 抛错，git 调用止于 status（无分支/checkpoint）
+async def test_dirty_run_declined_raises(tmp_path: Path) -> None:
+    git = _FakeGitManager(dirty=True)
+    perm = _FakePermissionManager(allowed=False)
+    runner, _collected = _git_runner(tmp_path, git, permission_manager=perm)
+    with pytest.raises(DirtyWorkspaceError):
+        await runner.run_and_capture("goal", run_id="r1")
+    assert "ensure_task_branch:r1" not in git.calls
+    assert "create_checkpoint" not in "".join(git.calls)
+
+
+# 功能：验证 run 失败且 auto_rollback_on_fail 时恢复到 baseline
+# 设计：provider 抛错使 run 标记 failed → restore(baseline) 被调用
+async def test_run_failure_auto_rollback(tmp_path: Path) -> None:
+    git = _FakeGitManager(auto_rollback_on_fail=True)
+    runner, _collected = _git_runner(tmp_path, git, provider=_ModelThenErrorProvider())
+    outcome = await runner.run_and_capture("goal", run_id="r1")
+    assert outcome.status == "failed"
+    assert "restore:0" in git.calls
+
+
+# 功能：验证取消时不做自动 rollback（用户可能正在查看，refs 已持久化）
+# 设计：auto_rollback 开启 + CancelledError → run 抛 CancelledError 且 restore 未被调用
+async def test_cancelled_run_skips_auto_rollback(tmp_path: Path) -> None:
+    git = _FakeGitManager(auto_rollback_on_fail=True)
+    runner, _collected = _git_runner(tmp_path, git, provider=_CancelProvider())
+    with pytest.raises(asyncio.CancelledError):
+        await runner.run_and_capture("goal", run_id="r1")
+    assert "restore" not in "".join(git.calls)
+
+
+# 功能：验证非 git 仓库 fail-open——run 继续但无 git 能力
+# 设计：ensure_ready 抛 GitUnavailableError → run 成功且无分支/checkpoint/diff
+async def test_non_repo_run_fails_open(tmp_path: Path) -> None:
+    git = _FakeGitManager(ensure_fails=True)
+    runner, collected = _git_runner(tmp_path, git)
+    outcome = await runner.run_and_capture("goal", run_id="r1")
+    assert outcome.status == "success"
+    assert git.calls == ["ensure_ready"]
+    assert not any(isinstance(e, GitRunDiffEvent) for e in collected)
+
+
+# 功能：验证 per_step 模式下每个 step 结束自动 checkpoint
+# 设计：两步 run（tool_use + end_turn）→ auto-step-1 与 auto-step-2 各一次
+async def test_per_step_checkpoint_on_step_finished(tmp_path: Path) -> None:
+    git = _FakeGitManager(checkpoint_mode="per_step")
+    runner, _collected = _git_runner(tmp_path, git, provider=_OnceToolUseProvider())
+    await runner.run_and_capture("goal", run_id="r1")
+    assert "create_checkpoint:r1:1:auto-step-1" in git.calls
+    assert "create_checkpoint:r1:2:auto-step-2" in git.calls
+
+
+# 功能：验证 git_manager 存在时注册 5 个 git 工具，缺失时不注册
+# 设计：_build_registry 带 run_id 断言工具齐全；无 manager 断言 git_commit 缺失
+def test_registry_includes_git_tools_when_manager_present(tmp_path: Path) -> None:
+    runner, _collected = _git_runner(tmp_path, _FakeGitManager())
+    registry = runner._build_registry(TaskManager(tmp_path / "t" / ".tasks"), run_id="r1")
+    for name in (
+        "git_status",
+        "git_diff",
+        "git_checkpoint",
+        "git_commit",
+        "git_rollback",
+    ):
+        assert registry.get(name) is not None
+
+    plain, _plain_collected = _git_runner(tmp_path, None)
+    plain_registry = plain._build_registry(
+        TaskManager(tmp_path / "t2" / ".tasks"), run_id="r1"
+    )
+    assert plain_registry.get("git_commit") is None
+
+
+# 功能：验证注入 semantic service 时注册 search_semantic（fallback 为同工作区 search_code）
+# 设计：whitelist 仅 search_semantic 时工具注册且 fallback 绑定 Runner workspace；
+#       仅 read_file 的 whitelist 下 search_semantic 缺省
+def test_runner_registers_semantic_tool_with_fallback_and_whitelist(
+    tmp_path: Path,
+) -> None:
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        semantic_service=SemanticRetrievalService(
+            SemanticConfig(index_dir=str(tmp_path / "idx")),
+            tmp_path.resolve(),
+        ),
+    )
+
+    semantic_registry = runner._build_registry(
+        TaskManager(tmp_path / "semantic-tasks"),
+        tool_whitelist=["search_semantic"],
+    )
+    read_registry = runner._build_registry(
+        TaskManager(tmp_path / "read-tasks"),
+        tool_whitelist=["read_file"],
+    )
+
+    semantic_tool = semantic_registry.get("search_semantic")
+    assert isinstance(semantic_tool, SearchSemanticTool)
+    assert isinstance(semantic_tool._fallback, SearchCodeTool)
+    assert semantic_tool._fallback._resolver.root == tmp_path.resolve(strict=True)
+    assert read_registry.get("search_semantic") is None
+
+
+# 功能：验证未注入 semantic service 时 registry 不注册 search_semantic
+# 设计：语义检索为可选能力（配置禁用时 app 不注入），registry 静默缺省
+def test_runner_omits_semantic_tool_without_service(tmp_path: Path) -> None:
+    runner = AgentRunner(_config(), workspace_root=tmp_path.resolve())
+
+    registry = runner._build_registry(TaskManager(tmp_path / "tasks"))
+
+    assert registry.get("search_semantic") is None
