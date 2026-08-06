@@ -81,15 +81,14 @@ class SemanticRetrievalService:
         self._config = config
         self._root = workspace_root.resolve()
         self._git_head_provider = git_head_provider
-        self._index = SemanticIndex(
-            self._index_dir(), git_head_provider=git_head_provider
-        )
+        self._index = SemanticIndex(self._index_dir(), git_head_provider=git_head_provider)
         self._lock = asyncio.Lock()
         # (IndexState, EmbeddingStrategy, records) 三元组；None 表示从未构建
         self._state: tuple[IndexState, EmbeddingStrategy, list[ChunkRecord]] | None = None
         self._strategy_cache: EmbeddingStrategy | None = None
         self._strategy_fitted = False
         self._stats = IndexStats()
+        self._closed = False
 
     def _index_dir(self) -> Path:
         digest = hashlib.sha256(str(self._root).encode("utf-8")).hexdigest()[:12]
@@ -106,8 +105,14 @@ class SemanticRetrievalService:
     async def ensure_ready(self) -> None:
         await self.refresh()
 
+    async def close(self) -> None:
+        """释放资源（幂等）。当前无持锁资源，ONNX 后端加载模型后在此释放"""
+        self._closed = True
+
     async def refresh(self) -> None:
         """构建/增量更新索引（串行化 + to_thread 取消）；失败抛 IndexUnavailableError"""
+        if self._closed:
+            raise IndexUnavailableError("semantic service is closed")
         async with self._lock:
             stop_event = threading.Event()
             try:
@@ -162,11 +167,7 @@ class SemanticRetrievalService:
             self._load_ready_state(state)
             return
         try:
-            old_records = (
-                self._state[2]
-                if self._state is not None
-                else self._index.read_records()
-            )
+            old_records = self._state[2] if self._state is not None else self._index.read_records()
         except IndexCorruptedError:
             self._rebuild_all(files, stop_event)
             return
@@ -189,9 +190,7 @@ class SemanticRetrievalService:
             self._strategy_fitted = True
         self._state = (state, strategy, records)
 
-    def _rebuild_all(
-        self, files: dict[str, FileStat], stop_event: threading.Event
-    ) -> None:
+    def _rebuild_all(self, files: dict[str, FileStat], stop_event: threading.Event) -> None:
         records = self._build_full(files, stop_event)
         self._finish_build(records, files)
 
@@ -228,13 +227,9 @@ class SemanticRetrievalService:
         self._stats = replace(self._stats, indexed_files=len(new_records))
         self._finish_build(records, files)
 
-    def _finish_build(
-        self, records: list[ChunkRecord], files: dict[str, FileStat]
-    ) -> None:
+    def _finish_build(self, records: list[ChunkRecord], files: dict[str, FileStat]) -> None:
         git_head = (
-            self._git_head_provider(self._root)
-            if self._git_head_provider is not None
-            else None
+            self._git_head_provider(self._root) if self._git_head_provider is not None else None
         )
         self._index.write(
             records,
@@ -266,9 +261,7 @@ class SemanticRetrievalService:
             total_bytes += len(text.encode("utf-8"))
         strategy.fit(texts)
         self._strategy_fitted = True
-        self._stats = replace(
-            self._stats, indexed_files=indexed, total_bytes=total_bytes
-        )
+        self._stats = replace(self._stats, indexed_files=indexed, total_bytes=total_bytes)
         if not records:
             return []
         return [replace(r, vector=strategy.embed(r.text)) for r in records]
@@ -286,9 +279,7 @@ class SemanticRetrievalService:
         for dirpath, dirnames, filenames in os.walk(self._root):
             self._check_stop(stop_event)
             dirnames[:] = [
-                d
-                for d in dirnames
-                if d not in _IGNORED_DIRECTORIES and not d.startswith(".")
+                d for d in dirnames if d not in _IGNORED_DIRECTORIES and not d.startswith(".")
             ]
             for name in filenames:
                 if name.startswith("."):
@@ -354,9 +345,7 @@ class SemanticRetrievalService:
                 )
             except EmbeddingStrategyUnavailableError:
                 # fail-open：onnx 后端缺失时降级回词法策略
-                self._strategy_cache = LexicalEmbeddingStrategy(
-                    ngram_n=self._config.ngram_n
-                )
+                self._strategy_cache = LexicalEmbeddingStrategy(ngram_n=self._config.ngram_n)
         return self._strategy_cache
 
     def _bump(self, field: str) -> None:

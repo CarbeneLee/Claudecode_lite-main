@@ -195,3 +195,10 @@ def test_param_preview_truncates_long_value() -> None:
     preview = param_preview("bash", {"command": long_cmd})
     assert len(preview) <= 75  # key='<60 chars>…' overhead ~11 chars
     assert "…" in preview
+
+
+# 功能：验证 search_semantic 默认 ALLOW 且审批卡片展示查询词
+# 设计：只读检索工具与 search_code 同权（默认不打扰用户），预览键为 query
+def test_semantic_search_default_allow_and_preview() -> None:
+    assert evaluate("search_semantic", {"query": "token"}) == PermissionDecision.ALLOW
+    assert param_preview("search_semantic", {"query": "needle"}) == "query='needle'"

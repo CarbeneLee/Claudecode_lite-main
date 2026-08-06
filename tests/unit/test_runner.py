@@ -33,6 +33,9 @@ from kama_claude.core.sandbox.executors import (
 )
 from kama_claude.core.sandbox.manager import SandboxManager
 from kama_claude.core.sandbox.runtime import ContainerRuntime
+from kama_claude.core.semantic.config import SemanticConfig
+from kama_claude.core.semantic.service import SemanticRetrievalService
+from kama_claude.core.semantic.tools import SearchSemanticTool
 from kama_claude.core.subagent.tool import SpawnAgentTool
 from kama_claude.core.task.manager import TaskManager
 from kama_claude.core.tools.builtin.bash import BashTool
@@ -1467,3 +1470,44 @@ def test_registry_includes_git_tools_when_manager_present(tmp_path: Path) -> Non
         TaskManager(tmp_path / "t2" / ".tasks"), run_id="r1"
     )
     assert plain_registry.get("git_commit") is None
+
+
+# 功能：验证注入 semantic service 时注册 search_semantic（fallback 为同工作区 search_code）
+# 设计：whitelist 仅 search_semantic 时工具注册且 fallback 绑定 Runner workspace；
+#       仅 read_file 的 whitelist 下 search_semantic 缺省
+def test_runner_registers_semantic_tool_with_fallback_and_whitelist(
+    tmp_path: Path,
+) -> None:
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        semantic_service=SemanticRetrievalService(
+            SemanticConfig(index_dir=str(tmp_path / "idx")),
+            tmp_path.resolve(),
+        ),
+    )
+
+    semantic_registry = runner._build_registry(
+        TaskManager(tmp_path / "semantic-tasks"),
+        tool_whitelist=["search_semantic"],
+    )
+    read_registry = runner._build_registry(
+        TaskManager(tmp_path / "read-tasks"),
+        tool_whitelist=["read_file"],
+    )
+
+    semantic_tool = semantic_registry.get("search_semantic")
+    assert isinstance(semantic_tool, SearchSemanticTool)
+    assert isinstance(semantic_tool._fallback, SearchCodeTool)
+    assert semantic_tool._fallback._resolver.root == tmp_path.resolve(strict=True)
+    assert read_registry.get("search_semantic") is None
+
+
+# 功能：验证未注入 semantic service 时 registry 不注册 search_semantic
+# 设计：语义检索为可选能力（配置禁用时 app 不注入），registry 静默缺省
+def test_runner_omits_semantic_tool_without_service(tmp_path: Path) -> None:
+    runner = AgentRunner(_config(), workspace_root=tmp_path.resolve())
+
+    registry = runner._build_registry(TaskManager(tmp_path / "tasks"))
+
+    assert registry.get("search_semantic") is None

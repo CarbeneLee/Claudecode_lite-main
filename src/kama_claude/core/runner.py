@@ -39,6 +39,8 @@ from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.runs import RUNS_DIR, new_run_id
 from kama_claude.core.sandbox.executors import build_executor
 from kama_claude.core.sandbox.manager import SandboxManager
+from kama_claude.core.semantic.service import SemanticRetrievalService
+from kama_claude.core.semantic.tools import SearchSemanticTool
 from kama_claude.core.session.model import Session
 from kama_claude.core.session.store import SessionStore
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
@@ -67,23 +69,29 @@ from kama_claude.core.workspace.policy import WorkspaceAccessPolicy
 from kama_claude.core.workspace.resolver import WorkspacePathResolver
 
 
-def _now() -> str: # 生成当前 UTC 时间的 ISO 格式字符串，用于事件时间戳。
+def _now() -> str:  # 生成当前 UTC 时间的 ISO 格式字符串，用于事件时间戳。
     return datetime.now(UTC).isoformat()
+
+
 # 返回str而非datetime对象，方便JSONL序列化和日志记录。
+
 
 @dataclass
 class RunOutcome:
-    status: str # 运行状态，例如 "success" 或 "failure"
+    status: str  # 运行状态，例如 "success" 或 "failure"
     result: str  # 运行结果的文本输出，可能为 None
-    reason: str | None # 运行失败的原因，如果有的话
+    reason: str | None  # 运行失败的原因，如果有的话
+
+
 # 一次运行后的不可变快照结果
+
 
 class AgentRunner:
     # 组装所有运行时依赖，准备执行一次完整的 agent run
     def __init__(
         self,
-        config: KamaConfig, #唯一必须参数
-        *, # 通过*传递的可选参数
+        config: KamaConfig,  # 唯一必须参数
+        *,  # 通过*传递的可选参数
         workspace_root: Path,
         bus: EventBus | None = None,
         provider: LLMProvider | None = None,
@@ -95,6 +103,7 @@ class AgentRunner:
         journal: EventJournalCoordinator | None = None,
         sandbox_manager: SandboxManager | None = None,
         git_manager: GitManager | None = None,
+        semantic_service: SemanticRetrievalService | None = None,
     ) -> None:
         self._config = config
         self._path_resolver = WorkspacePathResolver(workspace_root)
@@ -109,6 +118,7 @@ class AgentRunner:
         self._mcp_manager = mcp_manager
         self._sandbox_manager = sandbox_manager
         self._git_manager = git_manager
+        self._semantic_service = semantic_service
         self._journal = journal or EventJournalCoordinator()
         self._owns_journal = journal is None
         if self._owns_journal:
@@ -118,8 +128,8 @@ class AgentRunner:
         self._background_tasks: dict[str, set[asyncio.Task[None]]] = {}
 
     # 构建工具注册表，注入 TaskManager（任务工具共享同一实例）；可选注入 SpawnAgentTool
-    def _build_registry( #条件化工具注入
-        self, 
+    def _build_registry(  # 条件化工具注入
+        self,
         task_manager: TaskManager,
         *,
         session: Session | None = None,
@@ -137,20 +147,28 @@ class AgentRunner:
             return allowed is None or name in allowed
 
         registry = ToolRegistry()
+        search_tool = SearchCodeTool(self._path_resolver, self._access_policy)
         for t in [
             ReadFileTool(self._path_resolver, self._access_policy),
             BashTool(
-                build_executor(
-                    self._sandbox_manager, workspace_root=self._workspace_root
-                ),
+                build_executor(self._sandbox_manager, workspace_root=self._workspace_root),
                 workspace_root=self._workspace_root,
             ),
             WriteFileTool(self._path_resolver, self._access_policy),
             ListDirTool(self._path_resolver, self._access_policy),
-            SearchCodeTool(self._path_resolver, self._access_policy),
+            search_tool,
         ]:
             if _ok(t.name):
                 registry.register(t)
+        # search_semantic 可选：注入 service 时注册，降级回退复用同一 search_code 实例
+        if self._semantic_service is not None and _ok("search_semantic"):
+            registry.register(
+                SearchSemanticTool(
+                    self._semantic_service,
+                    fallback=search_tool,
+                    degradation=self._config.semantic.degradation,
+                )
+            )
         for t in [
             TaskCreateTool(task_manager),
             TaskUpdateTool(task_manager),
@@ -177,7 +195,7 @@ class AgentRunner:
                         task_registry=self._task_registry,
                         runs_dir=runs_dir,
                         session_id=session_id,
-                        depth=0, # 防止agent无限递归调用自身，depth=0表示这是顶层agent
+                        depth=0,  # 防止agent无限递归调用自身，depth=0表示这是顶层agent
                         journal=self._journal,
                         background_tasks=self._background_tasks,
                         sandbox_manager=self._sandbox_manager,
@@ -245,11 +263,7 @@ class AgentRunner:
             await self._journal.register_run(
                 run_id,
                 run_path,
-                session_id=(
-                    session.id
-                    if session is not None and not self._owns_journal
-                    else None
-                ),
+                session_id=(session.id if session is not None and not self._owns_journal else None),
             )
 
         # 创建包含本次运行基本信息和状态的执行上下文
@@ -265,7 +279,7 @@ class AgentRunner:
             project_context=project_ctx,
             system_prompt_override=system_prompt_override,
         )
-        prefill_len = len(history) #避免重复存储历史消息
+        prefill_len = len(history)  # 避免重复存储历史消息
 
         await bus.publish(RunStartedEvent(run_id=run_id, goal=goal, ts=_now()))
 
@@ -291,9 +305,7 @@ class AgentRunner:
                 status = await gm.status()
                 dirty = status.dirty
                 if dirty:
-                    allowed = await self._request_git_snapshot(
-                        bus, run_id, session_id_str
-                    )
+                    allowed = await self._request_git_snapshot(bus, run_id, session_id_str)
                     if not allowed:
                         raise DirtyWorkspaceError(
                             "workspace has uncommitted changes; approve snapshot "
@@ -326,13 +338,10 @@ class AgentRunner:
                 )
                 git_enabled = False
             if gm.config.checkpoint_mode == "per_step":
-
                 # per_step 模式：每个 step 结束自动落 checkpoint（auto-step-N）
                 async def _step_checkpoint(event: BaseModel) -> None:
                     if isinstance(event, StepFinishedEvent) and event.run_id == run_id:
-                        await gm.create_checkpoint(
-                            run_id, event.step, f"auto-step-{event.step}"
-                        )
+                        await gm.create_checkpoint(run_id, event.step, f"auto-step-{event.step}")
 
                 step_checkpoint_handler = _step_checkpoint
                 bus.subscribe(_step_checkpoint)
@@ -372,10 +381,12 @@ class AgentRunner:
             )
             compactor = Compactor(bus, session_dir, session_id_str)
             loop = AgentLoop(
-                provider, registry, bus,
+                provider,
+                registry,
+                bus,
                 permission_manager=self._permission_manager,
                 compactor=compactor,
-                compact_threshold=self._config.compaction.auto_threshold, #触发压缩上下文的阈值
+                compact_threshold=self._config.compaction.auto_threshold,  # 触发压缩上下文的阈值
                 session_id=session_id_str,
             )
             await loop.run(context)
@@ -403,8 +414,7 @@ class AgentRunner:
                     context.mark_failed("cancelled")
             else:
                 logging.getLogger(__name__).error(
-                    "background cleanup cancellation treated as secondary "
-                    "run_id=%s role=cleanup",
+                    "background cleanup cancellation treated as secondary run_id=%s role=cleanup",
                     run_id,
                 )
 
@@ -449,9 +459,7 @@ class AgentRunner:
         )
 
     # dirty 工作树快照审批：走权限通道向用户 ASK，无权限系统时默认拒绝
-    async def _request_git_snapshot(
-        self, bus: EventBus, run_id: str, session_id: str
-    ) -> bool:
+    async def _request_git_snapshot(self, bus: EventBus, run_id: str, session_id: str) -> bool:
         if self._permission_manager is None:
             return False
 
@@ -462,8 +470,7 @@ class AgentRunner:
             tool_use_id=f"pre-run:{run_id}",
             tool_name="git_pre_run_snapshot",
             params={
-                "reason": "workspace has uncommitted changes; snapshot them into "
-                "the run baseline?"
+                "reason": "workspace has uncommitted changes; snapshot them into the run baseline?"
             },
             session_id=session_id,
             event_emitter=_emit,
@@ -489,9 +496,7 @@ class AgentRunner:
                 await git_manager.restore(baseline)
         try:
             git_diff = await git_manager.diff()
-            await bus.publish(
-                GitRunDiffEvent(run_id=run_id, stat=git_diff.stat, ts=_now())
-            )
+            await bus.publish(GitRunDiffEvent(run_id=run_id, stat=git_diff.stat, ts=_now()))
         except GitError:
             # diff 摘要失败不影响已完成的 run（fail-open）
             logging.getLogger(__name__).warning(

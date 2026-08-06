@@ -4,6 +4,7 @@ import asyncio
 import datetime
 import logging
 import signal
+import subprocess
 import time
 import uuid
 from datetime import UTC
@@ -49,6 +50,7 @@ from kama_claude.core.permissions.storage import load_policy_file
 from kama_claude.core.runner import AgentRunner
 from kama_claude.core.runs import new_run_id
 from kama_claude.core.sandbox.manager import SandboxManager
+from kama_claude.core.semantic.service import SemanticRetrievalService
 from kama_claude.core.session import SessionManager, SessionStore
 from kama_claude.core.trace.record import TraceRecord
 from kama_claude.core.trace.writer import TraceWriter
@@ -67,6 +69,23 @@ logger = logging.getLogger(__name__)
 
 def _now() -> str:
     return datetime.datetime.now(UTC).isoformat()
+
+
+# 供语义索引检测分支切换：返回当前 HEAD sha；非 git 目录/异常返回 None（跳过检查）
+def git_head_provider(root: Path) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
 
 
 class CoreApp:
@@ -223,9 +242,27 @@ class CoreApp:
                     if self._config.git.enabled
                     else None
                 ),
+                semantic=(
+                    SemanticRetrievalService(
+                        config=self._config.semantic,
+                        workspace_root=workspace_root,
+                        git_head_provider=git_head_provider,
+                    )
+                    if self._config.semantic.enabled
+                    else None
+                ),
             )
             self._contexts[workspace_root] = context
         return context
+
+    # 从 workspace context 取全部管理器（单次构建 context，供 runner_factory 展开注入）
+    def _workspace_managers_for(self, workspace_root: Path) -> dict[str, Any]:
+        context = self._workspace_context_for(workspace_root)
+        return {
+            "sandbox_manager": context.sandbox,
+            "git_manager": context.git,
+            "semantic_service": context.semantic,
+        }
 
     @staticmethod
     # 屏蔽重复取消并等待 cleanup task 终态，失败时只记录脱敏 secondary
@@ -288,7 +325,8 @@ class CoreApp:
         cmd = PermissionRespondCommand.model_validate(params)
         logger.info(
             "permission.respond received tool_use_id=%s decision=%s",
-            cmd.tool_use_id, cmd.decision,
+            cmd.tool_use_id,
+            cmd.decision,
         )
         if self._permission_manager is None:
             logger.error("permission.respond: PermissionManager not initialized")
@@ -441,8 +479,7 @@ class CoreApp:
                 permission_manager=self._permission_manager,
                 mcp_manager=self._mcp_manager,
                 journal=self._journal,
-                sandbox_manager=self._workspace_context_for(workspace_root).sandbox,
-                git_manager=self._workspace_context_for(workspace_root).git,
+                **self._workspace_managers_for(workspace_root),
             ),
             bus=self._bus,
             provider=compact_provider,

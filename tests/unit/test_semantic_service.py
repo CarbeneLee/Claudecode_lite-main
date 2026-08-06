@@ -357,3 +357,16 @@ def test_index_dir_is_hashed_per_workspace(tmp_path) -> None:
         SemanticRetrievalService(config=cfg, workspace_root=ws_a)._index._dir
         == service_a._index._dir
     )
+
+
+# 功能：验证 close 幂等且关闭后拒绝 refresh
+# 设计：close 两次不抛错（app 级联关闭可重复）；关闭后 refresh 抛 IndexUnavailableError
+async def test_close_is_idempotent_and_rejects_after_close(tmp_path) -> None:
+    service = _make_service(tmp_path, files={"auth.py": AUTH_PY})
+    await service.ensure_ready()
+
+    await service.close()
+    await service.close()
+
+    with pytest.raises(IndexUnavailableError, match="closed"):
+        await service.refresh()
