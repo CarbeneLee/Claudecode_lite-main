@@ -99,14 +99,10 @@ class SearchSemanticTool(BaseTool):
         except IndexUnavailableError as exc:
             return await self._on_unavailable(p.query, exc)
         degraded = self._service.degraded_query(p.query)
-        content = self._format_output(
-            results, degraded="query" if degraded else "none"
-        )
+        content = self._format_output(results, degraded="query" if degraded else "none")
         return ToolResult(content=content)
 
-    async def _on_unavailable(
-        self, query: str, exc: IndexUnavailableError
-    ) -> ToolResult:
+    async def _on_unavailable(self, query: str, exc: IndexUnavailableError) -> ToolResult:
         if self._degradation == "fail_closed":
             return ToolResult(
                 content=f"semantic index unavailable: {exc}",
@@ -116,9 +112,7 @@ class SearchSemanticTool(BaseTool):
         result = await self._fallback.invoke({"query": query})
         if result.is_error:
             return result
-        return ToolResult(
-            content=result.content + "\n[search_semantic] degraded=literal_fallback"
-        )
+        return ToolResult(content=result.content + "\n[search_semantic] degraded=literal_fallback")
 
     # ---- 输出组装 ----
 
@@ -156,7 +150,4 @@ class SearchSemanticTool(BaseTool):
 
     @staticmethod
     def _footer(results: int, degraded: str, truncated: str) -> str:
-        return (
-            f"[search_semantic] results={results} "
-            f"degraded={degraded} truncated={truncated}"
-        )
+        return f"[search_semantic] results={results} degraded={degraded} truncated={truncated}"

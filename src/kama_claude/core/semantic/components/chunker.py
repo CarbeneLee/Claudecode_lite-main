@@ -46,7 +46,7 @@ class ChunkRecord:
     chunk_id: str
     logical_path: str
     start_line: int  # 1 基、闭区间
-    end_line: int    # 1 基、闭区间
+    end_line: int  # 1 基、闭区间
     text: str
     symbol_type: str  # "function" | "class" | "module"
     symbol_name: str
@@ -68,9 +68,7 @@ def _is_comment(line: str, language: str | None) -> bool:
     return any(stripped.startswith(p) for p in prefixes)
 
 
-def _parse_decl(
-    line: str, language: str
-) -> tuple[int, str, str, str | None] | None:
+def _parse_decl(line: str, language: str) -> tuple[int, str, str, str | None] | None:
     """返回 (缩进, 符号名, 类型, go 接收者类型)；非声明行返回 None"""
     indent = len(line) - len(line.lstrip(" \t"))
     if language == "python":

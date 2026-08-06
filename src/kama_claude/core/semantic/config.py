@@ -40,17 +40,13 @@ class SemanticConfig:
     def __post_init__(self) -> None:
         # 枚举与数值约束在构造时即拒绝非法取值，避免配置错误扩散到运行时
         if self.strategy not in _STRATEGIES:
-            raise ValueError(
-                f"strategy must be one of {_STRATEGIES}, got {self.strategy!r}"
-            )
+            raise ValueError(f"strategy must be one of {_STRATEGIES}, got {self.strategy!r}")
         if self.degradation not in _DEGRADATIONS:
             raise ValueError(
                 f"degradation must be one of {_DEGRADATIONS}, got {self.degradation!r}"
             )
         if not 1 <= self.ngram_n <= 6:
-            raise ValueError(
-                f"ngram_n must be between 1 and 6, got {self.ngram_n!r}"
-            )
+            raise ValueError(f"ngram_n must be between 1 and 6, got {self.ngram_n!r}")
         for field, value in (
             ("chunk_size", self.chunk_size),
             ("min_chunk_lines", self.min_chunk_lines),
@@ -61,11 +57,8 @@ class SemanticConfig:
             ("max_query_chars", self.max_query_chars),
         ):
             if value <= 0:
-                raise ValueError(
-                    f"{field} must be a positive integer, got {value!r}"
-                )
+                raise ValueError(f"{field} must be a positive integer, got {value!r}")
         if not 0.0 < self.similarity_threshold <= 1.0:
             raise ValueError(
-                f"similarity_threshold must be in (0.0, 1.0], "
-                f"got {self.similarity_threshold!r}"
+                f"similarity_threshold must be in (0.0, 1.0], got {self.similarity_threshold!r}"
             )

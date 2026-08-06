@@ -80,12 +80,8 @@ class LexicalEmbeddingStrategy:
         norm = math.sqrt(sum(w * w for w in weights.values()))
         if norm == 0.0:
             return SparseVector((), ())
-        pairs = sorted(
-            (zlib.crc32(g.encode("utf-8")), w / norm) for g, w in weights.items()
-        )
-        return SparseVector(
-            tuple(i for i, _ in pairs), tuple(v for _, v in pairs)
-        )
+        pairs = sorted((zlib.crc32(g.encode("utf-8")), w / norm) for g, w in weights.items())
+        return SparseVector(tuple(i for i, _ in pairs), tuple(v for _, v in pairs))
 
     def degraded_query(self, query: str) -> bool:
         """查询过短（< ngram_n 字符）或提取不到 gram → 建议降级字面量检索"""
@@ -104,8 +100,7 @@ class LexicalEmbeddingStrategy:
                 grams.append(token)
             else:
                 grams.extend(
-                    token[i : i + self.ngram_n]
-                    for i in range(len(token) - self.ngram_n + 1)
+                    token[i : i + self.ngram_n] for i in range(len(token) - self.ngram_n + 1)
                 )
         return grams
 

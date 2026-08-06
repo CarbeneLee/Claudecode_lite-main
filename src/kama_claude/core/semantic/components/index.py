@@ -67,13 +67,9 @@ class SemanticIndex:
             "strategy": strategy,
             "built_at": datetime.now(UTC).isoformat(),
             "git_head": git_head,
-            "files": {
-                rel: {"mtime_ns": s.mtime_ns, "size": s.size} for rel, s in files.items()
-            },
+            "files": {rel: {"mtime_ns": s.mtime_ns, "size": s.size} for rel, s in files.items()},
         }
-        lines = "\n".join(
-            json.dumps(_record_to_dict(r), ensure_ascii=False) for r in records
-        )
+        lines = "\n".join(json.dumps(_record_to_dict(r), ensure_ascii=False) for r in records)
         _atomic_write(self._records_path, lines + "\n")
         manifest_text = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
         _atomic_write(self._manifest_path, manifest_text)
