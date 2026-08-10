@@ -56,6 +56,12 @@ ENV HOME=/home/kama \
     XDG_CACHE_HOME=/tmp/.cache
 ENV PATH="/opt/venv/bin:$PATH"
 
+# slim 基础镜像不含 git；GitManager 的 checkpoint/finalize 依赖真实 CLI
+# （commit 身份由 _author_env 注入 GIT_AUTHOR_*，无需 git config）
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd --gid "${KAMA_GID}" kama \
     && useradd --uid "${KAMA_UID}" --gid kama --create-home \
         --home-dir /home/kama --shell /usr/sbin/nologin kama \
