@@ -13,11 +13,12 @@ from pydantic import BaseModel
 
 import kama_claude.core.loop as loop_module
 from kama_claude.core.bus.events import StepFinishedEvent
-from kama_claude.core.context import ExecutionContext
+from kama_claude.core.context import REPOSITORY_CHANGE_DISCIPLINE, ExecutionContext
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock, UsageStats
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.tools.base import BaseTool, ToolResult
+from kama_claude.core.tools.invocation import DirectToolInvoker
 from kama_claude.core.tools.registry import ToolRegistry
 
 _DEFAULT_BASE_PROMPT = (
@@ -45,7 +46,7 @@ _STATE_TRANSITION_PROTOCOL = (
     "compensation preserves the stated invariant. Do not apply this protocol to tasks "
     "without multi-step side effects."
 )
-_PHASE9B_PROMPT_HASH = (
+_FROZEN_REQUIREMENT_CONTRACT_PROMPT_HASH = (
     "b248587ef77d172cefb5e7b777a1523cf50978d6d273b466a8b6eb37349621eb"
 )
 _REQUIREMENT_CONTRACT_HASH = (
@@ -221,7 +222,8 @@ def _make_loop(
     bus: EventBus | None = None,
 ) -> tuple[AgentLoop, EventBus]:
     b = bus or EventBus()
-    return AgentLoop(provider, registry or ToolRegistry(), b), b  # type: ignore[arg-type]
+    actual_registry = registry or ToolRegistry()
+    return AgentLoop(provider, DirectToolInvoker(actual_registry, b, "r1"), b), b
 
 
 async def _events(bus: EventBus) -> list[BaseModel]:
@@ -248,6 +250,17 @@ def _assert_private_exception_absent(
     for record in caplog.records:
         assert record.exc_info is None
         assert record.exc_text in (None, "")
+
+
+# 功能：验证 AgentLoop 不允许在没有显式 ToolInvoker 时创建
+# 设计：直接传入旧的 optional=None seam，确保测试在迁移前准确失败而非依赖 provider 行为
+def test_agent_loop_requires_explicit_tool_invoker() -> None:
+    with pytest.raises(TypeError):
+        AgentLoop(
+            _MockProvider([LlmResponse(stop_reason="end_turn", text="done")]),
+            None,  # type: ignore[arg-type]
+            EventBus(),
+        )
 
 
 # 返回仍在运行的EventBus publication tasks，作为无orphan的外部task集合证据
@@ -406,7 +419,7 @@ async def test_cancelled_error_marks_failed_and_reraises() -> None:
     provider = _BlockingCancellationProvider()
     bus = EventBus()
     events = await _events(bus)
-    loop = AgentLoop(provider, ToolRegistry(), bus)  # type: ignore[arg-type]
+    loop = AgentLoop(provider, DirectToolInvoker(ToolRegistry(), bus, "r1"), bus)
     ctx = _ctx()
     task = asyncio.create_task(loop.run(ctx))
     await provider.entered.wait()
@@ -458,7 +471,7 @@ async def test_later_provider_error_closes_every_started_step() -> None:
             )
         ]
     )
-    loop = AgentLoop(provider, ToolRegistry(), bus)  # type: ignore[arg-type]
+    loop = AgentLoop(provider, DirectToolInvoker(ToolRegistry(), bus, "r1"), bus)
     ctx = _ctx()
 
     await loop.run(ctx)
@@ -728,7 +741,7 @@ async def test_cancellation_remains_primary_over_step_failure() -> None:
 
     bus.subscribe(fail_step_terminal)
     provider = _BlockingCancellationProvider()
-    loop = AgentLoop(provider, ToolRegistry(), bus)  # type: ignore[arg-type]
+    loop = AgentLoop(provider, DirectToolInvoker(ToolRegistry(), bus, "r1"), bus)
     ctx = _ctx()
     task = asyncio.create_task(loop.run(ctx))
     await provider.entered.wait()
@@ -781,7 +794,7 @@ async def test_tool_processing_error_remains_primary_over_step_failure(
     provider = _MockProvider(
         [LlmResponse(stop_reason="tool_use", tool_calls=[_tc("unknown", {})])]
     )
-    loop = AgentLoop(provider, ToolRegistry(), bus)  # type: ignore[arg-type]
+    loop = AgentLoop(provider, DirectToolInvoker(ToolRegistry(), bus, "r1"), bus)
     ctx = _ctx()
 
     with caplog.at_level("ERROR", logger="kama_claude.core.loop"):
@@ -845,7 +858,7 @@ async def test_compaction_error_remains_primary_over_step_failure(
     )
     loop = AgentLoop(
         provider,
-        ToolRegistry(),
+        DirectToolInvoker(ToolRegistry(), bus, "r1"),
         bus,
         compactor=compactor,  # type: ignore[arg-type]
         compact_threshold=0.5,
@@ -919,7 +932,7 @@ async def test_max_steps_closes_every_step_without_final_compaction() -> None:
     events = await _events(bus)
     loop = AgentLoop(
         provider,
-        ToolRegistry(),
+        DirectToolInvoker(ToolRegistry(), bus, "r1"),
         bus,
         compactor=compactor,  # type: ignore[arg-type]
         compact_threshold=0.5,
@@ -996,9 +1009,9 @@ async def test_assistant_message_blocks_added_to_context() -> None:
     assert blocks[0]["text"] == "answer"  # type: ignore[index]
 
 
-# 功能：验证 Phase 9B 的 base 与 v1 字节身份在追加 v2 前保持冻结
+# 功能：验证冻结 base 与 v1 字节身份在追加 v2 前保持冻结
 # 设计：直接对冻结文本做词数、字节数和 SHA-256 检查，避免未来 prompt 变化改写历史 control
-def test_phase9b_prompt_identity_remains_frozen() -> None:
+def test_frozen_requirement_contract_prompt_identity_remains_frozen() -> None:
     prompt = _DEFAULT_BASE_PROMPT + "\n\n" + _REQUIREMENT_CONTRACT
 
     assert len(_REQUIREMENT_CONTRACT.split()) == 97
@@ -1007,7 +1020,7 @@ def test_phase9b_prompt_identity_remains_frozen() -> None:
         hashlib.sha256(_REQUIREMENT_CONTRACT.encode("utf-8")).hexdigest()
         == _REQUIREMENT_CONTRACT_HASH
     )
-    assert hashlib.sha256(prompt.encode("utf-8")).hexdigest() == _PHASE9B_PROMPT_HASH
+    assert hashlib.sha256(prompt.encode("utf-8")).hexdigest() == _FROZEN_REQUIREMENT_CONTRACT_PROMPT_HASH
 
 
 # 功能：验证冻结的 state-transition protocol 文本满足精确 addition 身份
@@ -1021,8 +1034,8 @@ def test_state_transition_protocol_addition_identity_is_frozen() -> None:
     )
 
 
-# 功能：验证 repaired treatment 每次默认模型调用各包含一次冻结 v1 与 v2
-# 设计：用两步 scripted provider 捕获真实 system，锁定 base、双换行、v1/v2 与无尾随换行的字节组合
+# 功能：验证每次默认模型调用包含冻结 v1/v2 与一次可信仓库变更纪律
+# 设计：用两步 scripted provider 捕获真实 system，锁定 base、既有协议和新 trusted slot 的组合顺序
 async def test_default_prompt_contains_v1_and_v2_once_per_call() -> None:
     provider = _MockProvider(
         [
@@ -1042,11 +1055,14 @@ async def test_default_prompt_contains_v1_and_v2_once_per_call() -> None:
         + _REQUIREMENT_CONTRACT
         + "\n\n"
         + _STATE_TRANSITION_PROTOCOL
+        + "\n\n"
+        + REPOSITORY_CHANGE_DISCIPLINE
     )
     for system in provider.seen_systems:
         assert system is not None
         assert system.count(_REQUIREMENT_CONTRACT) == 1
         assert system.count(_STATE_TRANSITION_PROTOCOL) == 1
+        assert system.count(REPOSITORY_CHANGE_DISCIPLINE) == 1
         assert not system.endswith("\n")
     assert provider.seen_systems == [expected, expected]
 

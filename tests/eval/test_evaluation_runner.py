@@ -31,6 +31,11 @@ _REQUIREMENT_CONTRACT = (
     "limitation. Keep the contract brief and auditable; do not expose private "
     "chain-of-thought or force any particular tool."
 )
+_REPOSITORY_CHANGE_DISCIPLINE = """## Repository Change Discipline
+Prefer editing existing files to creating new ones
+Don't add features, refactor, or introduce abstractions beyond what the task requires
+Don't design for hypothetical future requirements
+A bug fix doesn't need surrounding cleanup"""
 
 
 # 创建只含公开输入与空 private criterion 的最小任务目录
@@ -317,6 +322,7 @@ async def test_worker_and_direct_runner_share_requirement_contract_prompt(
     assert worker_provider.systems == direct_provider.systems
     assert worker_provider.systems[0] is not None
     assert worker_provider.systems[0].count(_REQUIREMENT_CONTRACT) == 1
+    assert worker_provider.systems[0].count(_REPOSITORY_CHANGE_DISCIPLINE) == 1
     assert worker_provider.messages[0] == direct_provider.messages[0] == [
         {"role": "user", "content": "Create result.txt."}
     ]

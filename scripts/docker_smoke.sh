@@ -3,19 +3,19 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 COMPOSE_FILE="$ROOT_DIR/compose.yaml"
-PROJECT_NAME="kamaclaude-p6-${GITHUB_RUN_ID:-local}-$$-${RANDOM:-0}"
+PROJECT_NAME="kamaclaude-docker-smoke-${GITHUB_RUN_ID:-local}-$$-${RANDOM:-0}"
 MISSING_WORKSPACE_PROJECT="${PROJECT_NAME}-missing-workspace"
 TEMP_ROOT=""
 WORKSPACE_DIR=""
 MISSING_WORKSPACE_DIR=""
-CANARY_PATH="$ROOT_DIR/phase6-unlisted-private-canary.txt"
+CANARY_PATH="$ROOT_DIR/docker-smoke-unlisted-private-canary.txt"
 CANARY_CREATED=0
-SECRET_CANARY="phase6-build-context-canary-$$-${RANDOM:-0}"
+SECRET_CANARY="docker-smoke-build-context-canary-$$-${RANDOM:-0}"
 TEST_IMAGE="$PROJECT_NAME-test"
 RUNTIME_IMAGE="$PROJECT_NAME-runtime:latest"
 DOCKER_TOUCHED=0
 
-export ANTHROPIC_API_KEY="phase6-ci-dummy-key"
+export ANTHROPIC_API_KEY="docker-smoke-ci-dummy-key"
 export KAMA_GID="${KAMA_GID:-10001}"
 export KAMA_IMAGE="$RUNTIME_IMAGE"
 export KAMA_UID="${KAMA_UID:-10001}"
@@ -61,7 +61,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 fail() {
-  printf 'phase6 smoke failed: %s\n' "$1" >&2
+  printf 'docker smoke failed: %s\n' "$1" >&2
   exit 1
 }
 
@@ -119,25 +119,25 @@ wait_healthy() {
   fail "daemon did not become healthy"
 }
 
-TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/kamaclaude-phase6.XXXXXX")"
+TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/kamaclaude-docker-smoke.XXXXXX")"
 WORKSPACE_DIR="$TEMP_ROOT/workspace"
 export KAMA_WORKSPACE="$WORKSPACE_DIR"
 
 mkdir -p "$WORKSPACE_DIR"
 # 让固定 UID 的非 root 容器可写私有临时父目录中的 bind workspace
 chmod 0777 "$WORKSPACE_DIR"
-printf '%s\n' 'phase6-docker-marker' >"$WORKSPACE_DIR/marker.txt"
+printf '%s\n' 'docker-smoke-marker' >"$WORKSPACE_DIR/marker.txt"
 ln -s /etc/passwd "$WORKSPACE_DIR/outside-link"
 ln -s /etc "$WORKSPACE_DIR/outside-dir"
 test ! -e "$CANARY_PATH" || fail "build-context canary path already exists"
 printf '%s\n' "$SECRET_CANARY" >"$CANARY_PATH"
 CANARY_CREATED=1
 
-case "${PHASE6_SIGNAL_PROBE:-}" in
+case "${KAMA_DOCKER_SIGNAL_PROBE:-}" in
   INT) kill -INT "$$" ;;
   TERM) kill -TERM "$$" ;;
   "") ;;
-  *) fail "unsupported PHASE6_SIGNAL_PROBE: $PHASE6_SIGNAL_PROBE" ;;
+  *) fail "unsupported KAMA_DOCKER_SIGNAL_PROBE: $KAMA_DOCKER_SIGNAL_PROBE" ;;
 esac
 
 cd "$ROOT_DIR"
@@ -145,7 +145,7 @@ DOCKER_TOUCHED=1
 docker info >/dev/null
 compose config --quiet
 
-if [[ "${PHASE6_SKIP_TEST_BUILD:-0}" != "1" ]]; then
+if [[ "${KAMA_DOCKER_SKIP_TEST_BUILD:-0}" != "1" ]]; then
   docker build --target test --tag "$TEST_IMAGE" .
 fi
 
@@ -231,10 +231,10 @@ assert_equals 'no' "$(docker inspect --format '{{.HostConfig.RestartPolicy.Name}
 compose run --rm -T client kama ping
 compose run --rm --no-deps -T client sh -c '
   test "$(pwd -P)" = /workspace
-  grep -F phase6-docker-marker /workspace/marker.txt >/dev/null
+  grep -F docker-smoke-marker /workspace/marker.txt >/dev/null
   test -z "${ANTHROPIC_API_KEY:-}"
   printf "%s\n" container-write > /workspace/container-write.txt
-  printf "%s\n" persistent-state > /home/kama/.kama/phase6-state.txt
+  printf "%s\n" persistent-state > /home/kama/.kama/docker-smoke-state.txt
 '
 [[ "$(sed -n '1p' "$WORKSPACE_DIR/container-write.txt")" == "container-write" ]] || fail "container write did not reach host workspace"
 
@@ -254,9 +254,9 @@ assert os.O_DIRECTORY
 assert os.open in os.supports_dir_fd
 assert os.scandir in os.supports_fd
 tool = SearchCodeTool(WorkspacePathResolver(root), WorkspaceAccessPolicy(root))
-result = asyncio.run(tool.invoke({"query": "phase6-docker-marker"}))
+result = asyncio.run(tool.invoke({"query": "docker-smoke-marker"}))
 assert not result.is_error
-assert "marker.txt:1: phase6-docker-marker" in result.content
+assert "marker.txt:1: docker-smoke-marker" in result.content
 assert "/Users/" not in result.content
 assert "/private/" not in result.content
 for path in ("../etc/passwd", "outside-link", "outside-dir", "outside-dir/passwd"):
@@ -269,7 +269,7 @@ for path in ("../etc/passwd", "outside-link", "outside-dir", "outside-dir/passwd
 print(result.content)
 PY
 )"
-[[ "$SEARCH_OUTPUT" == *"marker.txt:1: phase6-docker-marker"* ]] || fail "packaged search_code smoke returned no result"
+[[ "$SEARCH_OUTPUT" == *"marker.txt:1: docker-smoke-marker"* ]] || fail "packaged search_code smoke returned no result"
 [[ "$SEARCH_OUTPUT" != *"$WORKSPACE_DIR"* ]] || fail "search output leaked host workspace path"
 
 compose run --rm --no-deps -T client python - <<'PY'
@@ -277,8 +277,8 @@ from pathlib import Path
 
 from kama_claude.core.session import Session, SessionStore
 
-marker = "phase6-sessionstore-persistence"
-sid = "sess-phase6-persistence"
+marker = "docker-smoke-sessionstore-persistence"
+sid = "sess-docker-smoke-persistence"
 store = SessionStore(Path("/home/kama/.kama/sessions"))
 store.write_meta(Session(
     id=sid,
@@ -289,12 +289,12 @@ store.write_meta(Session(
     updated_at="2026-01-01T00:00:00+00:00",
     workspace_root=Path("/workspace"),
 ))
-store.append_note(sid, marker, "phase6-smoke")
+store.append_note(sid, marker, "docker-smoke")
 assert store.read_meta(sid).title == marker
 assert marker in store.read_notes(sid)
 PY
 
-compose exec -T daemon sh -c 'printf "%s\n" tmp-canary > /tmp/phase6-tmp-canary'
+compose exec -T daemon sh -c 'printf "%s\n" tmp-canary > /tmp/docker-smoke-tmp-canary'
 STOP_STARTED="$(date +%s)"
 compose stop -t 30 daemon
 STOP_ELAPSED="$(( $(date +%s) - STOP_STARTED ))"
@@ -309,30 +309,30 @@ trace = Path("/home/kama/.kama/traces/daemon.jsonl")
 assert trace.is_file()
 for line in trace.read_text(encoding="utf-8").splitlines():
     json.loads(line)
-assert Path("/home/kama/.kama/phase6-state.txt").read_text(encoding="utf-8").strip() == "persistent-state"
+assert Path("/home/kama/.kama/docker-smoke-state.txt").read_text(encoding="utf-8").strip() == "persistent-state"
 PY
 
 compose rm -f daemon
 compose up -d daemon
 wait_healthy
-compose exec -T daemon test ! -e /tmp/phase6-tmp-canary
-compose run --rm --no-deps -T client test -f /home/kama/.kama/phase6-state.txt
+compose exec -T daemon test ! -e /tmp/docker-smoke-tmp-canary
+compose run --rm --no-deps -T client test -f /home/kama/.kama/docker-smoke-state.txt
 compose run --rm --no-deps -T client python - <<'PY'
 from pathlib import Path
 
 from kama_claude.core.session import SessionStore
 
-marker = "phase6-sessionstore-persistence"
+marker = "docker-smoke-sessionstore-persistence"
 store = SessionStore(Path("/home/kama/.kama/sessions"))
-assert store.read_meta("sess-phase6-persistence").title == marker
-assert marker in store.read_notes("sess-phase6-persistence")
+assert store.read_meta("sess-docker-smoke-persistence").title == marker
+assert marker in store.read_notes("sess-docker-smoke-persistence")
 PY
 
 FINAL_DAEMON_ID="$(compose ps -q daemon)"
 compose stop -t 30 daemon
 assert_equals '0' "$(docker inspect --format '{{.State.ExitCode}}' "$FINAL_DAEMON_ID")" "recreated daemon SIGTERM exit code must be zero"
 
-printf 'phase6 docker smoke passed\n'
+printf 'docker smoke passed\n'
 printf 'project=%s\n' "$PROJECT_NAME"
 printf 'image=%s\n' "$RUNTIME_IMAGE"
 printf 'platform=%s/%s\n' \

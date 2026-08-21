@@ -9,7 +9,12 @@ from typing import Any, cast
 
 import pytest
 
-from kama_claude.core.bus.events import LogLineEvent, RunFinishedEvent, RunStartedEvent
+from kama_claude.core.bus.events import (
+    LogLineEvent,
+    PlannerDecisionReadyEvent,
+    RunFinishedEvent,
+    RunStartedEvent,
+)
 from kama_claude.core.events import journal as journal_module
 from kama_claude.core.events.journal import (
     DuplicateStreamOwnerError,
@@ -23,6 +28,7 @@ from kama_claude.core.events.journal import (
     UnknownStreamError,
 )
 from kama_claude.core.events.writer import EventWriter
+from kama_claude.core.plan_view import LegacyPlanViewV0
 
 
 # 构造字段稳定的 run.started 事件，便于比较跨 stream identity
@@ -31,6 +37,28 @@ def _run_started(run_id: str = "run-1") -> RunStartedEvent:
         run_id=run_id,
         goal="journal test",
         ts="2026-07-21T00:00:00Z",
+    )
+
+
+# 构造双 durable stream 使用的结构化 PlanReady 事件
+def _plan_ready(event_id: str = "plan-1", *, approach: str = "reuse") -> PlannerDecisionReadyEvent:
+    plan = LegacyPlanViewV0(
+        plan_key="decision-1:v1",
+        goal="journal plan",
+        selected_approach=approach,
+    )
+    return PlannerDecisionReadyEvent(
+        event_id=event_id,
+        run_id="run-1",
+        planner_run_id="planner-1",
+        session_id="sess-1",
+        plan=plan,
+        plan_key=plan.plan_key,
+        decision_id="decision-1",
+        decision_version=1,
+        ts="2026-07-21T00:00:00Z",
+        snapshot_digest="snapshot",
+        content_digest="content",
     )
 
 
@@ -66,6 +94,38 @@ async def test_dual_stream_records_share_event_id_and_keep_local_seq(tmp_path: P
     assert run_rows[0]["seq"] == 1
     assert session_rows[0]["seq"] == 1
     assert len(delivered) == 2
+
+
+# 功能：验证 PlanReady 必须同时 durable 到 top-level run 与 session stream，并支持精确幂等重放
+# 设计：先发布相同 event_id 两次再发布冲突 payload，直接读取两个 journal 的严格 replay 结果
+async def test_plan_ready_requires_dual_durable_route_and_deduplicates_payload(
+    tmp_path: Path,
+) -> None:
+    coordinator = EventJournalCoordinator()
+    session_path = tmp_path / "sessions" / "sess-1"
+    run_path = session_path / "runs" / "run-1"
+    await coordinator.register_session("sess-1", session_path)
+    await coordinator.register_run("run-1", run_path, session_id="sess-1")
+
+    event = _plan_ready()
+    first, second = await asyncio.gather(
+        coordinator.publish_required_durable(event),
+        coordinator.publish_required_durable(event),
+    )
+    assert first == second
+
+    run_replay = await coordinator.read_replay("run:run-1", after_seq=0, high_watermark=1)
+    session_replay = await coordinator.read_replay(
+        "session:sess-1",
+        after_seq=0,
+        high_watermark=1,
+    )
+    assert run_replay.records[0].event_id == event.event_id
+    assert session_replay.records[0].event_id == event.event_id
+
+    with pytest.raises(JournalError, match="payload conflict"):
+        await coordinator.publish_required_durable(_plan_ready(approach="different"))
+    await coordinator.close()
 
 
 # 功能：验证两个并发 run 各自只写入所属 stream，不交叉污染 journal

@@ -3,6 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+REPOSITORY_CHANGE_DISCIPLINE = """## Repository Change Discipline
+Prefer editing existing files to creating new ones
+Don't add features, refactor, or introduce abstractions beyond what the task requires
+Don't design for hypothetical future requirements
+A bug fix doesn't need surrounding cleanup"""
+
 
 @dataclass # 唯一的、贯穿整个 run 生命周期的有状态对象（状态机、消息容器和系统提示词构建器）
 class ExecutionContext:
@@ -13,6 +19,7 @@ class ExecutionContext:
     session_notes: str = "" # 持久化笔记
     global_context: str = "" # ~/.kama/context.md 内容
     project_context: str = "" # .kama/context.md 内容
+    repository_instructions: str = "" # workspace 显式仓库规则及来源标识
     messages: list[dict[str, Any]] = field(default_factory=list) # ← 核心：完整的对话历史
     step: int = 0 # 当前步数计数器
     status: str = "running"  # "running" | "success" | "failed" 
@@ -31,11 +38,15 @@ class ExecutionContext:
         elif not self.messages:
             self.messages.append({"role": "user", "content": self.goal})
 
-    # 最终提示由 base/override、Global Context、Project Context 和 Session Notes 组成
-    # 返回当前 run 的 system prompt；有 override 时跳过 base，直接注入记忆层
+    # 返回当前 run 的可信 policy 与上下文组合；override 只能替换 role/base 槽位
     def system_prompt(self, base: str) -> str:
         # base 硬编码在 AgentLoop.run() 中
         parts = [self.system_prompt_override if self.system_prompt_override else base]
+        parts.append("\n\n" + REPOSITORY_CHANGE_DISCIPLINE)
+        if self.repository_instructions.strip():
+            parts.append(
+                "\n\n## Repository Instructions\n" + self.repository_instructions
+            )
         if self.global_context.strip(): #~/.kama/context.md,跨项目记录用户偏好和全局规则
             parts.append("\n\n## Global Context\n" + self.global_context.strip())
         # .kama/context.md 作用于当前项目，包含项目目标、约束和已知事实

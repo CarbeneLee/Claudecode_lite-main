@@ -92,7 +92,7 @@ def _exact_multibyte_value() -> str:
     )
 
 
-# 功能：验证 Phase 7A 提供独立的 connection lifecycle 模块
+# 功能：验证 connection context 提供独立的 connection lifecycle 模块
 # 设计：先用模块发现断言制造稳定 RED，避免缺失模块导致 pytest collection error
 def test_connection_context_module_exists() -> None:
     spec = importlib.util.find_spec("kama_claude.core.transport.connection")

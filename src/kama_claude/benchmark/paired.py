@@ -451,8 +451,8 @@ class SharedPreflightIdentity(_StrictModel):
 
 
 class OutputParentEvidence(_StrictModel):
-    env_name: SafeIdentifier = "KAMA_PHASE9D_OUTPUT_PARENT"
-    label: SafeIdentifier = "phase9d-external-output-parent"
+    env_name: SafeIdentifier = "KAMA_PAIRED_OUTPUT_PARENT"
+    label: SafeIdentifier = "paired-experiment-external-output-parent"
     canonical_path_sha256: Sha256
     canonical_object_sha256: Sha256
     absolute_path_persisted: Literal[False] = False
@@ -1163,7 +1163,7 @@ def build_command_spec(
         "--experiment",
         profile_path,
         "--output",
-        f"${{KAMA_PHASE9D_OUTPUT_PARENT}}/{output_basename}",
+        f"${{KAMA_PAIRED_OUTPUT_PARENT}}/{output_basename}",
     ]
     expected_env = [
         "ANTHROPIC_API_KEY",
@@ -2027,7 +2027,7 @@ def _load_evaluation_bundle(path: Path) -> EvaluationReport:
         raise ValueError("attempt artifact evidence is invalid") from exc
 
 
-# 验证baseline row对应的Phase 8A report与关键runtime/private evidence存在
+# 验证baseline row对应的evaluation report与关键runtime/private evidence存在
 def _attempt_artifacts_are_complete(root: Path, row: AttemptAnalysis) -> bool:
     evaluation_root = (
         root

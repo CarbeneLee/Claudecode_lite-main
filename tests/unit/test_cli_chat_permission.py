@@ -53,6 +53,8 @@ class _FakeClient:
                 "high_watermark_seq": params["after_seq"],
                 "daemon_instance_id": self.daemon_id,
             }
+        if method == "session.get_agent_mode":
+            return {"agent_mode": "direct", "revision": 0}
         if method == "session.send_message":
             return {"run_id": "run-test"}
         return {}

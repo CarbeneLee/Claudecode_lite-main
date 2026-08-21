@@ -111,7 +111,7 @@ def _resolve_task_dir(tasks_root: Path, task_id: str) -> Path:
     return resolved
 
 
-# 加载 suite 及其 Phase 8A tasks，并校验 observer metadata 与 private grader 对齐
+# 加载 suite 及其 evaluation tasks，并校验 observer metadata 与 private grader 对齐
 def load_suite(
     suite_path: Path | str,
     tasks_root: Path | str,

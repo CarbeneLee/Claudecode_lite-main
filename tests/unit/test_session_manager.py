@@ -6,18 +6,24 @@ from typing import Any, cast
 
 import pytest
 
-from kama_claude.core.bus.envelope import HandlerError
+from kama_claude.core.approval import ApprovalRecordCorrupt
+from kama_claude.core.bus.envelope import INVALID_PARAMS, HandlerError
+from kama_claude.core.bus.events import RunFinishedEvent, RunStartedEvent
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.events.bus import EventBus
+from kama_claude.core.events.journal import EventJournalCoordinator
+from kama_claude.core.execution import ApprovedExecutionBinding
 from kama_claude.core.llm.types import LlmResponse
 from kama_claude.core.runner import AgentRunner, RunOutcome
 from kama_claude.core.session.manager import (
     SESSION_BUSY,
     SESSION_CLOSED,
+    SESSION_INTERRUPTED,
+    SESSION_INVALID_MODE,
     SESSION_NOT_FOUND,
     SessionManager,
 )
-from kama_claude.core.session.model import Session
+from kama_claude.core.session.model import MAX_AGENT_MODE_REVISION, Session
 from kama_claude.core.session.store import SessionStore
 
 _REQUIREMENT_CONTRACT = (
@@ -53,6 +59,7 @@ class _Runner:
         goal: str,
         *,
         run_id: str | None = None,
+        agent_mode: str = "direct",
         session: Session | None = None,
         store: SessionStore | None = None,
         system_prompt_override: str | None = None,
@@ -174,6 +181,252 @@ async def test_create_session_writes_meta_and_event(tmp_path: Path) -> None:
     assert store.read_meta(session.id).title == "title"
     assert store.read_meta(session.id).workspace_root == workspace_root
     assert [e.type for e in events] == ["session.created"]  # type: ignore[attr-defined]
+
+
+# 功能：验证 agent_mode 在 session lock 内持久化切换，并在活动 run 期间拒绝变更
+# 设计：先完成空闲切换再用 gate 保持 active_run_id，覆盖 mode snapshot 与 send acceptance 的同锁边界
+async def test_agent_mode_is_persisted_and_busy_run_blocks_switch(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    runner = _GatedRunner()
+    manager = SessionManager(store, lambda _root: runner, EventBus())  # type: ignore[arg-type]
+    session = await manager.create("chat", workspace_root=tmp_path.resolve())
+
+    changed = await manager.set_agent_mode(session.id, "plan")
+    assert changed.agent_mode == "plan"
+    assert changed.revision == 1
+    snapshot = await manager.get_agent_mode(session.id)
+    assert snapshot.agent_mode == "plan"
+    assert snapshot.revision == 1
+    assert store.read_meta(session.id).agent_mode == "plan"
+    assert store.read_meta(session.id).agent_mode_revision == 1
+
+    await manager.send_message(session.id, "plan this")
+    await asyncio.wait_for(runner.started.wait(), timeout=1)
+    with pytest.raises(HandlerError) as exc:
+        await manager.set_agent_mode(session.id, "direct")
+    assert exc.value.code == SESSION_BUSY
+    runner.gate.set()
+    await _await_no_active_runs(manager)
+
+
+# 功能：验证空闲时重复设置同一 mode 不递增 revision 且不发布 changed event
+# 设计：用 EventBus 收集真实事件，区分 create 事件与 mode changed 的 side effect
+async def test_same_mode_idle_is_idempotent_without_changed_event(tmp_path: Path) -> None:
+    events: list[Any] = []
+    bus = EventBus()
+
+    async def collect(event: Any) -> None:
+        events.append(event)
+
+    bus.subscribe(collect)
+    manager = SessionManager(
+        SessionStore(tmp_path / "sessions"),
+        lambda _root: _Runner(),
+        bus,
+    )  # type: ignore[arg-type]
+    session = await manager.create("chat", workspace_root=tmp_path.resolve())
+    events.clear()
+
+    result = await manager.set_agent_mode(session.id, "direct")
+
+    assert result.agent_mode == "direct"
+    assert result.revision == 0
+    assert events == []
+
+
+# 功能：验证 session-backed approval 在读取损坏用户记录时不会先修复 derived receipt
+# 设计：把 receipt materializer 替换成必失败哨兵，确保 corrupted ApprovalRecord 是最先观察到的失败
+@pytest.mark.asyncio
+async def test_corrupt_approval_record_is_checked_before_receipt_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    manager = SessionManager(
+        store,
+        lambda _workspace_root: _Runner(),
+        EventBus(),
+    )  # type: ignore[arg-type]
+    session = await manager.create("chat", workspace_root=tmp_path.resolve())
+    projection_key = "pv1:run-1:decision-1:v1"
+    path = store.approval_record_path(session.id, projection_key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("corrupt approval record", encoding="utf-8")
+    materialize_called = False
+
+    async def unexpected_materialize(**_kwargs: object) -> object:
+        nonlocal materialize_called
+        materialize_called = True
+        raise AssertionError("receipt materialization must follow approval validation")
+
+    monkeypatch.setattr(
+        "kama_claude.core.session.manager.materialize_committed_plan_receipt",
+        unexpected_materialize,
+    )
+
+    with pytest.raises(ApprovalRecordCorrupt, match="approval-record-corrupt"):
+        await manager.resolve_approval(
+            session.id,
+            projection_key,
+            action="approve",
+            decision_id="decision-1",
+            decision_version=1,
+            content_digest="decision-digest",
+            commit_receipt_digest="receipt-digest",
+        )
+
+    assert materialize_called is False
+
+
+# 功能：验证活动 run 中即使请求当前 mode 也优先返回 SESSION_BUSY
+# 设计：gate 保持 run active，锁定 busy 优先于 same-mode no-op 的既有 admission 语义
+async def test_same_mode_during_active_run_is_busy(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    runner = _GatedRunner()
+    manager = SessionManager(store, lambda _root: runner, EventBus())  # type: ignore[arg-type]
+    session = await manager.create("chat", workspace_root=tmp_path.resolve(), agent_mode="plan")
+    await manager.send_message(session.id, "work")
+    await asyncio.wait_for(runner.started.wait(), timeout=1)
+
+    with pytest.raises(HandlerError) as exc:
+        await manager.set_agent_mode(session.id, "plan")
+
+    assert exc.value.code == SESSION_BUSY
+    assert (await manager.get_agent_mode(session.id)).revision == 0
+    runner.gate.set()
+    await _await_no_active_runs(manager)
+
+
+# 功能：验证 write_meta 失败时 live Session 保持旧 mode/revision 且不发 changed event
+# 设计：替换真实 writer 为一次失败的边界 stub，只断言内存与事件，不宣称磁盘 crash-atomic rollback
+async def test_mode_write_failure_does_not_mutate_live_session(tmp_path: Path) -> None:
+    events: list[Any] = []
+    bus = EventBus()
+
+    async def collect(event: Any) -> None:
+        events.append(event)
+
+    bus.subscribe(collect)
+    store = SessionStore(tmp_path / "sessions")
+    manager = SessionManager(store, lambda _root: _Runner(), bus)  # type: ignore[arg-type]
+    session = await manager.create("chat", workspace_root=tmp_path.resolve())
+    events.clear()
+    original_write = store.write_meta
+
+    def fail_write(_: Session) -> None:
+        raise OSError("disk write failed")
+
+    store.write_meta = fail_write  # type: ignore[method-assign]
+    with pytest.raises(OSError):
+        await manager.set_agent_mode(session.id, "plan")
+    store.write_meta = original_write  # type: ignore[method-assign]
+
+    assert session.agent_mode == "direct"
+    assert session.agent_mode_revision == 0
+    assert events == []
+
+
+# 功能：验证 mode notification 失败不回滚已经写入的 mode/revision
+# 设计：bus subscriber 在 commit 后抛异常，断言返回与持久化 authority 仍保持新 snapshot
+async def test_mode_notification_failure_keeps_committed_snapshot(tmp_path: Path) -> None:
+    bus = EventBus()
+    store = SessionStore(tmp_path / "sessions")
+    manager = SessionManager(store, lambda _root: _Runner(), bus)  # type: ignore[arg-type]
+    session = await manager.create("chat", workspace_root=tmp_path.resolve())
+
+    async def fail_publish(_: Any) -> None:
+        raise RuntimeError("notification unavailable")
+
+    bus.subscribe(fail_publish)
+    result = await manager.set_agent_mode(session.id, "plan")
+
+    assert result.agent_mode == "plan"
+    assert result.revision == 1
+    snapshot = await manager.get_agent_mode(session.id)
+    assert snapshot.agent_mode == "plan"
+    assert snapshot.revision == 1
+
+
+# 功能：验证 mode getter 不获取 mutation lock，也不会把正常读取误报为 SESSION_BUSY
+# 设计：手动持有内部 lock 后调用只读 getter，直接覆盖 event-loop-confined pair read 约束
+async def test_get_agent_mode_does_not_use_mutation_lock(tmp_path: Path) -> None:
+    manager = SessionManager(
+        SessionStore(tmp_path / "sessions"),
+        lambda _root: _Runner(),
+        EventBus(),
+    )  # type: ignore[arg-type]
+    session = await manager.create("chat", workspace_root=tmp_path.resolve())
+    lock = manager._locks[session.id]  # type: ignore[attr-defined]
+    await lock.acquire()
+    try:
+        snapshot = await manager.get_agent_mode(session.id)
+    finally:
+        lock.release()
+
+    assert snapshot.agent_mode == "direct"
+    assert snapshot.revision == 0
+
+
+# 功能：验证 revision 达到协议上限后再次切换会 fail closed 且不污染 live state
+# 设计：直接设置 domain 边界值，区分 overflow rejection 与普通 busy/invalid mode 分支
+async def test_agent_mode_revision_overflow_fails_closed(tmp_path: Path) -> None:
+    manager = SessionManager(
+        SessionStore(tmp_path / "sessions"),
+        lambda _root: _Runner(),
+        EventBus(),
+    )  # type: ignore[arg-type]
+    session = await manager.create("chat", workspace_root=tmp_path.resolve())
+    session.agent_mode_revision = MAX_AGENT_MODE_REVISION
+
+    with pytest.raises(HandlerError) as exc:
+        await manager.set_agent_mode(session.id, "plan")
+
+    assert exc.value.code == SESSION_INVALID_MODE
+    assert session.agent_mode == "direct"
+    assert session.agent_mode_revision == MAX_AGENT_MODE_REVISION
+
+
+# 功能：验证 mode notification 的 CancelledError 不被吞掉但 committed state 保留
+# 设计：subscriber 主动抛出取消异常，断言 cancellation 传播同时检查 live authority 已经写入
+async def test_mode_notification_cancellation_propagates_after_commit(tmp_path: Path) -> None:
+    bus = EventBus()
+    manager = SessionManager(
+        SessionStore(tmp_path / "sessions"),
+        lambda _root: _Runner(),
+        bus,
+    )  # type: ignore[arg-type]
+    session = await manager.create("chat", workspace_root=tmp_path.resolve())
+
+    async def cancel_publish(_: Any) -> None:
+        raise asyncio.CancelledError
+
+    bus.subscribe(cancel_publish)
+    with pytest.raises(asyncio.CancelledError):
+        await manager.set_agent_mode(session.id, "plan")
+
+    assert session.agent_mode == "plan"
+    assert session.agent_mode_revision == 1
+
+
+# 功能：验证未知 slash skill 在持久化 user/run 前被拒绝，而绝对路径型 goal 仍可发送
+# 设计：先检查 rejection 不留下 active_run，再用两个斜杠的绝对路径 token 覆盖精确 slash grammar
+async def test_slash_grammar_rejects_unknown_and_allows_absolute_path_goal(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    runner = _Runner()
+    manager = SessionManager(store, lambda _root: runner, EventBus())  # type: ignore[arg-type]
+    session = await manager.create("chat", workspace_root=tmp_path.resolve())
+
+    with pytest.raises(HandlerError) as exc:
+        await manager.send_message(session.id, "/not-a-known-skill do work")
+    assert exc.value.code == INVALID_PARAMS
+    assert store.read_meta(session.id).active_run_id is None
+    assert store.read_messages(session.id) == []
+
+    await manager.send_message(session.id, "/Users/project inspect")
+    await _await_no_active_runs(manager)
+    assert runner.seen_goals == ["/Users/project inspect"]
 
 
 # 功能：验证 session stream owner 注册严格早于 session.created 发布与 meta 后续使用
@@ -567,3 +820,253 @@ async def test_run_failure_still_finalizes_session_state(tmp_path: Path) -> None
     await _await_no_active_runs(manager)
 
     assert store.read_meta(session.id).status == "waiting_for_input"
+
+
+# 功能：验证活动 run 会持久化 active_run_id 并成为 session 的唯一 in-flight 标记
+# 设计：使用 gate 阻塞真实后台 runner，断言 send_message 返回后 metadata 已含 run_id 且 task map 只负责清理
+async def test_send_message_persists_active_run_id(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    runner = _GatedRunner()
+    manager = SessionManager(
+        store,
+        lambda _workspace_root: runner,
+        EventBus(),
+    )  # type: ignore[arg-type]
+    session = await manager.create("chat", workspace_root=tmp_path.resolve())
+
+    run_id = await manager.send_message(session.id, "hello")
+
+    loaded = store.read_meta(session.id)
+    assert loaded.active_run_id == run_id
+    assert loaded.status == "active"
+    runner.gate.set()
+    await _await_no_active_runs(manager)
+    assert store.read_meta(session.id).active_run_id is None
+
+
+# 功能：验证重启时没有 terminal journal 的 active run 会拒绝新消息并返回 SESSION_INTERRUPTED
+# 设计：先写入持久化 meta，再用新 manager 恢复 session，避免依赖内存 task 是否仍存在
+async def test_reconcile_without_terminal_marks_session_interrupted(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    session = Session(
+        id="sess-interrupted",
+        mode="chat",
+        status="active",
+        title="interrupted",
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+        workspace_root=tmp_path.resolve(),
+        run_ids=["run-interrupted"],
+        active_run_id="run-interrupted",
+    )
+    store.write_meta(session)
+    manager = SessionManager(
+        store,
+        lambda _workspace_root: _Runner(),
+        EventBus(),
+    )  # type: ignore[arg-type]
+    await manager.reconcile_persisted_sessions()
+
+    with pytest.raises(HandlerError) as exc:
+        await manager.send_message(session.id, "again")
+    assert exc.value.code == SESSION_INTERRUPTED
+
+
+# 功能：验证 terminal journal 存在时重启 reconciliation 清除 active_run_id 并恢复可交互状态
+# 设计：注入最小 terminal 查询 fake，覆盖 chat 与 one_shot 两种 session 状态收敛而不启动 runner
+async def test_reconcile_terminal_run_restores_session_state(tmp_path: Path) -> None:
+    class _Journal:
+        # 返回固定的 terminal 结果，模拟 daemon 重启后读取 durable run journal
+        def has_terminal_run(self, run_id: str) -> bool:
+            return run_id == "run-finished"
+
+    store = SessionStore(tmp_path / "sessions")
+    for mode, expected_status in (("chat", "waiting_for_input"), ("one_shot", "closed")):
+        session = Session(
+            id=f"sess-{mode}",
+            mode=mode,  # type: ignore[arg-type]
+            status="active",
+            title=mode,
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+            workspace_root=tmp_path.resolve(),
+            run_ids=["run-finished"],
+            active_run_id="run-finished",
+        )
+        store.write_meta(session)
+        manager = SessionManager(
+            store,
+            lambda _workspace_root: _Runner(),
+            EventBus(),
+            journal=_Journal(),  # type: ignore[arg-type]
+        )
+        await manager.reconcile_persisted_sessions()
+
+        loaded = store.read_meta(session.id)
+        assert loaded.active_run_id is None
+        assert loaded.status == expected_status
+
+
+# 功能：验证 interrupted session 可以在没有 live task 时被 close 并清除 active_run_id
+# 设计：复用无 terminal 的恢复路径，再调用 close，确保关闭不依赖 task map 中的对象
+async def test_close_clears_interrupted_session(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    session = Session(
+        id="sess-close-interrupted",
+        mode="chat",
+        status="active",
+        title="interrupted",
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+        workspace_root=tmp_path.resolve(),
+        run_ids=["run-interrupted"],
+        active_run_id="run-interrupted",
+    )
+    store.write_meta(session)
+    manager = SessionManager(
+        store,
+        lambda _workspace_root: _Runner(),
+        EventBus(),
+    )  # type: ignore[arg-type]
+    await manager.reconcile_persisted_sessions()
+
+    await manager.close(session.id)
+
+    loaded = store.read_meta(session.id)
+    assert loaded.status == "closed"
+    assert loaded.active_run_id is None
+
+
+# 功能：验证重复 get_execution 在缓存与 durable terminal 一致时不改写状态 revision
+# 设计：真实 run journal + status artifact 重放两次，比较结果与 binding 文件 bytes 排除隐式重写
+async def test_get_execution_terminal_reconcile_is_idempotent(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    journal = EventJournalCoordinator()
+    manager = SessionManager(
+        store,
+        lambda _workspace_root: _Runner(),
+        EventBus(),
+        journal=journal,
+    )  # type: ignore[arg-type]
+    session = await manager.create("chat", workspace_root=tmp_path.resolve())
+    run_id = "run-execution-idempotent"
+    run_path = store.runs_dir(session.id) / run_id
+    await journal.register_run(run_id, run_path, session_id=session.id)
+    binding = ApprovedExecutionBinding.create(
+        session_id=session.id,
+        request_id="request-idempotent",
+        execution_id="execution-idempotent",
+        run_id=run_id,
+        projection_key="pv1:run:decision:v1",
+        decision_id="decision",
+        decision_version=1,
+        decision_content_digest="decision-digest",
+        approval_record_digest="approval-digest",
+        commit_receipt_digest="receipt-digest",
+        snapshot_digest="snapshot-digest",
+        workspace_id="workspace",
+    )
+    store.write_approved_execution_binding(binding)
+    store.write_execution_status(
+        session.id,
+        binding.request_id,
+        status="completed_unverified",
+        status_revision=4,
+        reason="execution_completed_unverified",
+    )
+    await journal.publish_required_durable(
+        RunStartedEvent(
+            run_id=run_id,
+            goal="approved execution",
+            ts="2026-01-01T00:00:00+00:00",
+            execution_id=binding.execution_id,
+            execution_status="running",
+        )
+    )
+    await journal.publish_required_durable(
+        RunFinishedEvent(
+            run_id=run_id,
+            status="success",
+            reason="execution_completed_unverified",
+            steps=1,
+            ts="2026-01-01T00:00:01+00:00",
+            execution_id=binding.execution_id,
+            execution_status="completed_unverified",
+        )
+    )
+    binding_path = store.approved_execution_binding_path(session.id, binding.request_id)
+    before = binding_path.read_bytes()
+
+    first = await manager.get_execution(session.id, binding.request_id)
+    second = await manager.get_execution(session.id, binding.request_id)
+
+    assert first == second
+    assert first.status_revision == 4
+    assert binding_path.read_bytes() == before
+    await journal.close()
+
+
+# 功能：验证 terminal journal 写入失败时不会把 approved execution 标记为已完成
+# 设计：让 fake approved runner 返回完成但强制 terminal append 失败，断言 status 保守收敛为 interrupted
+async def test_terminal_journal_failure_cannot_complete_execution(tmp_path: Path) -> None:
+    class _FailingTerminalJournal:
+        # 模拟已注册但无法写入 terminal event 的 durable journal
+        async def register_session(self, session_id: str, session_path: Path) -> None:
+            del session_id, session_path
+
+        def has_terminal_run(self, run_id: str) -> bool:
+            del run_id
+            return False
+
+        # 让 terminal fallback 立即失败，覆盖 status-cache completion barrier
+        async def publish_required_durable(self, event: object) -> None:
+            del event
+            raise RuntimeError("terminal append failed")
+
+    class _CompletedRunner:
+        # 返回未验证完成结果，但不自行写 terminal journal
+        async def run_approved(self, **kwargs: Any) -> RunOutcome:
+            del kwargs
+            return RunOutcome(
+                status="completed_unverified",
+                result="done",
+                reason="execution_completed_unverified",
+            )
+
+    store = SessionStore(tmp_path / "sessions")
+    journal = _FailingTerminalJournal()
+    manager = SessionManager(
+        store,
+        lambda _root: _CompletedRunner(),  # type: ignore[arg-type]
+        EventBus(),
+        journal=journal,  # type: ignore[arg-type]
+    )
+    session = await manager.create("chat", workspace_root=tmp_path.resolve())
+    binding = ApprovedExecutionBinding.create(
+        session_id=session.id,
+        request_id="terminal-failure-request",
+        execution_id="terminal-failure-execution",
+        run_id="terminal-failure-run",
+        projection_key="pv1:terminal-failure-run:decision:v1",
+        decision_id="decision",
+        decision_version=1,
+        decision_content_digest="decision-digest",
+        approval_record_digest="approval-digest",
+        commit_receipt_digest="receipt-digest",
+        snapshot_digest="snapshot-digest",
+        workspace_id="workspace",
+    )
+    store.write_approved_execution_binding(binding)
+
+    await manager._run_approved_and_finalize(  # type: ignore[arg-type]
+        sid=session.id,
+        binding=binding,
+        decision=None,
+        summary="full summary",
+        context=None,
+    )
+
+    status = store.read_execution_status(session.id, binding.request_id)
+    assert status is not None
+    assert status.status == "interrupted"
+    assert status.reason == "terminal-journal-unavailable"

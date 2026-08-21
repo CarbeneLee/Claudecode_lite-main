@@ -18,13 +18,17 @@ $ARGUMENTS
 调用 spawn_agent，参数：
 - description: "规划任务"
 - subagent_type: "planner"
-- prompt: 包含完整目标描述，要求 planner 输出有序的执行步骤列表，每步包含明确的成功标准
+- prompt: 包含完整目标描述，要求 planner 先完成 grounding，再提交最终 PlannerDecision，并在成功提交后输出人类可读摘要
+
+如果 planner 的 spawn_agent 结果为 `is_error=true`，立即停止本工作流；不得派生 executor 或 reviewer，只向用户报告稳定的 Planner failure 摘要。
+
+成功的 planner 结果必须是 runtime 从已持久化 `ExactPlannerDecisionV2` 生成的完整 agent-facing execution summary；它不是 bounded `PlanView`，也不是 child 的未经认证自然语言文本。
 
 **阶段 2：执行（executor）**
-将 planner 的完整输出作为上下文，调用 spawn_agent，参数：
+仅在 planner 成功返回后，将上述完整 `ExactPlannerDecisionV2` execution summary 作为上下文，调用 spawn_agent，参数：
 - description: "执行计划"
 - subagent_type: "executor"
-- prompt: 包含原始目标 + planner 输出的完整执行计划，要求 executor 逐步执行并汇报每步结果
+- prompt: 包含原始目标 + planner 输出的完整 execution summary，要求 executor 逐步执行并汇报每步结果；不得使用 bounded PlanView 或自行补全被截断内容
 
 **阶段 3：审查（reviewer）**
 将 executor 的完整输出作为上下文，调用 spawn_agent，参数：

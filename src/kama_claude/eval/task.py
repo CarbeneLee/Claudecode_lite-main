@@ -51,7 +51,7 @@ def _reject_symlink_entries(root: Path, *, label: str) -> None:
         raise ValueError(f"{label} cannot be inspected") from exc
 
 
-# 加载单个 Phase 8A task 并保持公开输入与私有 grader 的路径边界
+# 加载单个 evaluation task 并保持公开输入与私有 grader 的路径边界
 def load_task(task_dir: Path | str) -> LoadedTask:
     root = Path(task_dir).resolve(strict=True)
     public_root = _resolve_within(root, root / "public", label="public task directory")

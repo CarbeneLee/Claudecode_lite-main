@@ -136,7 +136,7 @@ def _apply_patch(workspace: Path, patch: Path) -> None:
     )
 
 
-# 在 fresh copy 上运行真实 Phase 8A rule grader 并保留确定性证据
+# 在 fresh copy 上运行真实 evaluation rule grader 并保留确定性证据
 async def _grade_snapshot(
     task: LoadedBenchmarkTask,
     root: Path,
@@ -269,7 +269,7 @@ def test_easy_anchor_public_bundle_is_hygienic_and_leak_free() -> None:
 
 
 # 功能：验证 pristine/reference/alternative/wrong states 的 oracle 结果正确且三次 fresh-copy 一致
-# 设计：所有 states 都运行真实 Phase 8A grader，按 group 断言并比较确定性 snapshot
+# 设计：所有 states 都运行真实 evaluation grader，按 group 断言并比较确定性 snapshot
 @pytest.mark.asyncio
 async def test_easy_anchor_validation_matrix_is_correct_and_deterministic(
     tmp_path: Path,

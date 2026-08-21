@@ -29,9 +29,9 @@ jobs:
         run: uv run pytest tests/docker/test_docker_contract.py -q
 
       - name: Build and execute the independent test stage
-        run: docker build --target test --tag kamaclaude-phase6-test .
+        run: docker build --target test --tag kamaclaude-docker-smoke-test .
 
       - name: Build, inspect, and smoke the runtime
         env:
-          PHASE6_SKIP_TEST_BUILD: "1"
+          KAMA_DOCKER_SKIP_TEST_BUILD: "1"
         run: scripts/docker_smoke.sh

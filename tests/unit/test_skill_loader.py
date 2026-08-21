@@ -27,6 +27,27 @@ def test_all_builtin_skills_found(name: str, tmp_path: Path) -> None:
     assert skill is not None, f"builtin skill '{name}' not found"
 
 
+# 功能：验证 orchestrate 在 Planner error 时停止，不把未经认证文本交给 executor
+# 设计：读取真实 builtin skill 正文，锁定最小 prompt-level compatibility contract
+def test_orchestrate_stops_after_planner_error(tmp_path: Path) -> None:
+    skill = SkillLoader(tmp_path.resolve()).resolve("orchestrate")
+
+    assert skill is not None
+    assert "is_error=true" in skill.system_prompt_template
+    assert "不得派生 executor 或 reviewer" in skill.system_prompt_template
+
+
+# 功能：验证 orchestrate 将完整 ExactPlannerDecisionV2 传给 executor
+# 设计：锁定 agent-facing renderer 与 bounded PlanView 的边界，防止 UI projection 被误当执行事实
+def test_orchestrate_uses_full_agent_facing_decision(tmp_path: Path) -> None:
+    skill = SkillLoader(tmp_path.resolve()).resolve("orchestrate")
+
+    assert skill is not None
+    assert "ExactPlannerDecisionV2" in skill.system_prompt_template
+    assert "不是 bounded `PlanView`" in skill.system_prompt_template
+    assert "不得使用 bounded PlanView" in skill.system_prompt_template
+
+
 # 功能：验证需要代码探索的 init/review skill 声明 search_code
 # 设计：只检查两个相关内建 skill 的解析结果，避免重复 getter 或文本快照测试
 @pytest.mark.parametrize("name", ["init", "review"])

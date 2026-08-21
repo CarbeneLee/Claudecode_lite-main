@@ -17,6 +17,7 @@ from kama_claude.core.events.journal import EventJournalCoordinator
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.tools.base import BaseTool, ToolResult
+from kama_claude.core.tools.invocation import DirectToolInvoker
 from kama_claude.core.tools.registry import ToolRegistry
 from kama_claude.eval.evaluator import evaluate_task
 from kama_claude.eval.failure import FailureCategory
@@ -140,7 +141,7 @@ async def test_real_producer_final_failure_prefix_passes_timeout_grader(
         goal="Exercise final failure lifecycle.",
         max_steps=5,
     )
-    loop = AgentLoop(provider, registry, bus)
+    loop = AgentLoop(provider, DirectToolInvoker(registry, bus, run_id), bus)
     loop_task = asyncio.create_task(loop.run(context))
 
     await asyncio.wait_for(provider.second_call_started.wait(), timeout=2.0)

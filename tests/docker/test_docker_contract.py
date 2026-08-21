@@ -174,7 +174,7 @@ def test_dockerignore_is_default_deny_and_allows_only_build_inputs() -> None:
     assert "!docs/**" not in rules
     assert "!.env*" not in rules
     assert "!.kama/**" not in rules
-    assert "!phase6-unlisted-private-canary.txt" not in rules
+    assert "!docker-smoke-unlisted-private-canary.txt" not in rules
 
 
 # 功能：验证 Compose 让 daemon/client 共享 fail-closed /workspace 与持久状态但只给 daemon 注入密钥
@@ -185,7 +185,7 @@ def test_compose_declares_shared_path_identity_and_secret_boundary() -> None:
     client = _compose_service(compose, "client")
 
     for service in (daemon, client):
-        assert "image: ${KAMA_IMAGE:-kamaclaude:phase6}" in service
+        assert "image: ${KAMA_IMAGE:-kamaclaude:docker-smoke}" in service
         assert "working_dir: /workspace" in service
         assert """    volumes:
       - type: bind
@@ -281,14 +281,14 @@ def test_smoke_script_uses_unique_project_and_trap_cleanup() -> None:
 # 功能：验证 smoke 收到 INT 或 TERM 时保留标准非零退出码并清理早期临时资源
 # 设计：使用脚本内受控信号探针在接触 Docker 前自发信号，直接覆盖真实 Bash trap 而不依赖 daemon
 def test_smoke_script_preserves_signal_status_and_cleans_early_resources(tmp_path: Path) -> None:
-    canary_path = ROOT / "phase6-unlisted-private-canary.txt"
+    canary_path = ROOT / "docker-smoke-unlisted-private-canary.txt"
     assert not canary_path.exists()
 
     for signal_name, expected_status in (("INT", 130), ("TERM", 143)):
         signal_tmp = tmp_path / signal_name.lower()
         signal_tmp.mkdir()
         env = os.environ.copy()
-        env["PHASE6_SIGNAL_PROBE"] = signal_name
+        env["KAMA_DOCKER_SIGNAL_PROBE"] = signal_name
         env["TMPDIR"] = str(signal_tmp)
 
         completed = subprocess.run(
@@ -338,13 +338,13 @@ def test_smoke_probes_session_store_persistence_across_recreate() -> None:
 
     writer = smoke.index("store.write_meta(Session(")
     recreate = smoke.index("compose rm -f daemon")
-    reader = smoke.rindex('store.read_meta("sess-phase6-persistence")')
+    reader = smoke.rindex('store.read_meta("sess-docker-smoke-persistence")')
 
     assert writer < recreate < reader
     assert "from kama_claude.core.session import Session, SessionStore" in smoke
     assert 'SessionStore(Path("/home/kama/.kama/sessions"))' in smoke
-    assert 'store.append_note(sid, marker, "phase6-smoke")' in smoke
-    assert 'marker in store.read_notes("sess-phase6-persistence")' in smoke
+    assert 'store.append_note(sid, marker, "docker-smoke")' in smoke
+    assert 'marker in store.read_notes("sess-docker-smoke-persistence")' in smoke
 
 
 # 功能：验证 CI 构建独立 test stage、执行 runtime smoke 且从不发布镜像

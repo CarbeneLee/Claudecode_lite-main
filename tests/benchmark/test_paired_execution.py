@@ -51,8 +51,8 @@ def _paired() -> ModuleType:
 
 # 从允许新增的scripts文件加载side-effect边界
 def _script() -> ModuleType:
-    path = Path(__file__).resolve().parents[2] / "scripts" / "phase9d_paired.py"
-    spec = importlib.util.spec_from_file_location("phase9d_paired_script", path)
+    path = Path(__file__).resolve().parents[2] / "scripts" / "paired_experiment.py"
+    spec = importlib.util.spec_from_file_location("paired_experiment_script", path)
     if spec is None or spec.loader is None:
         pytest.fail("paired script cannot be loaded")
     module = importlib.util.module_from_spec(spec)
@@ -127,8 +127,8 @@ def _same_receipt_bytes_git_repo(tmp_path: Path) -> tuple[Path, str, str, Path]:
     receipt = repo / "benchmarks" / "receipts" / _receipt_path().name
     receipt.parent.mkdir(parents=True)
     subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-    _git(repo, "config", "user.email", "phase9d@example.invalid")
-    _git(repo, "config", "user.name", "Phase 9D")
+    _git(repo, "config", "user.email", "paired-experiment@example.invalid")
+    _git(repo, "config", "user.name", "Paired Experiment")
     receipt.write_bytes(_receipt_path().read_bytes())
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "add receipt")
@@ -405,7 +405,7 @@ def _expected_arm(receipt: object, arm: str) -> object:
 def _use_record() -> object:
     return _paired().AuthorizationUseRecord(
         schema_version=1,
-        reservation_id="phase9d-use-test",
+        reservation_id="paired-use-test",
         status="RESERVED_FOR_ONE_PAIRED_EXECUTION",
         created_at_utc="2026-08-01T00:00:00Z",
         authorization_sha256="1" * 64,
@@ -495,7 +495,7 @@ def _valid_capability_result_for_reference(receipt_reference: object) -> object:
     control = _valid_arm_audit("control")
     treatment = _valid_arm_audit("treatment")
     return paired.build_paired_result(
-        result_id="phase9d-artifact-semantics",
+        result_id="paired-artifact-semantics",
         created_at_utc="2026-08-01T00:00:00Z",
         receipt_reference=receipt_reference,
         preflight_commit="a" * 40,
@@ -1566,7 +1566,7 @@ def test_paired_result_json_markdown_are_same_model_and_redacted(tmp_path: Path)
         receipt=receipt,
     )
     result = paired.build_paired_result(
-        result_id="phase9d-pair-test",
+        result_id="paired-experiment-test",
         created_at_utc="2026-08-01T00:00:00Z",
         receipt_reference=_receipt_reference(),
         preflight_commit="a" * 40,
@@ -2053,11 +2053,11 @@ def test_validate_execution_authorization_binds_all_frozen_references() -> None:
     receipt = _receipt()
     preflight = paired.FinalPreflightArtifact.model_validate(
         importlib.import_module(
-            "tests.benchmark.test_phase9d_final_preflight"
+            "tests.benchmark.test_paired_final_preflight"
         )._preflight_payload()
     )
     payload = importlib.import_module(
-        "tests.benchmark.test_phase9d_final_preflight"
+        "tests.benchmark.test_paired_final_preflight"
     )._authorization_payload()
     payload["paired_receipt"] = {
         "commit": preflight.paired_receipt.commit,
@@ -2463,7 +2463,7 @@ def test_paired_cli_sanitizes_observer_exceptions(
 
     captured = capsys.readouterr()
     assert exit_code == 2
-    assert captured.err == "phase9d paired observer failed\n"
+    assert captured.err == "paired experiment observer failed\n"
     assert "SECRET_CREDENTIAL_CANARY" not in captured.err
     assert str(tmp_path) not in captured.err
 
@@ -2477,7 +2477,7 @@ def test_execution_main_identity_is_bound_to_authorization_commit(
     script = _script()
     preflight = _paired().FinalPreflightArtifact.model_validate(
         importlib.import_module(
-            "tests.benchmark.test_phase9d_final_preflight"
+            "tests.benchmark.test_paired_final_preflight"
         )._preflight_payload()
     )
     authorized_commit = "b" * 40
@@ -2555,7 +2555,7 @@ def test_materialize_arm_launch_binds_profile_source_and_private_output(
 
 
 # 功能：验证worktree validator拒绝branch-attached、dirty、wrong-head和wrong-source binding
-# 设计：对纯observation逐字段mutation，避免创建正式Phase 9D worktree
+# 设计：对纯observation逐字段mutation，避免创建正式Paired Experiment worktree
 @pytest.mark.parametrize(
     ("field", "replacement"),
     [
@@ -2639,7 +2639,7 @@ def test_worktree_binding_rejects_source_root_from_main_checkout(tmp_path: Path)
 def _execution_artifacts(receipt: object) -> tuple[object, object]:
     paired = _paired()
     preflight_payload = importlib.import_module(
-        "tests.benchmark.test_phase9d_final_preflight"
+        "tests.benchmark.test_paired_final_preflight"
     )._preflight_payload()
     preflight_payload["paired_receipt"] = _receipt_reference().model_dump(
         mode="json"
@@ -2647,7 +2647,7 @@ def _execution_artifacts(receipt: object) -> tuple[object, object]:
     preflight_payload["external_parent"]["canonical_path_sha256"] = "3" * 64
     preflight = paired.FinalPreflightArtifact.model_validate(preflight_payload)
     authorization_payload = importlib.import_module(
-        "tests.benchmark.test_phase9d_final_preflight"
+        "tests.benchmark.test_paired_final_preflight"
     )._authorization_payload()
     authorization_payload["paired_receipt"] = {
         "commit": preflight.paired_receipt.commit,
@@ -2737,7 +2737,7 @@ def _execute_with_child(
             if observe_between is None
             else observe_between
         ),
-        result_id="phase9d-pair-test",
+        result_id="paired-experiment-test",
         created_at_utc="2026-08-01T00:00:00Z",
         child_runner=child,
     )
@@ -2946,7 +2946,7 @@ def test_execute_control_first_runs_both_valid_arms_in_order(tmp_path: Path) -> 
         ),
         between_expected=_between_arm(),
         observe_between=lambda: _between_arm(),
-        result_id="phase9d-pair-test",
+        result_id="paired-experiment-test",
         created_at_utc="2026-08-01T00:00:00Z",
         child_runner=child,
     )
@@ -3028,7 +3028,7 @@ def test_execute_control_first_stops_after_invalid_control(tmp_path: Path) -> No
         ),
         between_expected=_between_arm(),
         observe_between=lambda: _between_arm(),
-        result_id="phase9d-pair-test",
+        result_id="paired-experiment-test",
         created_at_utc="2026-08-01T00:00:00Z",
         child_runner=child,
     )
@@ -3149,9 +3149,9 @@ def test_tracked_artifact_identity_rejects_worktree_blob_drift(tmp_path: Path) -
         [
             "git",
             "-c",
-            "user.name=Phase9D Test",
+            "user.name=Paired Experiment Test",
             "-c",
-            "user.email=phase9d@example.invalid",
+            "user.email=paired-experiment@example.invalid",
             "commit",
             "-qm",
             "fixture",
@@ -3194,7 +3194,7 @@ def test_paired_result_bundle_rejects_markdown_json_verdict_divergence(
         receipt=receipt,
     )
     result = paired.build_paired_result(
-        result_id="phase9d-bundle-test",
+        result_id="paired-bundle-test",
         created_at_utc="2026-08-01T00:00:00Z",
         receipt_reference=_receipt_reference(),
         preflight_commit="a" * 40,
@@ -3561,7 +3561,7 @@ def _execute_with_terminal_contract(
             if observe_between is None
             else observe_between
         ),
-        result_id="phase9d-pair-test",
+        result_id="paired-experiment-test",
         created_at_utc="2026-08-01T00:00:00Z",
         child_runner=child,
     )
@@ -3989,7 +3989,7 @@ def test_paired_result_write_failure_has_durable_terminal_evidence(
         ),
         between_expected=_between_arm(),
         observe_between=lambda: _between_arm(),
-        result_id="phase9d-pair-test",
+        result_id="paired-experiment-test",
         created_at_utc="2026-08-01T00:00:00Z",
         child_runner=child,
     )
@@ -4306,7 +4306,7 @@ def test_terminal_record_rejects_contiguous_impossible_transition_history(
 # 功能：验证orchestrator源码不直接构造CONTROL_INVALID/TREATMENT_INVALID绕过reducer
 # 设计：AST扫描PairState attribute使用，允许初始化NOT_STARTED和从reducer结果转换，不做文本grep
 def test_orchestrator_does_not_assign_intermediate_invalid_states_directly() -> None:
-    path = Path(__file__).resolve().parents[2] / "scripts" / "phase9d_paired.py"
+    path = Path(__file__).resolve().parents[2] / "scripts" / "paired_experiment.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     invalid_attributes = [
         node.attr
@@ -4811,10 +4811,10 @@ def test_failure_terminal_write_failure_remains_consumed_and_fail_closed(
 # 执行不继承secret的临时Git命令并返回stdout
 def _temporary_git(repository: Path, *args: str) -> str:
     environment = {
-        "GIT_AUTHOR_EMAIL": "phase9d@example.invalid",
-        "GIT_AUTHOR_NAME": "Phase9D Test",
-        "GIT_COMMITTER_EMAIL": "phase9d@example.invalid",
-        "GIT_COMMITTER_NAME": "Phase9D Test",
+        "GIT_AUTHOR_EMAIL": "paired-experiment@example.invalid",
+        "GIT_AUTHOR_NAME": "Paired Experiment Test",
+        "GIT_COMMITTER_EMAIL": "paired-experiment@example.invalid",
+        "GIT_COMMITTER_NAME": "Paired Experiment Test",
         "PATH": os.environ.get("PATH", ""),
     }
     result = subprocess.run(

@@ -22,7 +22,7 @@ def _analyzer_module() -> ModuleType:
         pytest.fail("benchmark analyzer module is missing")
 
 
-# 构造带指定 criteria 和基本指标的 Phase 8A report
+# 构造带指定 criteria 和基本指标的 evaluation report
 def _report(
     task_id: str,
     *,
@@ -74,7 +74,7 @@ def _testgen_metadata() -> BenchmarkTaskSpec:
     )
 
 
-# 在 Phase 8A attempt layout 中写入 analyzer 所需的 validated evidence
+# 在 evaluation attempt layout 中写入 analyzer 所需的 validated evidence
 def _write_artifacts(
     evaluation_output: Path,
     report: EvaluationReport,
@@ -415,7 +415,7 @@ def test_analyzer_fails_closed_on_missing_required_evidence(tmp_path: Path) -> N
 
 
 # 功能：验证 timeout 且 trace 未形成时仍保留 attempt，不要求不存在的 workspace 与数值 evidence
-# 设计：构造真实 Phase 8A timeout report 形状且不写任何 artifact，锁定 reliability 分母不会丢失
+# 设计：构造真实 evaluation timeout report 形状且不写任何 artifact，锁定 reliability 分母不会丢失
 def test_analyzer_keeps_pre_artifact_timeout_as_reportable_attempt(
     tmp_path: Path,
 ) -> None:

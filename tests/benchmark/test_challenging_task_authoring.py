@@ -125,7 +125,7 @@ def _challenging_task(tmp_path: Path, task_id: str) -> LoadedBenchmarkTask:
         json.dumps(
             {
                 "schema_version": 1,
-                "suite_id": "phase8b-batch2-authoring",
+                "suite_id": "evaluation-batch-two-authoring",
                 "suite_version": 1,
                 "task_ids": [task_id],
             }
@@ -163,7 +163,7 @@ def _apply_patch(workspace: Path, patch: Path) -> None:
     )
 
 
-# 在 fresh copy 上运行真实 Phase 8A rule grader并保留确定性证据
+# 在 fresh copy 上运行真实 evaluation rule grader并保留确定性证据
 async def _grade_snapshot(
     task: LoadedBenchmarkTask,
     root: Path,
@@ -379,12 +379,12 @@ async def test_challenging_task_validation_matrix_is_correct_and_deterministic(
 # 功能：验证九任务在类别、难度、领域、oracle 和环境上满足冻结前平衡要求
 # 设计：用临时 suite 只读加载全部任务，并对三乘三组合与跨任务合同做机械审计
 def test_pre_freeze_suite_balance_is_consistent(tmp_path: Path) -> None:
-    suite_path = tmp_path / "phase8b-pre-freeze-balance.json"
+    suite_path = tmp_path / "evaluation-pre-freeze-balance.json"
     suite_path.write_text(
         json.dumps(
             {
                 "schema_version": 1,
-                "suite_id": "phase8b-pre-freeze-balance",
+                "suite_id": "evaluation-pre-freeze-balance",
                 "suite_version": 1,
                 "task_ids": list(_ALL_TASK_IDS),
             }

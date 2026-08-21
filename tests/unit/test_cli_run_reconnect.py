@@ -7,13 +7,37 @@ from typing import Any
 
 import pytest
 
+import kama_claude.cli.main as cli_main_module
 from kama_claude.cli.commands import run as run_module
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.transport.socket_client import EventDelivery
 
-# Phase 7C 的 CLI run reconnect 行为集中在本模块。
+# CLI run reconnect 行为集中在本模块。
 
 type DeliveryHandler = Callable[[EventDelivery], Awaitable[None]]
+
+
+# 功能：验证 CLI main 的 --mode plan 会把模式传入 run command，而不是改写 goal
+# 设计：替换 cmd_run 和 daemon 配置边界，直接断言 argparse 到 command 的 typed 参数映射
+def test_cli_main_passes_plan_mode_to_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(cli_main_module, "get_config", lambda: KamaConfig())
+    monkeypatch.setattr(cli_main_module, "setup_logging", lambda _config: None)
+    monkeypatch.setattr(
+        cli_main_module,
+        "cmd_run",
+        lambda goal, _config, *, agent_mode="direct": captured.append((goal, agent_mode)),
+    )
+    monkeypatch.setattr(
+        cli_main_module.sys,
+        "argv",
+        ["kama", "run", "--mode", "plan", "--goal", "/Users/project goal"],
+    )
+
+    cli_main_module.main()
+
+    assert captured == [("/Users/project goal", "plan")]
 
 
 class _ReconnectRunClient:
@@ -179,7 +203,14 @@ async def test_run_sends_canonical_client_cwd(
         (
             "event.subscribe",
             {
-                "topics": ["run.*", "step.*", "tool.*", "llm.token", "llm.usage"],
+                    "topics": [
+                        "run.*",
+                        "step.*",
+                        "tool.*",
+                        "llm.token",
+                        "llm.usage",
+                        "planner.*",
+                    ],
                 "scope": "run:run-test",
                 "after_seq": 0,
             },

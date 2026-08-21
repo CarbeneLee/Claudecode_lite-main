@@ -62,6 +62,11 @@ _STABLE_ERROR_TYPES: frozenset[str] = frozenset(
         "rollback_failed",
         "merge_conflict",
         "semantic_index_unavailable",
+        "scope_denied",
+        "scope_required",
+        "external_workspace_drift",
+        "scope_mutation_inconclusive",
+        "scope_audit_failed",
     }
 )
 RETRYABLE_ERROR_TYPES: frozenset[str] = frozenset(

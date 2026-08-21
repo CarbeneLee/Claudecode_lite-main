@@ -10,13 +10,14 @@ from pathlib import Path
 from typing import Any
 
 from kama_claude.core.config import KamaConfig
+from kama_claude.core.plan_view import PlanReadyCommitReducer
 from kama_claude.core.transport.socket_client import (
     EventDelivery,
     IpcError,
     SocketClient,
 )
 
-_RUN_TOPICS = ["run.*", "step.*", "tool.*", "llm.token", "llm.usage"]
+_RUN_TOPICS = ["run.*", "step.*", "tool.*", "llm.token", "llm.usage", "planner.*"]
 _MAX_RECONNECT_ATTEMPTS = 3
 _RECONNECT_DELAY_S = 0.1
 _DAEMON_RESTART_ERROR = (
@@ -34,12 +35,39 @@ class StdoutPrinter:
     def __init__(self) -> None:
         self._inline = False  # True while LLM tokens are mid-line
         self._run_start: float = 0.0
+        self._plan_reducer = PlanReadyCommitReducer()
 
     # 若当前行有未换行的 token，补一个换行符
     def _ensure_newline(self) -> None:
         if self._inline:
             print()
             self._inline = False
+
+    # 输出已经通过 run.finished(success) 提交的结构化 PlanView
+    def _print_committed_plans(self, event: dict[str, Any]) -> None:
+        try:
+            plans = self._plan_reducer.ingest(event)
+        except (TypeError, ValueError):
+            log.warning("invalid PlanReady event ignored by CLI renderer")
+            return
+        for plan in plans:
+            payload = plan.model_dump(mode="json")
+            print("[plan] generated")
+            print(f"  goal: {payload.get('goal', '')}")
+            print(f"  approach: {payload.get('selected_approach', '')}")
+            for key, label in (
+                ("intended_changes", "intended changes"),
+                ("files_to_modify", "files to modify"),
+                ("files_to_create", "files to create"),
+                ("unresolved_questions", "unresolved"),
+                ("assumptions", "assumptions"),
+                ("dependency_changes", "dependency changes"),
+                ("protocol_or_schema_changes", "protocol/schema changes"),
+                ("verification_plan", "verification"),
+            ):
+                values = payload.get(key) or []
+                if values:
+                    print(f"  {label}: {values}")
 
     # 根据事件 type 字段分发并格式化打印到 stdout/stderr
     async def handle(self, event: dict[str, Any]) -> None:
@@ -79,6 +107,10 @@ class StdoutPrinter:
             self._ensure_newline()
             elapsed = time.monotonic() - self._run_start
             print(f"[run] {event.get('status', '')}  {event.get('steps')} steps  {elapsed:.1f}s")
+            self._print_committed_plans(event)
+
+        elif t == "planner.decision_ready":
+            self._print_committed_plans(event)
 
 
 class _DeliveryGate:
@@ -211,7 +243,12 @@ def _caller_is_cancelling() -> bool:
 
 
 # 异步核心：先启动 run，再按 run stream 游标订阅并有界重连
-async def _run_async(goal: str, config: KamaConfig) -> int:
+async def _run_async(
+    goal: str,
+    config: KamaConfig,
+    *,
+    agent_mode: str = "direct",
+) -> int:
     printer = StdoutPrinter()
     finished = asyncio.Event()
     daemon_changed = asyncio.Event()
@@ -219,6 +256,7 @@ async def _run_async(goal: str, config: KamaConfig) -> int:
     run_id = ""
     stream_id = ""
     cursor = 0
+    rendered_event_ids: set[str] = set()
     daemon_instance_id: str | None = None
     client = SocketClient(config.host, config.port)
     loop_task: asyncio.Task[None] | None = None
@@ -234,7 +272,11 @@ async def _run_async(goal: str, config: KamaConfig) -> int:
         if delivery.stream_id != stream_id:
             return
         event = delivery.event
-        if event.get("run_id") == run_id:
+        event_id = delivery.event_id
+        duplicate = event_id is not None and event_id in rendered_event_ids
+        if event_id is not None:
+            rendered_event_ids.add(event_id)
+        if event.get("run_id") == run_id and not duplicate:
             await printer.handle(event)
         if delivery.seq is not None:
             cursor = max(cursor, delivery.seq)
@@ -255,12 +297,15 @@ async def _run_async(goal: str, config: KamaConfig) -> int:
         client.on_delivery(gate.handle)
         loop_task = asyncio.create_task(client.run_event_loop())
         try:
+            agent_params: dict[str, Any] = {
+                "goal": goal,
+                "workspace_root": str(Path.cwd().resolve()),
+            }
+            if agent_mode != "direct":
+                agent_params["agent_mode"] = agent_mode
             started = await client.send_command(
                 "agent.run",
-                {
-                    "goal": goal,
-                    "workspace_root": str(Path.cwd().resolve()),
-                },
+                agent_params,
             )
         except asyncio.CancelledError:
             if _caller_is_cancelling():
@@ -375,9 +420,9 @@ async def _run_async(goal: str, config: KamaConfig) -> int:
 
 
 # 执行 kama run --goal "..." 命令
-def cmd_run(goal: str, config: KamaConfig) -> None:
+def cmd_run(goal: str, config: KamaConfig, *, agent_mode: str = "direct") -> None:
     try:
-        exit_code = asyncio.run(_run_async(goal, config))
+        exit_code = asyncio.run(_run_async(goal, config, agent_mode=agent_mode))
     except KeyboardInterrupt:
         sys.exit(130)
     sys.exit(exit_code)

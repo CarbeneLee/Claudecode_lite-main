@@ -362,7 +362,7 @@ async def test_evaluator_classifies_missing_grader_command(tmp_path: Path) -> No
 
 # 功能：验证 CLI 只接受单任务单 attempt 的 run 命令
 # 设计：检查 run namespace 没有 provider/repeats，再让 compare、baseline 和 provider 参数解析失败
-def test_cli_exposes_only_phase8a_run_command() -> None:
+def test_cli_exposes_only_evaluation_run_command() -> None:
     args = _parse_args(["run", "--task", "task-a", "--output", "artifacts"])
 
     assert args.command == "run"
@@ -437,7 +437,7 @@ Path(args.result).write_text(json.dumps({
 # 功能：验证真实 parent subprocess 边界可贯通 collector、grader、metrics 和 report
 # 设计：test-only worker 从 public request 产出 canonical artifacts，并主动断言 request 无 private value
 @pytest.mark.asyncio
-async def test_phase8a_vertical_slice_uses_public_only_worker_request(
+async def test_evaluation_vertical_slice_uses_public_only_worker_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     script = tmp_path / "vertical_worker.py"

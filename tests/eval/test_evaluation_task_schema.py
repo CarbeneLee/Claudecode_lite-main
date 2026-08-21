@@ -34,7 +34,7 @@ def test_public_task_schema_is_minimal_and_strict() -> None:
 
 
 # 功能：验证 private grader criterion 仅支持文件状态与 argv 命令且拒绝 shell 字符串
-# 设计：直接构造允许与禁止的判别类型，锁定 Phase 8A grader 能力而不依赖 runner
+# 设计：直接构造允许与禁止的判别类型，锁定 evaluation grader 能力而不依赖 runner
 def test_private_criteria_are_rule_only_and_command_uses_argv() -> None:
     file_criterion = FileContainsCriterion(
         id="contains-result",

@@ -50,7 +50,7 @@ def _write_public_outcome(execution: AttemptExecution) -> None:
     )
 
 
-# 运行一个 Phase 8A task，收集客观证据并生成单 attempt 公开报告
+# 运行一个 evaluation task，收集客观证据并生成单 attempt 公开报告
 async def evaluate_task(
     task_dir: Path | str,
     output_root: Path | str,

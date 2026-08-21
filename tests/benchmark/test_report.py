@@ -419,7 +419,7 @@ def test_benchmark_cli_exposes_only_fixed_suite_run() -> None:
             cli._parse_args(forbidden)
 
 
-# 写入一次带 matching runtime identity evidence 的 fake Phase 8A artifact 与公开 report
+# 写入一次带 matching runtime identity evidence 的 fake evaluation artifact 与公开 report
 def _write_fake_evaluation(
     task_dir: Path | str,
     output: Path | str,
@@ -735,7 +735,7 @@ def _write_cli_experiment_profile(
 
 
 # 功能：验证 CLI execution 贯通真实 suite、orchestrator、analyzer 与 baseline writer
-# 设计：只替换 Phase 8A evaluator，并提供 matching trace/journal，验证 declaration 到 report 全链路
+# 设计：只替换 evaluation evaluator，并提供 matching trace/journal，验证 declaration 到 report 全链路
 @pytest.mark.asyncio
 async def test_execute_benchmark_wires_real_observer_pipeline(
     tmp_path: Path,
@@ -831,7 +831,7 @@ async def test_execute_experiment_identity_mismatch_is_invalid(
     )
     monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-be-serialized")
 
-    # 生成合法 Phase 8A report，但 runtime identity 故意声明错误 max_steps
+    # 生成合法 evaluation report，但 runtime identity 故意声明错误 max_steps
     async def mismatched_evaluator(
         task_dir: Path | str,
         evaluation_output: Path | str,

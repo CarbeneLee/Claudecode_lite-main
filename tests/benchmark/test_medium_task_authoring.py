@@ -99,7 +99,7 @@ def _medium_task(tmp_path: Path, task_id: str) -> LoadedBenchmarkTask:
         json.dumps(
             {
                 "schema_version": 1,
-                "suite_id": "phase8b-batch1-authoring",
+                "suite_id": "evaluation-batch-one-authoring",
                 "suite_version": 1,
                 "task_ids": [task_id],
             }
@@ -137,7 +137,7 @@ def _apply_patch(workspace: Path, patch: Path) -> None:
     )
 
 
-# 在 fresh copy 上运行真实 Phase 8A rule grader并保留确定性证据
+# 在 fresh copy 上运行真实 evaluation rule grader并保留确定性证据
 async def _grade_snapshot(
     task: LoadedBenchmarkTask,
     root: Path,
@@ -278,7 +278,7 @@ def test_medium_task_public_bundles_are_hygienic_and_leak_free(
 
 
 # 功能：验证 medium tasks 的完整 candidate matrix 且三次 fresh-copy 结果一致
-# 设计：对 pristine/reference/alternative/三个 wrong probes 运行真实 Phase 8A grader
+# 设计：对 pristine/reference/alternative/三个 wrong probes 运行真实 evaluation grader
 @pytest.mark.asyncio
 @pytest.mark.parametrize("task_id", _MEDIUM_TASK_IDS)
 async def test_medium_task_validation_matrix_is_correct_and_deterministic(

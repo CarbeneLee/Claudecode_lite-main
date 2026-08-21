@@ -1380,7 +1380,7 @@ def generate_final_preflight(
     )
     control_command = build_command_spec(
         arm="control",
-        interpreter_label="phase9d-python",
+        interpreter_label="paired-experiment-python",
         interpreter_sha256=environment.interpreter_file_sha256,
         worktree_label=control_evidence.worktree.label,
         worktree_sha256=control_evidence.worktree.canonical_path_sha256,
@@ -1390,7 +1390,7 @@ def generate_final_preflight(
     )
     treatment_command = build_command_spec(
         arm="treatment",
-        interpreter_label="phase9d-python",
+        interpreter_label="paired-experiment-python",
         interpreter_sha256=environment.interpreter_file_sha256,
         worktree_label=treatment_evidence.worktree.label,
         worktree_sha256=treatment_evidence.worktree.canonical_path_sha256,
@@ -1875,7 +1875,7 @@ def execute_from_artifacts(args: argparse.Namespace) -> PairExecutionSummary:
         raise ValueError("execution worktree identity drift")
     control_spec = build_command_spec(
         arm="control",
-        interpreter_label="phase9d-python",
+        interpreter_label="paired-experiment-python",
         interpreter_sha256=current_environment.interpreter_file_sha256,
         worktree_label=control_evidence.worktree.label,
         worktree_sha256=control_evidence.worktree.canonical_path_sha256,
@@ -1885,7 +1885,7 @@ def execute_from_artifacts(args: argparse.Namespace) -> PairExecutionSummary:
     )
     treatment_spec = build_command_spec(
         arm="treatment",
-        interpreter_label="phase9d-python",
+        interpreter_label="paired-experiment-python",
         interpreter_sha256=current_environment.interpreter_file_sha256,
         worktree_label=treatment_evidence.worktree.label,
         worktree_sha256=treatment_evidence.worktree.canonical_path_sha256,
@@ -2043,9 +2043,9 @@ def execute_from_artifacts(args: argparse.Namespace) -> PairExecutionSummary:
     )
 
 
-# 构建仅包含offline observer边界的Phase 9D参数解析器
+# 构建仅包含 offline observer 边界的 paired-experiment 参数解析器
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="phase9d-paired")
+    parser = argparse.ArgumentParser(prog="kama-paired-experiment")
     subcommands = parser.add_subparsers(dest="command", required=True)
     preflight = subcommands.add_parser("preflight")
     preflight.add_argument("--receipt", required=True)
@@ -2158,7 +2158,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return _main(argv)
     except (OSError, RuntimeError, ValueError):
-        print("phase9d paired observer failed", file=sys.stderr)
+        print("paired experiment observer failed", file=sys.stderr)
         return 2
 
 

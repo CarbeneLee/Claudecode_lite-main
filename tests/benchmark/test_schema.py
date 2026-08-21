@@ -17,7 +17,7 @@ def _schema_module() -> ModuleType:
         pytest.fail("benchmark schema module is missing")
 
 
-# 创建一个与 Phase 8A 合同兼容的最小 benchmark task
+# 创建一个与 evaluation 合同兼容的最小 benchmark task
 def _write_task(
     tasks_root: Path,
     *,
@@ -202,9 +202,9 @@ def test_suite_manifest_is_strict_unique_and_bounded() -> None:
             schema.SuiteManifest.model_validate(invalid)
 
 
-# 功能：验证 suite loader 对齐 suite、benchmark metadata、Phase 8A task 与 private criteria
-# 设计：创建三个真实临时 task 并加载，证明 benchmark 只在 Phase 8A task 外附加 observer metadata
-def test_load_suite_reuses_phase8a_tasks_and_keeps_metadata_external(
+# 功能：验证 suite loader 对齐 suite、benchmark metadata、evaluation task 与 private criteria
+# 设计：创建三个真实临时 task 并加载，证明 benchmark 只在 evaluation task 外附加 observer metadata
+def test_load_suite_reuses_evaluation_tasks_and_keeps_metadata_external(
     tmp_path: Path,
 ) -> None:
     schema = _schema_module()

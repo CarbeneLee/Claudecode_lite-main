@@ -1,6 +1,6 @@
 services:
   daemon:
-    image: ${KAMA_IMAGE:-kamaclaude:phase6}
+    image: ${KAMA_IMAGE:-kamaclaude:docker-smoke}
     build:
       context: .
       target: runtime
@@ -40,7 +40,7 @@ services:
     stop_grace_period: 30s
 
   client:
-    image: ${KAMA_IMAGE:-kamaclaude:phase6}
+    image: ${KAMA_IMAGE:-kamaclaude:docker-smoke}
     command: ["kama", "ping"]
     working_dir: /workspace
     environment:

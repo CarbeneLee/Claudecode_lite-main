@@ -21,7 +21,7 @@ _IDENT_ENV = {
     "GIT_COMMITTER_EMAIL": "u@u",
 }
 
-# P7 指标表：5 个 evaluation case 各自记录指标，preflight 统一校验（镜像 phase9d 冻结产物风格）
+# 7 个 evaluation case 各自记录指标，preflight 统一校验
 _METRICS: dict[str, float] = {}
 _METRIC_THRESHOLDS: dict[str, tuple[float, str]] = {
     "rollback.tree_hash_consistency": (1.0, "=="),   # 回滚后 HEAD == checkpoint 哈希，100%
@@ -227,7 +227,7 @@ async def test_case5_crash_recovery(repo: Path) -> None:
 
 # ── 指标 preflight：完整性与阈值 ────────────────────────────────────────────────
 
-# 功能：验证 5 个 case 的指标全部记录且满足阈值表（镜像 phase9d 冻结产物校验风格）
+# 功能：验证 5 个 case 的指标全部记录且满足阈值表
 # 设计：缺失任一 metric 即失败；逐项比较值与阈值
 def test_metrics_report_complete_and_within_thresholds() -> None:
     missing = [key for key in _METRIC_THRESHOLDS if key not in _METRICS]

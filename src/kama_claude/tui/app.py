@@ -19,7 +19,21 @@ from textual.message import Message
 from textual.widget import Widget
 from textual.widgets import Label, Static, TextArea
 
+from kama_claude.core.approval import (
+    ApprovalRequestOwner,
+    ApprovalSnapshot,
+    ApprovalSnapshotRelation,
+    ApprovalSnapshotState,
+    CommittedApprovalTarget,
+    approval_snapshot_from_payload,
+)
 from kama_claude.core.config import KamaConfig
+from kama_claude.core.plan_view import PlanReadyCommitReducer, PlanViewV1
+from kama_claude.core.session.model import (
+    AgentModeSnapshot,
+    ModeSnapshotRelation,
+    compare_agent_mode_snapshots,
+)
 from kama_claude.core.skills.loader import SkillLoader
 from kama_claude.core.transport.socket_client import EventDelivery, IpcError, SocketClient
 
@@ -27,6 +41,13 @@ log = logging.getLogger(__name__)
 
 type _DaemonTransition = Literal["initial", "same", "changed"]
 type _DeliveryConsumer = Callable[[EventDelivery], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class _ModeRequestOwner:
+    client: SocketClient
+    session_id: str
+    daemon_instance_id: str | None
 
 _RECONNECT_ATTEMPT_LIMIT = 5
 _RECONNECT_DELAY_SECONDS = 2.0
@@ -42,6 +63,8 @@ _EVENT_TOPICS = [
     "context.*",
     "subagent.*",
     "skill.*",
+    "planner.*",
+    "plan.*",
 ]
 
 
@@ -717,6 +740,17 @@ class KamaTuiApp(App[None]):
         self._connection_ready = False
         self._reported_session_unknown_daemon_id: str | None = None
         self._last_context_pct: float = 0.0
+        self._agent_mode = "direct"
+        self._agent_mode_revision = 0
+        self._mode_snapshot: AgentModeSnapshot | None = None
+        self._mode_refresh_required = False
+        self._mode_refresh_in_flight = False
+        self._mode_refresh_task: asyncio.Task[None] | None = None
+        self._plan_reducer = PlanReadyCommitReducer()
+        self._approval_targets: dict[str, CommittedApprovalTarget] = {}
+        self._approval_states: dict[str, ApprovalSnapshotState] = {}
+        self._approval_refresh_required: set[str] = set()
+        self._approval_refresh_tasks: dict[str, asyncio.Task[None]] = {}
         self._slash_items: list[tuple[str, str]] = []
         self._subagent_run_ids: dict[str, str] = {}  # child run_id -> description
         self._subagent_start_times: dict[str, float] = {}  # child run_id -> start time
@@ -758,7 +792,14 @@ class KamaTuiApp(App[None]):
 
     # 构建斜杠命令候选列表：内建命令 + 所有已注册 skill
     def _build_slash_items(self) -> list[tuple[str, str]]:
-        items: list[tuple[str, str]] = [("compact", "compress context window")]
+        items: list[tuple[str, str]] = [
+            ("plan", "use the trusted planning-only mode"),
+            ("direct", "use the normal coding mode"),
+            ("mode", "show the daemon mode"),
+            ("approve", "approve the exact committed plan"),
+            ("reject", "reject the exact committed plan"),
+            ("compact", "compress context window"),
+        ]
         try:
             loader = SkillLoader(Path.cwd().resolve(strict=True))
             for skill in loader.list_all_skills():
@@ -841,6 +882,33 @@ class KamaTuiApp(App[None]):
         if not content:
             return
         # 检测 /compact 指令
+        if content in ("/plan", "/direct", "/mode"):
+            event.text_area.text = ""
+            if self._client is not None and self._session_id is not None and not self._busy:
+                self.run_worker(
+                    self._do_mode_command(content),
+                    name="agent_mode",
+                    exclusive=False,
+                )
+            return
+        if content == "/approve" or content.startswith("/approve "):
+            event.text_area.text = ""
+            if self._client is not None and self._session_id is not None and not self._busy:
+                self.run_worker(
+                    self._do_approval_command(content, "approve"),
+                    name="approval",
+                    exclusive=False,
+                )
+            return
+        if content == "/reject" or content.startswith("/reject "):
+            event.text_area.text = ""
+            if self._client is not None and self._session_id is not None and not self._busy:
+                self.run_worker(
+                    self._do_approval_command(content, "reject"),
+                    name="approval",
+                    exclusive=False,
+                )
+            return
         if content == "/compact":
             event.text_area.text = ""
             if self._client is not None and self._session_id is not None and not self._busy:
@@ -858,6 +926,102 @@ class KamaTuiApp(App[None]):
         self._append(Static(f"[bold]>[/bold] {content}", classes="user-turn"))
         self._update_header("running")
         self.run_worker(self._do_send_message(content), name="send_message", exclusive=False)
+
+    # 解析一个精确 projection key 并发送 approval command
+    async def _do_approval_command(
+        self,
+        content: str,
+        action: Literal["approve", "reject"],
+    ) -> None:
+        parts = content.split(maxsplit=1)
+        projection_key = parts[1].strip() if len(parts) == 2 else None
+        if projection_key is None:
+            if len(self._approval_targets) != 1:
+                self._append(
+                    Static(
+                        "[red]approval target unavailable or ambiguous[/red]",
+                        classes="log-line",
+                    )
+                )
+                return
+            projection_key = next(iter(self._approval_targets))
+        target = self._approval_targets.get(projection_key)
+        state = self._approval_states.get(projection_key)
+        owner = self._capture_approval_owner(target) if target is not None else None
+        client = self._client
+        if target is None or state is None or owner is None or client is None:
+            self._append(Static("[red]approval target is stale[/red]", classes="log-line"))
+            return
+        if not state.snapshot.commit_receipt_digest:
+            self._approval_refresh_required.add(projection_key)
+            self._schedule_approval_refresh(projection_key)
+            task = self._approval_refresh_tasks.get(projection_key)
+            if task is not None:
+                await task
+        receipt_digest = state.snapshot.commit_receipt_digest
+        if not receipt_digest:
+            self._append(Static("[red]approval authority unavailable[/red]", classes="log-line"))
+            return
+        try:
+            result = await client.send_command(
+                f"plan.{action}",
+                {
+                    "session_id": target.session_id,
+                    "projection_key": target.projection_key,
+                    "decision_id": target.decision_id,
+                    "decision_version": target.decision_version,
+                    "content_digest": target.decision_content_digest,
+                    "commit_receipt_digest": receipt_digest,
+                },
+            )
+        except asyncio.CancelledError:
+            if _caller_is_cancelling():
+                raise
+            return
+        except (IpcError, RuntimeError, OSError):
+            self._append(Static("[red]approval request failed[/red]", classes="log-line"))
+            return
+        if self._is_current_mode_request_owner(
+            _ModeRequestOwner(client, owner.session_id, owner.daemon_instance_id)
+        ):
+            if not self._merge_approval_response(dict(result)):
+                self._append(
+                    Static(
+                        "[red]approval response rejected as stale[/red]",
+                        classes="log-line",
+                    )
+                )
+
+    # 处理 TUI 的 mode command，只通过 daemon 改变持久化 session mode
+    async def _do_mode_command(self, content: str) -> None:
+        owner = self._capture_mode_request_owner()
+        if owner is None:
+            return
+        if content == "/mode":
+            method = "session.get_agent_mode"
+            params = {"session_id": owner.session_id}
+        else:
+            method = "session.set_agent_mode"
+            params = {
+                "session_id": owner.session_id,
+                "agent_mode": "plan" if content == "/plan" else "direct",
+            }
+        try:
+            result = await owner.client.send_command(method, params)
+            if not self._is_current_mode_request_owner(owner):
+                log.debug("discarding stale mode command response")
+                return
+            snapshot = AgentModeSnapshot(
+                agent_mode=result["agent_mode"],
+                revision=result["revision"],
+            )
+            self._apply_mode_authority(snapshot)
+            self._append(
+                Static(f"[mode: {self._agent_mode}]", classes="log-line")
+            )
+        except (IpcError, RuntimeError, OSError, KeyError, TypeError, ValueError):
+            log.warning("tui command failed role=agent_mode")
+            self._append(Static("[red]mode command failed[/red]", classes="log-line"))
 
     # 在 worker 中执行手动压缩命令，完成后显示结果横幅
     async def _do_compact(self) -> None:
@@ -1027,7 +1191,7 @@ class KamaTuiApp(App[None]):
     def _update_header(self, state: str) -> None:
         try:
             header = self.query_one("#header", Label)
-        except NoMatches:
+        except Exception:
             return
         session = f"  [dim]{self._session_id}[/dim]" if self._session_id else ""
         color = {
@@ -1038,7 +1202,8 @@ class KamaTuiApp(App[None]):
         }.get(state, "dim")
         header.update(
             f"[bold]KamaClaude[/bold]  [dim]{self._host}:{self._port}[/dim]"
-            f"{session}  [{color}]{state}[/{color}]"
+            f"{session}  [magenta]MODE:{self._agent_mode.upper()}[/magenta]"
+            f"  [{color}]{state}[/{color}]"
         )
 
     # 根据已恢复的 session 状态设置输入框和顶部状态
@@ -1079,6 +1244,247 @@ class KamaTuiApp(App[None]):
             except Exception:
                 log.warning("secondary cleanup failed role=tui_permission_widget_clear")
         self._permission_selects.clear()
+        self._plan_reducer = PlanReadyCommitReducer()
+        for task in self._approval_refresh_tasks.values():
+            if not task.done():
+                task.cancel()
+        self._approval_refresh_tasks.clear()
+        self._approval_targets.clear()
+        self._approval_states.clear()
+        self._approval_refresh_required.clear()
+        self._mode_snapshot = None
+        self._agent_mode = "direct"
+        self._agent_mode_revision = 0
+        self._mode_refresh_required = False
+
+    # 捕获 mode RPC 发起时的 client、session 和 daemon 所有者
+    def _capture_mode_request_owner(self) -> _ModeRequestOwner | None:
+        if self._client is None or self._session_id is None:
+            return None
+        return _ModeRequestOwner(
+            client=self._client,
+            session_id=self._session_id,
+            daemon_instance_id=self._reconnect_state.daemon_instance_id,
+        )
+
+    # 为 committed projection 建立当前 TUI view 的 approval owner
+    def _capture_approval_owner(
+        self,
+        target: CommittedApprovalTarget,
+    ) -> ApprovalRequestOwner | None:
+        if self._client is None or self._session_id != target.session_id:
+            return None
+        return ApprovalRequestOwner(
+            client_identity="tui",
+            session_id=target.session_id,
+            daemon_instance_id=self._reconnect_state.daemon_instance_id or "",
+            projection_key=target.projection_key,
+        )
+
+    # 记录 PlanView 的 exact decision identity，禁止用最新文本猜测 approval target
+    def _register_committed_plan(self, plan: PlanViewV1) -> None:
+        if self._session_id is None:
+            return
+        target = CommittedApprovalTarget.from_plan(self._session_id, plan)
+        owner = self._capture_approval_owner(target)
+        if owner is None:
+            return
+        state = self._approval_states.get(plan.projection_key)
+        if state is None or state.owner != owner:
+            state = ApprovalSnapshotState(owner)
+            self._approval_states[plan.projection_key] = state
+        self._approval_targets[plan.projection_key] = target
+        self._approval_refresh_required.add(plan.projection_key)
+
+    # 验证 approval response/event 仍绑定当前 committed decision
+    def _parse_approval_payload(
+        self,
+        target: CommittedApprovalTarget,
+        payload: dict[str, Any],
+    ) -> ApprovalSnapshot | None:
+        if not target.matches_payload(payload):
+            log.warning(
+                "approval identity mismatch ignored projection_key=%s",
+                target.projection_key,
+            )
+            return None
+        try:
+            return approval_snapshot_from_payload(payload)
+        except (KeyError, TypeError, ValueError):
+            log.warning(
+                "invalid approval snapshot ignored projection_key=%s",
+                target.projection_key,
+            )
+            return None
+
+    # 处理非权威 approval event，冲突只登记 deferred refresh
+    def _handle_approval_event(self, event: dict[str, Any]) -> None:
+        projection_key = str(event.get("projection_key", ""))
+        target = self._approval_targets.get(projection_key)
+        state = self._approval_states.get(projection_key)
+        if target is None or state is None:
+            return
+        payload = dict(event)
+        payload["decision_id"] = target.decision_id
+        payload["decision_version"] = target.decision_version
+        payload["content_digest"] = target.decision_content_digest
+        snapshot = self._parse_approval_payload(target, payload)
+        if snapshot is None:
+            return
+        relation = state.merge(snapshot)
+        if relation is ApprovalSnapshotRelation.CONFLICT:
+            self._approval_refresh_required.add(projection_key)
+        if relation in (
+            ApprovalSnapshotRelation.APPLY,
+            ApprovalSnapshotRelation.CONFLICT,
+        ):
+            self._show_approval_snapshot(state.snapshot)
+
+    # 显示通过 approval state machine 接受的状态
+    def _show_approval_snapshot(self, snapshot: ApprovalSnapshot) -> None:
+        self._append(
+            Static(
+                f"[bold cyan]approval[/bold cyan]  {snapshot.status}  "
+                f"[dim]{snapshot.projection_key}[/dim]",
+                classes="log-line",
+            )
+        )
+
+    # 在 delivery callback 返回后安排单 projection authority refresh
+    def _schedule_approval_refresh(self, projection_key: str) -> None:
+        if projection_key not in self._approval_targets:
+            return
+        current = self._approval_refresh_tasks.get(projection_key)
+        if current is not None and not current.done():
+            return
+        try:
+            task = asyncio.create_task(self._run_approval_refresh(projection_key))
+        except RuntimeError:
+            log.warning("approval refresh scheduled without running event loop")
+            return
+        self._approval_refresh_tasks[projection_key] = task
+
+    # 执行 authority GET 并用 owner/epoch 丢弃 stale 或冲突 response
+    async def _run_approval_refresh(self, projection_key: str) -> None:
+        try:
+            while projection_key in self._approval_refresh_required:
+                self._approval_refresh_required.discard(projection_key)
+                target = self._approval_targets.get(projection_key)
+                state = self._approval_states.get(projection_key)
+                if target is None or state is None:
+                    return
+                owner = self._capture_approval_owner(target)
+                client = self._client
+                if owner is None or client is None:
+                    if state.conflict_epoch is not None:
+                        state.fail_refresh(epoch=state.conflict_epoch)
+                    return
+                epoch = state.begin_refresh()
+                try:
+                    result = await client.send_command(
+                        "plan.get_approval",
+                        {
+                            "session_id": target.session_id,
+                            "projection_key": target.projection_key,
+                        },
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except (IpcError, RuntimeError, OSError, KeyError, TypeError, ValueError):
+                    if epoch is not None:
+                        state.fail_refresh(epoch=epoch)
+                    return
+                if not self._is_current_mode_request_owner(
+                    _ModeRequestOwner(client, owner.session_id, owner.daemon_instance_id)
+                ):
+                    return
+                if (
+                    self._approval_targets.get(projection_key) is not target
+                    or self._approval_states.get(projection_key) is not state
+                ):
+                    return
+                payload = dict(result)
+                snapshot = self._parse_approval_payload(target, payload)
+                if snapshot is None:
+                    if epoch is not None:
+                        state.fail_refresh(epoch=epoch)
+                    return
+                if epoch is None:
+                    applied = state.seed_authoritative_snapshot(snapshot, owner=owner)
+                else:
+                    applied = state.apply_authoritative_snapshot(
+                        snapshot,
+                        epoch=epoch,
+                        owner=owner,
+                    )
+                    if not applied:
+                        state.fail_refresh(epoch=epoch)
+                if applied:
+                    self._show_approval_snapshot(snapshot)
+        finally:
+            self._approval_refresh_tasks.pop(projection_key, None)
+
+    # 将 approve/reject RPC 结果走普通 snapshot merge
+    def _merge_approval_response(self, payload: dict[str, Any]) -> bool:
+        projection_key = str(payload.get("projection_key", ""))
+        target = self._approval_targets.get(projection_key)
+        state = self._approval_states.get(projection_key)
+        if target is None or state is None:
+            return False
+        snapshot = self._parse_approval_payload(target, payload)
+        if snapshot is None:
+            return False
+        relation = state.merge(snapshot)
+        if relation is ApprovalSnapshotRelation.CONFLICT:
+            self._approval_refresh_required.add(projection_key)
+        if relation in (
+            ApprovalSnapshotRelation.APPLY,
+            ApprovalSnapshotRelation.CONFLICT,
+        ):
+            self._show_approval_snapshot(state.snapshot)
+        return True
+
+    # 检查 mode RPC 返回时请求是否仍属于当前 view owner
+    def _is_current_mode_request_owner(self, owner: _ModeRequestOwner) -> bool:
+        return (
+            self._client is owner.client
+            and self._session_id == owner.session_id
+            and self._reconnect_state.daemon_instance_id == owner.daemon_instance_id
+        )
+
+    # 将已提交的 PlanView projection 渲染为 TUI 的结构化计划卡片
+    def _render_committed_plan_event(self, event: dict[str, Any]) -> None:
+        try:
+            plans = self._plan_reducer.ingest(event)
+        except (TypeError, ValueError):
+            log.warning("invalid PlanReady event ignored by TUI renderer")
+            return
+        for plan in plans:
+            if isinstance(plan, PlanViewV1):
+                self._register_committed_plan(plan)
+            payload = plan.model_dump(mode="json")
+            lines = [
+                "[bold cyan]Plan generated[/bold cyan]",
+                f"[dim]goal[/dim]  {_preview(str(payload.get('goal', '')), 120)}",
+                f"[dim]approach[/dim]  {_preview(str(payload.get('selected_approach', '')), 120)}",
+            ]
+            for key, label in (
+                ("intended_changes", "intended changes"),
+                ("files_to_modify", "files to modify"),
+                ("files_to_create", "files to create"),
+                ("unresolved_questions", "unresolved"),
+                ("assumptions", "assumptions"),
+                ("dependency_changes", "dependency changes"),
+                ("protocol_or_schema_changes", "protocol/schema changes"),
+                ("verification_plan", "verification"),
+            ):
+                values = payload.get(key) or []
+                if values:
+                    lines.append(f"[dim]{label}[/dim]  {_preview(str(values), 180)}")
+            lines.append(
+                f"[dim]decision[/dim]  {payload.get('decision_key', '')}"
+            )
+            self._append(Static("\n".join(lines), classes="log-line"))
 
     # 显示 daemon 重启或 session 丢失造成的明确历史边界
     def _append_recovery_notice(
@@ -1130,6 +1536,86 @@ class KamaTuiApp(App[None]):
         self._session_id = str(created["session_id"])
         log.info("session created session_id=%s", self._session_id)
 
+    # 应用 daemon 返回的 mode authority，禁止 stale response 降低本地 revision
+    def _apply_mode_authority(self, snapshot: AgentModeSnapshot) -> None:
+        relation = compare_agent_mode_snapshots(self._mode_snapshot, snapshot)
+        if relation in (
+            ModeSnapshotRelation.NEWER,
+            ModeSnapshotRelation.EQUAL_CONFLICT,
+        ):
+            self._mode_snapshot = snapshot
+            self._agent_mode = snapshot.agent_mode
+            self._agent_mode_revision = snapshot.revision
+            self._update_header("running" if self._busy else "ready")
+
+    # 重连后从 daemon 读取权威 agent mode；失败由连接状态机放弃本次连接
+    async def _refresh_agent_mode(
+        self,
+        client: SocketClient,
+        session_id: str,
+    ) -> AgentModeSnapshot | None:
+        try:
+            result = await client.send_command(
+                "session.get_agent_mode",
+                {"session_id": session_id},
+            )
+            snapshot = AgentModeSnapshot(
+                agent_mode=result["agent_mode"],
+                revision=result["revision"],
+            )
+        except (
+            IpcError,
+            RuntimeError,
+            OSError,
+            AssertionError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ):
+            return None
+        return snapshot
+
+    # 在 delivery callback 返回后启动至多一个 deferred mode refresh worker
+    def _schedule_mode_refresh(self) -> None:
+        self._mode_refresh_required = True
+        if self._mode_refresh_in_flight:
+            return
+        if self._mode_refresh_task is not None and not self._mode_refresh_task.done():
+            return
+        try:
+            self._mode_refresh_task = asyncio.create_task(self._run_mode_refresh())
+        except RuntimeError:
+            log.warning("mode refresh scheduled without running event loop")
+
+    # 合并冲突刷新请求，确保同一时间最多一个 authority RPC
+    async def _run_mode_refresh(self) -> None:
+        if self._mode_refresh_in_flight:
+            return
+        self._mode_refresh_in_flight = True
+        try:
+            while self._mode_refresh_required:
+                self._mode_refresh_required = False
+                owner = self._capture_mode_request_owner()
+                if owner is None:
+                    continue
+                snapshot = await self._refresh_agent_mode(owner.client, owner.session_id)
+                if not self._is_current_mode_request_owner(owner):
+                    log.debug("discarding stale deferred mode response")
+                    return
+                if snapshot is None:
+                    log.warning("deferred mode refresh failed")
+                    continue
+                self._apply_mode_authority(snapshot)
+        finally:
+            self._mode_refresh_in_flight = False
+            if asyncio.current_task() is self._mode_refresh_task:
+                self._mode_refresh_task = None
+            if self._mode_refresh_required:
+                try:
+                    asyncio.get_running_loop().call_soon(self._schedule_mode_refresh)
+                except RuntimeError:
+                    log.debug("mode refresh reschedule skipped without event loop")
+
     # 为当前 session/replay 视图建立从已提交 cursor 开始的 durable 订阅
     async def _subscribe_current_view(
         self,
@@ -1157,6 +1643,7 @@ class KamaTuiApp(App[None]):
         try:
             await client.connect()
             client.on_delivery(gate.handle)
+            self._client = client
             loop_task = asyncio.create_task(client.run_event_loop())
 
             phase = "handshake"
@@ -1184,7 +1671,10 @@ class KamaTuiApp(App[None]):
                 try:
                     await client.send_command(
                         "session.get_history",
-                        {"session_id": self._session_id},
+                        {
+                            "session_id": self._session_id,
+                            "include_projection_metadata": True,
+                        },
                     )
                 except IpcError as exc:
                     if exc.code != -32010:
@@ -1213,6 +1703,13 @@ class KamaTuiApp(App[None]):
                         "historical replay stream unavailable on new daemon"
                     ) from None
                 raise
+            owner = self._capture_mode_request_owner()
+            if owner is not None:
+                snapshot = await self._refresh_agent_mode(owner.client, owner.session_id)
+                if snapshot is None or not self._is_current_mode_request_owner(owner):
+                    await gate.discard()
+                    raise _ConnectionLost("authoritative mode query failed")
+                self._apply_mode_authority(snapshot)
             if replay_daemon_changed:
                 self._append(
                     Static(
@@ -1224,6 +1721,9 @@ class KamaTuiApp(App[None]):
             phase = "delivery_open"
             self._client = client
             await gate.open()
+            for projection_key in tuple(self._approval_targets):
+                self._approval_refresh_required.add(projection_key)
+                self._schedule_approval_refresh(projection_key)
             self._connection_ready = True
             self._set_connected_ui()
 
@@ -1349,6 +1849,10 @@ class KamaTuiApp(App[None]):
             self._handle_event_inner(event)
 
         await self._reconnect_state.process_delivery(delivery, render)
+        if self._mode_refresh_required:
+            self._schedule_mode_refresh()
+        for projection_key in tuple(self._approval_refresh_required):
+            self._schedule_approval_refresh(projection_key)
 
     # 实际的事件路由逻辑
     def _handle_event_inner(self, event: dict[str, Any]) -> None:
@@ -1375,6 +1879,24 @@ class KamaTuiApp(App[None]):
                 prompt.focus()
             self._update_header("ready")
 
+        elif t == "session.agent_mode_changed":
+            try:
+                incoming = AgentModeSnapshot(
+                    agent_mode=event["agent_mode"],
+                    revision=event.get("revision", 0),
+                )
+            except (KeyError, TypeError, ValueError):
+                log.warning("invalid agent mode event ignored by TUI")
+                return
+            relation = compare_agent_mode_snapshots(self._mode_snapshot, incoming)
+            if relation is ModeSnapshotRelation.NEWER:
+                self._apply_mode_authority(incoming)
+                self._append(
+                    Static(f"[mode: {self._agent_mode}]", classes="log-line")
+                )
+            elif relation is ModeSnapshotRelation.EQUAL_CONFLICT:
+                self._mode_refresh_required = True
+
         elif t == "session.closed":
             self._busy = False
             prompt = self._prompt()
@@ -1391,6 +1913,12 @@ class KamaTuiApp(App[None]):
                 f"[dim]run[/dim]  [cyan]{run_id}[/cyan]  [dim]{_preview(goal, 96)}[/dim]",
                 classes="run-header",
             ))
+
+        elif t == "planner.decision_ready":
+            self._render_committed_plan_event(event)
+
+        elif t == "plan.approval_changed":
+            self._handle_approval_event(event)
 
         elif t == "skill.invoked":
             skill_name = event.get("skill_name", "")
@@ -1486,6 +2014,7 @@ class KamaTuiApp(App[None]):
                     f"[bold red]✗ failed[/bold red]{detail}  [dim]{steps} steps[/dim]",
                     classes="run-err",
                 ))
+            self._render_committed_plan_event(event)
 
         elif t == "llm.usage":
             run_id = event.get("run_id", "")

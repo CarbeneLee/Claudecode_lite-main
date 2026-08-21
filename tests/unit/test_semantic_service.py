@@ -369,6 +369,29 @@ def test_index_dir_is_hashed_per_workspace(tmp_path) -> None:
     )
 
 
+# 功能：验证语义索引刷新不会在 workspace 内创建或修改缓存文件
+# 设计：记录 workspace 文件快照并要求索引目录位于配置的外部缓存根，隔离只读 grounding 的工作区边界
+async def test_semantic_refresh_does_not_mutate_workspace(tmp_path) -> None:
+    service = _make_service(tmp_path, files={"src/a.py": "def value():\n    return 1\n"})
+    workspace = tmp_path / "ws"
+    before = {
+        path.relative_to(workspace).as_posix(): path.read_bytes()
+        for path in workspace.rglob("*")
+        if path.is_file()
+    }
+
+    await service.ensure_ready()
+
+    after = {
+        path.relative_to(workspace).as_posix(): path.read_bytes()
+        for path in workspace.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+    assert service._index._dir.is_relative_to(tmp_path / "idx")
+    assert not service._index._dir.is_relative_to(workspace)
+
+
 # 功能：验证 close 幂等且关闭后拒绝 refresh
 # 设计：close 两次不抛错（app 级联关闭可重复）；关闭后 refresh 抛 IndexUnavailableError
 async def test_close_is_idempotent_and_rejects_after_close(tmp_path) -> None:

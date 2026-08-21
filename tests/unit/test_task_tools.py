@@ -20,7 +20,7 @@ from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.tools.builtin.task_create import TaskCreateTool
 from kama_claude.core.tools.builtin.task_get import TaskGetTool
 from kama_claude.core.tools.builtin.task_update import TaskUpdateTool
-from kama_claude.core.tools.invocation import invoke_tool
+from kama_claude.core.tools.invocation import DirectToolInvoker, invoke_tool
 from kama_claude.core.tools.registry import ToolRegistry
 
 
@@ -238,7 +238,8 @@ async def test_task_error_result_enters_agent_loop_context(tmp_path: Path) -> No
     registry.register(TaskGetTool(TaskManager(tmp_path)))
     context = ExecutionContext(run_id="run-1", goal="inspect task", max_steps=3)
 
-    await AgentLoop(provider, registry, EventBus()).run(context)
+    bus = EventBus()
+    await AgentLoop(provider, DirectToolInvoker(registry, bus, context.run_id), bus).run(context)
 
     tool_result_message = provider.seen_messages[1][2]
     content = tool_result_message["content"]

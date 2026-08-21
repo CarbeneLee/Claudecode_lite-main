@@ -109,6 +109,7 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
 | `type` | `string` | no |
 | `goal` | `string` | yes |
 | `workspace_root` | `string` | yes |
+| `agent_mode` | `string` | no |
 
 ```json
 {
@@ -125,6 +126,15 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
     },
     "workspace_root": {
       "title": "Workspace Root",
+      "type": "string"
+    },
+    "agent_mode": {
+      "default": "direct",
+      "enum": [
+        "direct",
+        "plan"
+      ],
+      "title": "Agent Mode",
       "type": "string"
     }
   },
@@ -439,6 +449,7 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
 |---|---|---|
 | `type` | `string` | no |
 | `mode` | `string` | no |
+| `agent_mode` | `string` | no |
 | `title` | `string` | no |
 | `workspace_root` | `string` | yes |
 
@@ -458,6 +469,15 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
         "chat"
       ],
       "title": "Mode",
+      "type": "string"
+    },
+    "agent_mode": {
+      "default": "direct",
+      "enum": [
+        "direct",
+        "plan"
+      ],
+      "title": "Agent Mode",
       "type": "string"
     },
     "title": {
@@ -628,6 +648,7 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
 |---|---|---|
 | `type` | `string` | no |
 | `session_id` | `string` | yes |
+| `include_projection_metadata` | `boolean` | no |
 
 ```json
 {
@@ -641,6 +662,11 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
     "session_id": {
       "title": "Session Id",
       "type": "string"
+    },
+    "include_projection_metadata": {
+      "default": false,
+      "title": "Include Projection Metadata",
+      "type": "boolean"
     }
   },
   "required": [
@@ -673,6 +699,142 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
     "messages"
   ],
   "title": "SessionGetHistoryResult",
+  "type": "object"
+}
+```
+
+### SessionGetAgentModeCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "session.get_agent_mode",
+      "default": "session.get_agent_mode",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id"
+  ],
+  "title": "SessionGetAgentModeCommand",
+  "type": "object"
+}
+```
+
+### SessionGetAgentModeResult
+
+| Field | Type | Required |
+|---|---|---|
+| `agent_mode` | `string` | yes |
+| `revision` | `integer` | yes |
+
+```json
+{
+  "properties": {
+    "agent_mode": {
+      "enum": [
+        "direct",
+        "plan"
+      ],
+      "title": "Agent Mode",
+      "type": "string"
+    },
+    "revision": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Revision",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "agent_mode",
+    "revision"
+  ],
+  "title": "SessionGetAgentModeResult",
+  "type": "object"
+}
+```
+
+### SessionSetAgentModeCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `agent_mode` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "session.set_agent_mode",
+      "default": "session.set_agent_mode",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "agent_mode": {
+      "enum": [
+        "direct",
+        "plan"
+      ],
+      "title": "Agent Mode",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "agent_mode"
+  ],
+  "title": "SessionSetAgentModeCommand",
+  "type": "object"
+}
+```
+
+### SessionSetAgentModeResult
+
+| Field | Type | Required |
+|---|---|---|
+| `agent_mode` | `string` | yes |
+| `revision` | `integer` | yes |
+
+```json
+{
+  "properties": {
+    "agent_mode": {
+      "enum": [
+        "direct",
+        "plan"
+      ],
+      "title": "Agent Mode",
+      "type": "string"
+    },
+    "revision": {
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Revision",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "agent_mode",
+    "revision"
+  ],
+  "title": "SessionSetAgentModeResult",
   "type": "object"
 }
 ```
@@ -729,6 +891,794 @@ All commands are sent as JSON-RPC 2.0 requests. The `type` field inside `params`
     "status"
   ],
   "title": "SessionCloseResult",
+  "type": "object"
+}
+```
+
+### PlanGetApprovalCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `projection_key` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "plan.get_approval",
+      "default": "plan.get_approval",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "projection_key": {
+      "title": "Projection Key",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "projection_key"
+  ],
+  "title": "PlanGetApprovalCommand",
+  "type": "object"
+}
+```
+
+### PlanGetApprovalResult
+
+| Field | Type | Required |
+|---|---|---|
+| `session_id` | `string` | yes |
+| `projection_key` | `string` | yes |
+| `status` | `string` | yes |
+| `decision_id` | `string | null` | no |
+| `decision_version` | `integer | null` | no |
+| `content_digest` | `string | null` | no |
+| `commit_receipt_digest` | `string | null` | no |
+| `action` | `string | null` | no |
+| `record_digest` | `string | null` | no |
+
+```json
+{
+  "properties": {
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "projection_key": {
+      "title": "Projection Key",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "pending",
+        "approved",
+        "rejected",
+        "conflicted/unknown"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "decision_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Decision Id"
+    },
+    "decision_version": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Decision Version"
+    },
+    "content_digest": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Content Digest"
+    },
+    "commit_receipt_digest": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Commit Receipt Digest"
+    },
+    "action": {
+      "anyOf": [
+        {
+          "enum": [
+            "approve",
+            "reject"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Action"
+    },
+    "record_digest": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Record Digest"
+    }
+  },
+  "required": [
+    "session_id",
+    "projection_key",
+    "status"
+  ],
+  "title": "PlanGetApprovalResult",
+  "type": "object"
+}
+```
+
+### PlanApproveCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `projection_key` | `string` | yes |
+| `decision_id` | `string` | yes |
+| `decision_version` | `integer` | yes |
+| `content_digest` | `string` | yes |
+| `commit_receipt_digest` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "plan.approve",
+      "default": "plan.approve",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "projection_key": {
+      "title": "Projection Key",
+      "type": "string"
+    },
+    "decision_id": {
+      "title": "Decision Id",
+      "type": "string"
+    },
+    "decision_version": {
+      "title": "Decision Version",
+      "type": "integer"
+    },
+    "content_digest": {
+      "title": "Content Digest",
+      "type": "string"
+    },
+    "commit_receipt_digest": {
+      "title": "Commit Receipt Digest",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "projection_key",
+    "decision_id",
+    "decision_version",
+    "content_digest",
+    "commit_receipt_digest"
+  ],
+  "title": "PlanApproveCommand",
+  "type": "object"
+}
+```
+
+### PlanApproveResult
+
+| Field | Type | Required |
+|---|---|---|
+| `session_id` | `string` | yes |
+| `projection_key` | `string` | yes |
+| `status` | `string` | yes |
+| `decision_id` | `string | null` | no |
+| `decision_version` | `integer | null` | no |
+| `content_digest` | `string | null` | no |
+| `commit_receipt_digest` | `string | null` | no |
+| `action` | `string | null` | no |
+| `record_digest` | `string | null` | no |
+
+```json
+{
+  "properties": {
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "projection_key": {
+      "title": "Projection Key",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "pending",
+        "approved",
+        "rejected",
+        "conflicted/unknown"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "decision_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Decision Id"
+    },
+    "decision_version": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Decision Version"
+    },
+    "content_digest": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Content Digest"
+    },
+    "commit_receipt_digest": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Commit Receipt Digest"
+    },
+    "action": {
+      "anyOf": [
+        {
+          "enum": [
+            "approve",
+            "reject"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Action"
+    },
+    "record_digest": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Record Digest"
+    }
+  },
+  "required": [
+    "session_id",
+    "projection_key",
+    "status"
+  ],
+  "title": "PlanApproveResult",
+  "type": "object"
+}
+```
+
+### PlanRejectCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `projection_key` | `string` | yes |
+| `decision_id` | `string` | yes |
+| `decision_version` | `integer` | yes |
+| `content_digest` | `string` | yes |
+| `commit_receipt_digest` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "plan.reject",
+      "default": "plan.reject",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "projection_key": {
+      "title": "Projection Key",
+      "type": "string"
+    },
+    "decision_id": {
+      "title": "Decision Id",
+      "type": "string"
+    },
+    "decision_version": {
+      "title": "Decision Version",
+      "type": "integer"
+    },
+    "content_digest": {
+      "title": "Content Digest",
+      "type": "string"
+    },
+    "commit_receipt_digest": {
+      "title": "Commit Receipt Digest",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "projection_key",
+    "decision_id",
+    "decision_version",
+    "content_digest",
+    "commit_receipt_digest"
+  ],
+  "title": "PlanRejectCommand",
+  "type": "object"
+}
+```
+
+### PlanRejectResult
+
+| Field | Type | Required |
+|---|---|---|
+| `session_id` | `string` | yes |
+| `projection_key` | `string` | yes |
+| `status` | `string` | yes |
+| `decision_id` | `string | null` | no |
+| `decision_version` | `integer | null` | no |
+| `content_digest` | `string | null` | no |
+| `commit_receipt_digest` | `string | null` | no |
+| `action` | `string | null` | no |
+| `record_digest` | `string | null` | no |
+
+```json
+{
+  "properties": {
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "projection_key": {
+      "title": "Projection Key",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "pending",
+        "approved",
+        "rejected",
+        "conflicted/unknown"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "decision_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Decision Id"
+    },
+    "decision_version": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Decision Version"
+    },
+    "content_digest": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Content Digest"
+    },
+    "commit_receipt_digest": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Commit Receipt Digest"
+    },
+    "action": {
+      "anyOf": [
+        {
+          "enum": [
+            "approve",
+            "reject"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Action"
+    },
+    "record_digest": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Record Digest"
+    }
+  },
+  "required": [
+    "session_id",
+    "projection_key",
+    "status"
+  ],
+  "title": "PlanRejectResult",
+  "type": "object"
+}
+```
+
+### PlanExecuteCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `projection_key` | `string` | yes |
+| `request_id` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "plan.execute",
+      "default": "plan.execute",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "projection_key": {
+      "minLength": 1,
+      "title": "Projection Key",
+      "type": "string"
+    },
+    "request_id": {
+      "minLength": 1,
+      "title": "Request Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "projection_key",
+    "request_id"
+  ],
+  "title": "PlanExecuteCommand",
+  "type": "object"
+}
+```
+
+### PlanExecuteResult
+
+| Field | Type | Required |
+|---|---|---|
+| `session_id` | `string` | yes |
+| `request_id` | `string` | yes |
+| `execution_id` | `string` | yes |
+| `run_id` | `string` | yes |
+| `projection_key` | `string` | yes |
+| `status` | `string` | yes |
+| `status_revision` | `integer` | no |
+| `status_digest` | `string | null` | no |
+| `reason` | `string | null` | no |
+
+```json
+{
+  "properties": {
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "request_id": {
+      "title": "Request Id",
+      "type": "string"
+    },
+    "execution_id": {
+      "title": "Execution Id",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "projection_key": {
+      "title": "Projection Key",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "admitted",
+        "running",
+        "completed_unverified",
+        "failed",
+        "cancelled",
+        "scope_denied",
+        "inconclusive",
+        "interrupted"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "status_revision": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Status Revision",
+      "type": "integer"
+    },
+    "status_digest": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Status Digest"
+    },
+    "reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Reason"
+    }
+  },
+  "required": [
+    "session_id",
+    "request_id",
+    "execution_id",
+    "run_id",
+    "projection_key",
+    "status"
+  ],
+  "title": "PlanExecuteResult",
+  "type": "object"
+}
+```
+
+### PlanGetExecutionCommand
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `request_id` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "plan.get_execution",
+      "default": "plan.get_execution",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "request_id": {
+      "minLength": 1,
+      "title": "Request Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "request_id"
+  ],
+  "title": "PlanGetExecutionCommand",
+  "type": "object"
+}
+```
+
+### PlanGetExecutionResult
+
+| Field | Type | Required |
+|---|---|---|
+| `session_id` | `string` | yes |
+| `request_id` | `string` | yes |
+| `execution_id` | `string` | yes |
+| `run_id` | `string` | yes |
+| `projection_key` | `string` | yes |
+| `status` | `string` | yes |
+| `status_revision` | `integer` | no |
+| `status_digest` | `string | null` | no |
+| `reason` | `string | null` | no |
+
+```json
+{
+  "properties": {
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "request_id": {
+      "title": "Request Id",
+      "type": "string"
+    },
+    "execution_id": {
+      "title": "Execution Id",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "projection_key": {
+      "title": "Projection Key",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "admitted",
+        "running",
+        "completed_unverified",
+        "failed",
+        "cancelled",
+        "scope_denied",
+        "inconclusive",
+        "interrupted"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "status_revision": {
+      "default": 0,
+      "minimum": 0,
+      "title": "Status Revision",
+      "type": "integer"
+    },
+    "status_digest": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Status Digest"
+    },
+    "reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Reason"
+    }
+  },
+  "required": [
+    "session_id",
+    "request_id",
+    "execution_id",
+    "run_id",
+    "projection_key",
+    "status"
+  ],
+  "title": "PlanGetExecutionResult",
   "type": "object"
 }
 ```
@@ -913,6 +1863,8 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | `run_id` | `string` | yes |
 | `goal` | `string` | yes |
 | `ts` | `string` | yes |
+| `execution_id` | `string | null` | no |
+| `execution_status` | `string | null` | no |
 
 ```json
 {
@@ -934,6 +1886,34 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "ts": {
       "title": "Ts",
       "type": "string"
+    },
+    "execution_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Execution Id"
+    },
+    "execution_status": {
+      "anyOf": [
+        {
+          "enum": [
+            "admitted",
+            "running"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Execution Status"
     }
   },
   "required": [
@@ -967,6 +1947,8 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
 | `reason` | `string | null` | no |
 | `steps` | `integer` | yes |
 | `ts` | `string` | yes |
+| `execution_id` | `string | null` | no |
+| `execution_status` | `string | null` | no |
 
 ```json
 {
@@ -1004,6 +1986,40 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
     "ts": {
       "title": "Ts",
       "type": "string"
+    },
+    "execution_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Execution Id"
+    },
+    "execution_status": {
+      "anyOf": [
+        {
+          "enum": [
+            "admitted",
+            "running",
+            "completed_unverified",
+            "failed",
+            "cancelled",
+            "scope_denied",
+            "inconclusive",
+            "interrupted"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Execution Status"
     }
   },
   "required": [
@@ -1863,6 +2879,626 @@ Events written to `runs/<run_id>/events.jsonl` and forwarded over IPC to subscri
   "type": "session.closed",
   "session_id": "sess-abc123def456",
   "ts": "2026-05-16T10:00:00.001Z"
+}
+```
+
+### SessionAgentModeChangedEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `session_id` | `string` | yes |
+| `previous_mode` | `string` | yes |
+| `agent_mode` | `string` | yes |
+| `revision` | `integer` | no |
+| `ts` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "session.agent_mode_changed",
+      "default": "session.agent_mode_changed",
+      "title": "Type",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "previous_mode": {
+      "enum": [
+        "direct",
+        "plan"
+      ],
+      "title": "Previous Mode",
+      "type": "string"
+    },
+    "agent_mode": {
+      "enum": [
+        "direct",
+        "plan"
+      ],
+      "title": "Agent Mode",
+      "type": "string"
+    },
+    "revision": {
+      "default": 0,
+      "maximum": 9223372036854775807,
+      "minimum": 0,
+      "title": "Revision",
+      "type": "integer"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "previous_mode",
+    "agent_mode",
+    "ts"
+  ],
+  "title": "SessionAgentModeChangedEvent",
+  "type": "object"
+}
+```
+
+**Example:**
+
+```json
+{
+  "type": "session.agent_mode_changed",
+  "session_id": "sess-abc123def456",
+  "previous_mode": "direct",
+  "agent_mode": "plan",
+  "revision": 1,
+  "ts": "2026-05-16T10:00:00.001Z"
+}
+```
+
+## Planning Events
+
+### PlannerDecisionReadyEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `event_id` | `string` | yes |
+| `run_id` | `string` | yes |
+| `planner_run_id` | `string` | yes |
+| `session_id` | `string` | yes |
+| `plan` | `? | ?` | yes |
+| `plan_key` | `string` | no |
+| `decision_key` | `string` | no |
+| `projection_key` | `string` | no |
+| `decision_id` | `string` | no |
+| `decision_version` | `integer` | no |
+| `ts` | `string` | yes |
+| `snapshot_digest` | `string` | no |
+| `content_digest` | `string` | no |
+| `decision_content_digest` | `string` | no |
+| `projection_digest` | `string` | no |
+
+```json
+{
+  "$defs": {
+    "LegacyPlanViewV0": {
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "plan_key": {
+          "title": "Plan Key",
+          "type": "string"
+        },
+        "goal": {
+          "title": "Goal",
+          "type": "string"
+        },
+        "architecture_mode": {
+          "default": "preserve",
+          "title": "Architecture Mode",
+          "type": "string"
+        },
+        "requirements": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Requirements",
+          "type": "array"
+        },
+        "selected_approach": {
+          "title": "Selected Approach",
+          "type": "string"
+        },
+        "intended_changes": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Intended Changes",
+          "type": "array"
+        },
+        "existing_patterns_reused": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Existing Patterns Reused",
+          "type": "array"
+        },
+        "files_to_modify": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Files To Modify",
+          "type": "array"
+        },
+        "files_to_create": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Files To Create",
+          "type": "array"
+        },
+        "unresolved": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Unresolved",
+          "type": "array"
+        },
+        "assumptions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Assumptions",
+          "type": "array"
+        },
+        "dependency_changes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Dependency Changes",
+          "type": "array"
+        },
+        "protocol_or_schema_changes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Protocol Or Schema Changes",
+          "type": "array"
+        },
+        "verification_plan": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Verification Plan",
+          "type": "array"
+        },
+        "non_goals": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Non Goals",
+          "type": "array"
+        },
+        "section_budgets": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Section Budgets",
+          "type": "object"
+        },
+        "content_digest": {
+          "default": "",
+          "title": "Content Digest",
+          "type": "string"
+        },
+        "ts": {
+          "default": "",
+          "title": "Ts",
+          "type": "string"
+        }
+      },
+      "required": [
+        "plan_key",
+        "goal",
+        "selected_approach"
+      ],
+      "title": "LegacyPlanViewV0",
+      "type": "object"
+    },
+    "PlanViewV1": {
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "decision_key": {
+          "minLength": 1,
+          "title": "Decision Key",
+          "type": "string"
+        },
+        "projection_key": {
+          "minLength": 1,
+          "title": "Projection Key",
+          "type": "string"
+        },
+        "decision_id": {
+          "minLength": 1,
+          "title": "Decision Id",
+          "type": "string"
+        },
+        "decision_version": {
+          "minimum": 1,
+          "title": "Decision Version",
+          "type": "integer"
+        },
+        "decision_content_digest": {
+          "minLength": 1,
+          "title": "Decision Content Digest",
+          "type": "string"
+        },
+        "architecture_slice_id": {
+          "minLength": 1,
+          "title": "Architecture Slice Id",
+          "type": "string"
+        },
+        "architecture_slice_version": {
+          "minimum": 1,
+          "title": "Architecture Slice Version",
+          "type": "integer"
+        },
+        "architecture_slice_content_digest": {
+          "minLength": 1,
+          "title": "Architecture Slice Content Digest",
+          "type": "string"
+        },
+        "projection_digest": {
+          "minLength": 1,
+          "title": "Projection Digest",
+          "type": "string"
+        },
+        "snapshot_digest": {
+          "minLength": 1,
+          "title": "Snapshot Digest",
+          "type": "string"
+        },
+        "goal": {
+          "title": "Goal",
+          "type": "string"
+        },
+        "architecture_mode": {
+          "title": "Architecture Mode",
+          "type": "string"
+        },
+        "selected_approach": {
+          "title": "Selected Approach",
+          "type": "string"
+        },
+        "requirements": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Requirements",
+          "type": "array"
+        },
+        "existing_patterns_reused": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Existing Patterns Reused",
+          "type": "array"
+        },
+        "intended_changes": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Intended Changes",
+          "type": "array"
+        },
+        "files_to_modify": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Files To Modify",
+          "type": "array"
+        },
+        "files_to_create": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Files To Create",
+          "type": "array"
+        },
+        "allowed_capabilities": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Allowed Capabilities",
+          "type": "array"
+        },
+        "dependency_changes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Dependency Changes",
+          "type": "array"
+        },
+        "protocol_or_schema_changes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Protocol Or Schema Changes",
+          "type": "array"
+        },
+        "verification_plan": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Verification Plan",
+          "type": "array"
+        },
+        "non_goals": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Non Goals",
+          "type": "array"
+        },
+        "assumptions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Assumptions",
+          "type": "array"
+        },
+        "unresolved_questions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Unresolved Questions",
+          "type": "array"
+        },
+        "requires_user_approval": {
+          "const": true,
+          "default": true,
+          "title": "Requires User Approval",
+          "type": "boolean"
+        },
+        "execution_available": {
+          "const": false,
+          "default": false,
+          "title": "Execution Available",
+          "type": "boolean"
+        },
+        "section_limits": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Section Limits",
+          "type": "object"
+        },
+        "omitted_counts": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Omitted Counts",
+          "type": "object"
+        },
+        "truncated_sections": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Truncated Sections",
+          "type": "array"
+        }
+      },
+      "required": [
+        "decision_key",
+        "projection_key",
+        "decision_id",
+        "decision_version",
+        "decision_content_digest",
+        "architecture_slice_id",
+        "architecture_slice_version",
+        "architecture_slice_content_digest",
+        "projection_digest",
+        "snapshot_digest",
+        "goal",
+        "architecture_mode",
+        "selected_approach"
+      ],
+      "title": "PlanViewV1",
+      "type": "object"
+    }
+  },
+  "properties": {
+    "type": {
+      "const": "planner.decision_ready",
+      "default": "planner.decision_ready",
+      "title": "Type",
+      "type": "string"
+    },
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
+    "run_id": {
+      "title": "Run Id",
+      "type": "string"
+    },
+    "planner_run_id": {
+      "title": "Planner Run Id",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "plan": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LegacyPlanViewV0"
+        },
+        {
+          "$ref": "#/$defs/PlanViewV1"
+        }
+      ],
+      "title": "Plan"
+    },
+    "plan_key": {
+      "default": "",
+      "title": "Plan Key",
+      "type": "string"
+    },
+    "decision_key": {
+      "default": "",
+      "title": "Decision Key",
+      "type": "string"
+    },
+    "projection_key": {
+      "default": "",
+      "title": "Projection Key",
+      "type": "string"
+    },
+    "decision_id": {
+      "default": "",
+      "title": "Decision Id",
+      "type": "string"
+    },
+    "decision_version": {
+      "default": 0,
+      "title": "Decision Version",
+      "type": "integer"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    },
+    "snapshot_digest": {
+      "default": "",
+      "title": "Snapshot Digest",
+      "type": "string"
+    },
+    "content_digest": {
+      "default": "",
+      "title": "Content Digest",
+      "type": "string"
+    },
+    "decision_content_digest": {
+      "default": "",
+      "title": "Decision Content Digest",
+      "type": "string"
+    },
+    "projection_digest": {
+      "default": "",
+      "title": "Projection Digest",
+      "type": "string"
+    }
+  },
+  "required": [
+    "event_id",
+    "run_id",
+    "planner_run_id",
+    "session_id",
+    "plan",
+    "ts"
+  ],
+  "title": "PlannerDecisionReadyEvent",
+  "type": "object"
+}
+```
+
+### PlanApprovalChangedEvent
+
+| Field | Type | Required |
+|---|---|---|
+| `type` | `string` | no |
+| `event_id` | `string` | yes |
+| `session_id` | `string` | yes |
+| `projection_key` | `string` | yes |
+| `status` | `string` | yes |
+| `action` | `string` | yes |
+| `record_digest` | `string` | yes |
+| `commit_receipt_digest` | `string` | yes |
+| `ts` | `string` | yes |
+
+```json
+{
+  "properties": {
+    "type": {
+      "const": "plan.approval_changed",
+      "default": "plan.approval_changed",
+      "title": "Type",
+      "type": "string"
+    },
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
+    "session_id": {
+      "title": "Session Id",
+      "type": "string"
+    },
+    "projection_key": {
+      "title": "Projection Key",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "approved",
+        "rejected"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "action": {
+      "enum": [
+        "approve",
+        "reject"
+      ],
+      "title": "Action",
+      "type": "string"
+    },
+    "record_digest": {
+      "title": "Record Digest",
+      "type": "string"
+    },
+    "commit_receipt_digest": {
+      "title": "Commit Receipt Digest",
+      "type": "string"
+    },
+    "ts": {
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "event_id",
+    "session_id",
+    "projection_key",
+    "status",
+    "action",
+    "record_digest",
+    "commit_receipt_digest",
+    "ts"
+  ],
+  "title": "PlanApprovalChangedEvent",
+  "type": "object"
 }
 ```
 

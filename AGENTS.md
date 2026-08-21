@@ -131,3 +131,34 @@ For product-level features after S2, TUI remains the primary frontend and should
 - Never automatically commit or push learning work, and never modify another repository while completing this repository's phase deliverables.
 - Use [docs/learning/README.md](docs/learning/README.md) for the evidence matrix and devlog workflow.
 - Use [docs/learning/devlog/TEMPLATE.md](docs/learning/devlog/TEMPLATE.md) for every new phase learning record.
+
+## Agentic Harness Safety
+
+Agentic test harnesses are part of the runtime safety boundary.
+
+Any test involving AgentLoop, SpawnAgentTool, subagents, orchestration,
+scripted/fake LLM providers, or repeated tool calling MUST be finite by construction.
+
+Required invariants:
+
+1. Scripted/fake providers must implement an explicit finite-state interaction.
+2. Every provider interaction path must have a terminal response.
+3. Unexpected provider calls must raise immediately; never return another tool call as a fallback.
+4. Agentic tests must enforce explicit budgets for:
+   - total provider calls;
+   - root-agent provider calls;
+   - child-agent spawns.
+5. A budget violation is a deterministic test/harness failure. Do not retry it and do not increase the budget merely to obtain a passing test.
+6. Tests must not rely on "the model should eventually stop".
+7. When changing an agentic harness, run the exact affected test before broader focused or full suites.
+8. Do not run multiple broad agentic pytest suites concurrently.
+9. Resource-safety failures must stop the current execution before further tests are launched.
+
+The safety hierarchy is:
+
+    bounded test harness
+    > runtime/test assertions
+    > AGENTS.md instructions
+    > prompt compliance
+
+Prompt instructions are not a substitute for hard harness bounds.

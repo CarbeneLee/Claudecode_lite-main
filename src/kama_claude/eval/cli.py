@@ -9,7 +9,7 @@ from kama_claude.eval.evaluator import evaluate_task
 from kama_claude.eval.failure import FailureCategory
 
 
-# 解析唯一的 Phase 8A run 子命令，不暴露 provider、dataset 或 comparison 参数
+# 解析唯一的 evaluation run 子命令，不暴露 provider、dataset 或 comparison 参数
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="kama-eval")
     commands = parser.add_subparsers(dest="command", required=True)

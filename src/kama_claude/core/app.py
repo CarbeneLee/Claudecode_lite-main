@@ -14,6 +14,11 @@ from typing import Any
 from pydantic import BaseModel
 
 import kama_claude
+from kama_claude.core.approval import (
+    ApprovalConflict,
+    ApprovalError,
+    ApprovalRecordCorrupt,
+)
 from kama_claude.core.bus.commands import (
     AgentRunCommand,
     AgentRunResult,
@@ -25,6 +30,15 @@ from kama_claude.core.bus.commands import (
     EventUnsubscribeResult,
     PermissionRespondCommand,
     PermissionRespondResult,
+    PlanApprovalResult,
+    PlanApproveCommand,
+    PlanExecuteCommand,
+    PlanExecuteResult,
+    PlanGetApprovalCommand,
+    PlanGetApprovalResult,
+    PlanGetExecutionCommand,
+    PlanGetExecutionResult,
+    PlanRejectCommand,
     PongResult,
     SessionCloseCommand,
     SessionCloseResult,
@@ -32,10 +46,14 @@ from kama_claude.core.bus.commands import (
     SessionCompactResult,
     SessionCreateCommand,
     SessionCreateResult,
+    SessionGetAgentModeCommand,
+    SessionGetAgentModeResult,
     SessionGetHistoryCommand,
     SessionGetHistoryResult,
     SessionSendMessageCommand,
     SessionSendMessageResult,
+    SessionSetAgentModeCommand,
+    SessionSetAgentModeResult,
 )
 from kama_claude.core.bus.envelope import INVALID_PARAMS, HandlerError
 from kama_claude.core.config import KamaConfig, get_config
@@ -98,6 +116,7 @@ class CoreApp:
         self._journal: EventJournalCoordinator | None = None
         self._trace: TraceWriter | None = None
         self._config: KamaConfig | None = None
+        # 保留兼容性观察字段；session-backed run task 只由 SessionManager 拥有
         self._running_runs: set[asyncio.Task[Any]] = set()
         self._sessions: SessionManager | None = None
         self._permission_manager: PermissionManager | None = None
@@ -155,63 +174,15 @@ class CoreApp:
             mode="one_shot",
             title=cmd.goal[:40],
             workspace_root=workspace_root,
+            agent_mode=cmd.agent_mode,
         )
         run_id = new_run_id()
-        run_registered: asyncio.Event | None = None
-        if self._journal is None:
-            run_task = asyncio.create_task(
-                self._sessions.send_message(session.id, cmd.goal, run_id=run_id)
-            )
-        else:
-            run_registered = asyncio.Event()
-            run_task = asyncio.create_task(
-                self._sessions.send_message(
-                    session.id,
-                    cmd.goal,
-                    run_id=run_id,
-                    run_registered=run_registered,
-                )
-            )
-        self._running_runs.add(run_task)
-        run_task.add_done_callback(self._running_runs.discard)
-        if run_registered is not None:
-            try:
-                await self._await_run_registration(run_task, run_registered)
-            except asyncio.CancelledError:
-                await self._close_unexposed_session(session.id)
-                raise
-            except Exception:
-                await self._close_unexposed_session(session.id)
-                raise
-        return AgentRunResult(run_id=run_id)
-
-    # 等待 run durable owner 注册，外层取消时回收 detached run 并保留原异常
-    async def _await_run_registration(
-        self,
-        run_task: asyncio.Task[Any],
-        run_registered: asyncio.Event,
-    ) -> None:
-        registered_waiter = asyncio.create_task(run_registered.wait())
         try:
-            done, _pending = await asyncio.wait(
-                {run_task, registered_waiter},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if registered_waiter in done:
-                return
-            await run_task
-            raise RuntimeError("run registration handshake was not completed")
-        except asyncio.CancelledError:
-            run_task.cancel()
-            await self._await_secondary_task(run_task, role="run_startup")
+            await self._sessions.send_message(session.id, cmd.goal, run_id=run_id)
+        except BaseException:
+            await self._close_unexposed_session(session.id)
             raise
-        finally:
-            registered_waiter.cancel()
-            await self._await_secondary_task(
-                registered_waiter,
-                role="registration_waiter",
-                log_failure=False,
-            )
+        return AgentRunResult(run_id=run_id)
 
     # 将未向客户端暴露的 one-shot session 收敛到 durable closed 终态
     async def _close_unexposed_session(self, session_id: str) -> None:
@@ -303,10 +274,11 @@ class CoreApp:
             mode=cmd.mode,
             title=cmd.title,
             workspace_root=workspace_root,
+            agent_mode=cmd.agent_mode,
         )
         return SessionCreateResult(session_id=session.id, status=session.status)
 
-    # 向 session 发送一条用户消息并同步等待对应 run 完成
+    # 向 session 发送一条用户消息并等待 durable run registration 完成
     async def _session_send_handler(self, params: dict[str, Any]) -> SessionSendMessageResult:
         assert self._sessions is not None
         cmd = SessionSendMessageCommand.model_validate(params)
@@ -317,8 +289,113 @@ class CoreApp:
     async def _session_history_handler(self, params: dict[str, Any]) -> SessionGetHistoryResult:
         assert self._sessions is not None
         cmd = SessionGetHistoryCommand.model_validate(params)
-        messages = await self._sessions.get_history(cmd.session_id)
+        messages = await self._sessions.get_history(
+            cmd.session_id,
+            include_projection_metadata=cmd.include_projection_metadata,
+        )
         return SessionGetHistoryResult(messages=messages)
+
+    # 返回 daemon 持久化的 session agent mode
+    async def _session_get_agent_mode_handler(
+        self,
+        params: dict[str, Any],
+    ) -> SessionGetAgentModeResult:
+        assert self._sessions is not None
+        cmd = SessionGetAgentModeCommand.model_validate(params)
+        snapshot = await self._sessions.get_agent_mode(cmd.session_id)
+        return SessionGetAgentModeResult(
+            agent_mode=snapshot.agent_mode,
+            revision=snapshot.revision,
+        )
+
+    # 返回 committed plan 的当前 approval authority snapshot
+    async def _plan_get_approval_handler(self, params: dict[str, Any]) -> PlanGetApprovalResult:
+        assert self._sessions is not None
+        cmd = PlanGetApprovalCommand.model_validate(params)
+        try:
+            result = await self._sessions.get_approval(cmd.session_id, cmd.projection_key)
+            return result
+        except ApprovalRecordCorrupt as exc:
+            raise HandlerError(INVALID_PARAMS, "approval-record-corrupt") from exc
+        except ApprovalError as exc:
+            raise HandlerError(INVALID_PARAMS, str(exc)) from exc
+
+    # 创建一次 immutable approve authority record
+    async def _plan_approve_handler(self, params: dict[str, Any]) -> PlanApprovalResult:
+        assert self._sessions is not None
+        cmd = PlanApproveCommand.model_validate(params)
+        try:
+            return await self._sessions.resolve_approval(
+                cmd.session_id,
+                cmd.projection_key,
+                action="approve",
+                decision_id=cmd.decision_id,
+                decision_version=cmd.decision_version,
+                content_digest=cmd.content_digest,
+                commit_receipt_digest=cmd.commit_receipt_digest,
+            )
+        except ApprovalRecordCorrupt as exc:
+            raise HandlerError(INVALID_PARAMS, "approval-record-corrupt") from exc
+        except ApprovalConflict as exc:
+            raise HandlerError(INVALID_PARAMS, "approval-already-resolved-conflict") from exc
+        except ApprovalError as exc:
+            raise HandlerError(INVALID_PARAMS, str(exc)) from exc
+
+    # 创建一次 immutable reject authority record
+    async def _plan_reject_handler(self, params: dict[str, Any]) -> PlanApprovalResult:
+        assert self._sessions is not None
+        cmd = PlanRejectCommand.model_validate(params)
+        try:
+            return await self._sessions.resolve_approval(
+                cmd.session_id,
+                cmd.projection_key,
+                action="reject",
+                decision_id=cmd.decision_id,
+                decision_version=cmd.decision_version,
+                content_digest=cmd.content_digest,
+                commit_receipt_digest=cmd.commit_receipt_digest,
+            )
+        except ApprovalRecordCorrupt as exc:
+            raise HandlerError(INVALID_PARAMS, "approval-record-corrupt") from exc
+        except ApprovalConflict as exc:
+            raise HandlerError(INVALID_PARAMS, "approval-already-resolved-conflict") from exc
+        except ApprovalError as exc:
+            raise HandlerError(INVALID_PARAMS, str(exc)) from exc
+
+    # 在 daemon admission lock 内创建一次 approved execution binding
+    async def _plan_execute_handler(self, params: dict[str, Any]) -> PlanExecuteResult:
+        assert self._sessions is not None
+        cmd = PlanExecuteCommand.model_validate(params)
+        return await self._sessions.execute_approved_plan(
+            cmd.session_id,
+            cmd.projection_key,
+            cmd.request_id,
+        )
+
+    # 通过 request identity 读取 approved execution authority/status
+    async def _plan_get_execution_handler(
+        self,
+        params: dict[str, Any],
+    ) -> PlanGetExecutionResult:
+        assert self._sessions is not None
+        cmd = PlanGetExecutionCommand.model_validate(params)
+        return await self._sessions.get_execution(cmd.session_id, cmd.request_id)
+
+    # 在 session lock 内切换下一条消息的 agent mode
+    async def _session_set_agent_mode_handler(
+        self,
+        params: dict[str, Any],
+    ) -> SessionSetAgentModeResult:
+        assert self._sessions is not None
+        cmd = SessionSetAgentModeCommand.model_validate(params)
+        snapshot = await self._sessions.set_agent_mode(
+            cmd.session_id,
+            cmd.agent_mode,
+        )
+        return SessionSetAgentModeResult(
+            agent_mode=snapshot.agent_mode,
+            revision=snapshot.revision,
+        )
 
     # 接收客户端权限审批响应，resolve 对应挂起的 Future
     async def _permission_respond_handler(self, params: dict[str, Any]) -> PermissionRespondResult:
@@ -408,10 +485,6 @@ class CoreApp:
 
     # 先停止连接请求和 detached runs，再关闭 MCP、journal 与 trace
     async def _shutdown(self, server: SocketServer) -> None:
-        for run_task in list(self._running_runs):
-            run_task.cancel()
-        if self._running_runs:
-            await asyncio.gather(*self._running_runs, return_exceptions=True)
         if self._sessions is not None:
             await self._sessions.cancel_active_runs()
         await server.stop()
@@ -458,7 +531,6 @@ class CoreApp:
             on_live_only=self._broadcaster.publish_live_only,
             on_stream_failure=self._broadcaster.fail_stream,
         )
-        self._bus.subscribe(self._journal.handle)
         sessions_root = Path("~/.kama/sessions").expanduser()
         store = SessionStore(sessions_root)
         assert self._config is not None
@@ -485,6 +557,7 @@ class CoreApp:
             provider=compact_provider,
         )
         self._sessions.attach_journal(self._journal)
+        await self._sessions.reconcile_persisted_sessions()
 
         server = SocketServer(
             self._config.host,
@@ -500,6 +573,13 @@ class CoreApp:
         server.register("session.create", self._session_create_handler)
         server.register("session.send_message", self._session_send_handler)
         server.register("session.get_history", self._session_history_handler)
+        server.register("session.get_agent_mode", self._session_get_agent_mode_handler)
+        server.register("session.set_agent_mode", self._session_set_agent_mode_handler)
+        server.register("plan.get_approval", self._plan_get_approval_handler)
+        server.register("plan.approve", self._plan_approve_handler)
+        server.register("plan.reject", self._plan_reject_handler)
+        server.register("plan.execute", self._plan_execute_handler)
+        server.register("plan.get_execution", self._plan_get_execution_handler)
         server.register("session.close", self._session_close_handler)
         server.register("permission.respond", self._permission_respond_handler)
         server.register("session.compact", self._session_compact_handler)

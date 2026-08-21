@@ -26,8 +26,8 @@ def _paired() -> ModuleType:
 
 # 从允许新增的script文件加载离线preflight边界
 def _script() -> ModuleType:
-    path = Path(__file__).resolve().parents[2] / "scripts" / "phase9d_paired.py"
-    spec = importlib.util.spec_from_file_location("phase9d_preflight_script", path)
+    path = Path(__file__).resolve().parents[2] / "scripts" / "paired_experiment.py"
+    spec = importlib.util.spec_from_file_location("paired_experiment_script", path)
     if spec is None or spec.loader is None:
         pytest.fail("paired preflight script cannot be loaded")
     module = importlib.util.module_from_spec(spec)
@@ -50,7 +50,7 @@ def _receipt_path() -> Path:
 def _preflight_payload() -> dict[str, object]:
     return {
         "schema_version": 1,
-        "preflight_id": "phase9d-final-preflight-test",
+        "preflight_id": "paired-final-preflight-test",
         "status": "READY_AWAITING_EXECUTION_AUTHORIZATION",
         "created_at_utc": "2026-08-01T00:00:00Z",
         "generator": {
@@ -103,8 +103,8 @@ def _preflight_payload() -> dict[str, object]:
             "mcp_enabled": False,
         },
         "external_parent": {
-            "env_name": "KAMA_PHASE9D_OUTPUT_PARENT",
-            "label": "phase9d-external-output-parent",
+            "env_name": "KAMA_PAIRED_OUTPUT_PARENT",
+            "label": "paired-experiment-external-output-parent",
             "canonical_path_sha256": "c" * 64,
             "canonical_object_sha256": "d" * 64,
             "absolute_path_persisted": False,
@@ -181,7 +181,7 @@ def _arm_payload(
 def _authorization_payload() -> dict[str, object]:
     return {
         "schema_version": 1,
-        "authorization_id": "phase9d-authorization-test",
+        "authorization_id": "paired-authorization-test",
         "status": "AUTHORIZED_FOR_ONE_PAIRED_EXECUTION",
         "created_at_utc": "2026-08-01T00:00:00Z",
         "paired_receipt": {
@@ -536,8 +536,8 @@ def test_private_evidence_paths_are_frozen_identity_derivations(tmp_path: Path) 
     parent.mkdir()
     paired = _paired()
 
-    first = paired.derive_private_evidence_paths(parent.resolve(), "phase9d-pair-v1")
-    second = paired.derive_private_evidence_paths(parent.resolve(), "phase9d-pair-v1")
+    first = paired.derive_private_evidence_paths(parent.resolve(), "paired-experiment-v1")
+    second = paired.derive_private_evidence_paths(parent.resolve(), "paired-experiment-v1")
 
     assert first == second
     assert first.root.parent == parent.resolve()
@@ -683,7 +683,7 @@ def test_command_spec_is_logical_redacted_and_arm_specific(tmp_path: Path) -> No
     paired = _paired()
     control = paired.build_command_spec(
         arm="control",
-        interpreter_label="PHASE9D_PYTHON",
+        interpreter_label="PAIRED_EXPERIMENT_PYTHON",
         interpreter_sha256="1" * 64,
         worktree_label="C1_WORKTREE",
         worktree_sha256="2" * 64,
@@ -694,7 +694,7 @@ def test_command_spec_is_logical_redacted_and_arm_specific(tmp_path: Path) -> No
     same = paired.build_command_spec(**control.model_dump(exclude={"spec_sha256"}))
     treatment = paired.build_command_spec(
         arm="treatment",
-        interpreter_label="PHASE9D_PYTHON",
+        interpreter_label="PAIRED_EXPERIMENT_PYTHON",
         interpreter_sha256="1" * 64,
         worktree_label="C2_WORKTREE",
         worktree_sha256="3" * 64,
@@ -792,7 +792,7 @@ def test_generate_final_preflight_offline_writes_redacted_tmp_artifact(
     for path in (output_parent, control_worktree, treatment_worktree):
         path.mkdir()
     sentinel = "OFFLINE_PREFLIGHT_CREDENTIAL_SENTINEL"
-    monkeypatch.setenv("KAMA_PHASE9D_OUTPUT_PARENT", str(output_parent))
+    monkeypatch.setenv("KAMA_PAIRED_OUTPUT_PARENT", str(output_parent))
     monkeypatch.setenv("ANTHROPIC_API_KEY", sentinel)
     generator = paired.GitSnapshot(
         commit="5" * 40,
@@ -840,7 +840,7 @@ def test_generate_final_preflight_offline_writes_redacted_tmp_artifact(
             ),
         )
         execution_tests = importlib.import_module(
-            "tests.benchmark.test_phase9d_paired_execution"
+            "tests.benchmark.test_paired_execution"
         )
         declared = execution_tests._identity(receipt, arm).declared
         return evidence, declared
@@ -851,7 +851,7 @@ def test_generate_final_preflight_offline_writes_redacted_tmp_artifact(
     artifact = script.generate_final_preflight(
         receipt_path=_receipt_path(),
         artifact_path=artifact_path,
-        output_parent_env="KAMA_PHASE9D_OUTPUT_PARENT",
+        output_parent_env="KAMA_PAIRED_OUTPUT_PARENT",
         control_worktree=control_worktree,
         treatment_worktree=treatment_worktree,
         interpreter=Path(sys.executable),
@@ -1169,10 +1169,10 @@ def test_source_import_probe_rejects_symlink_escape(tmp_path: Path) -> None:
 def _git_repository(path: Path) -> Path:
     path.mkdir()
     environment = {
-        "GIT_AUTHOR_EMAIL": "phase9d@example.invalid",
-        "GIT_AUTHOR_NAME": "Phase9D Test",
-        "GIT_COMMITTER_EMAIL": "phase9d@example.invalid",
-        "GIT_COMMITTER_NAME": "Phase9D Test",
+        "GIT_AUTHOR_EMAIL": "paired-experiment@example.invalid",
+        "GIT_AUTHOR_NAME": "Paired Experiment Test",
+        "GIT_COMMITTER_EMAIL": "paired-experiment@example.invalid",
+        "GIT_COMMITTER_NAME": "Paired Experiment Test",
         "PATH": os.environ.get("PATH", ""),
     }
     subprocess.run(

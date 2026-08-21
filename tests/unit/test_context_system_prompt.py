@@ -21,6 +21,11 @@ _STATE_TRANSITION_PROTOCOL = (
     "compensation preserves the stated invariant. Do not apply this protocol to tasks "
     "without multi-step side effects."
 )
+_REPOSITORY_CHANGE_DISCIPLINE = """## Repository Change Discipline
+Prefer editing existing files to creating new ones
+Don't add features, refactor, or introduce abstractions beyond what the task requires
+Don't design for hypothetical future requirements
+A bug fix doesn't need surrounding cleanup"""
 
 
 # 构造最小 ExecutionContext 并允许测试覆盖任意字段
@@ -47,12 +52,12 @@ def test_all_layers_present() -> None:
     assert prompt.index("Global") < prompt.index("Project") < prompt.index("Session")
 
 
-# 功能：验证三层均为空时 system prompt 只含 base
-# 设计：不设置任何记忆字段，断言输出等于 base
+# 功能：验证无上下文时 system prompt 仍包含一次可信仓库变更纪律
+# 设计：用最小 context 断言 base 后紧跟完整 policy，防止 profile/base 成为绕过点
 def test_no_layers() -> None:
     ctx = _make_ctx()
     prompt = ctx.system_prompt("BASE_ONLY")
-    assert prompt == "BASE_ONLY"
+    assert prompt == "BASE_ONLY\n\n" + _REPOSITORY_CHANGE_DISCIPLINE
 
 
 # 功能：验证只有 global_context 时只出现 Global section，其他 section 不出现
@@ -86,20 +91,24 @@ def test_v1_and_v2_default_base_precede_all_context_layers() -> None:
     prompt = ctx.system_prompt(base)
 
     assert prompt.startswith(base)
+    assert prompt.count(_REPOSITORY_CHANGE_DISCIPLINE) == 1
     assert prompt.count(_REQUIREMENT_CONTRACT) == 1
     assert prompt.count(_STATE_TRANSITION_PROTOCOL) == 1
     assert prompt.index(_REQUIREMENT_CONTRACT) < prompt.index(
         _STATE_TRANSITION_PROTOCOL
     )
     assert prompt.index(_STATE_TRANSITION_PROTOCOL) < prompt.index(
+        _REPOSITORY_CHANGE_DISCIPLINE
+    )
+    assert prompt.index(_REPOSITORY_CHANGE_DISCIPLINE) < prompt.index(
         "## Global Context"
     )
     assert prompt.index("## Global Context") < prompt.index("## Project Context")
     assert prompt.index("## Project Context") < prompt.index("## Session Notes")
 
 
-# 功能：验证显式 override 完全替换包含 v1/v2 的 default base
-# 设计：向真实 ExecutionContext 同时传 full base 和 override，排除默认协议泄露到 slash skill/profile 路径
+# 功能：验证显式 override 替换 default base 但不能移除可信仓库变更纪律
+# 设计：向真实 ExecutionContext 同时传 full base 和 override，锁定 trusted policy 与可替换 role slot 的边界
 def test_override_excludes_v1_and_v2_but_keeps_context_order() -> None:
     base = "BASE\n\n" + _REQUIREMENT_CONTRACT + "\n\n" + _STATE_TRANSITION_PROTOCOL
     ctx = _make_ctx(
@@ -111,8 +120,42 @@ def test_override_excludes_v1_and_v2_but_keeps_context_order() -> None:
 
     prompt = ctx.system_prompt(base)
 
-    assert prompt.startswith("OVERRIDE\n\n## Global Context")
+    assert prompt.startswith("OVERRIDE\n\n" + _REPOSITORY_CHANGE_DISCIPLINE)
+    assert prompt.count(_REPOSITORY_CHANGE_DISCIPLINE) == 1
     assert _REQUIREMENT_CONTRACT not in prompt
     assert _STATE_TRANSITION_PROTOCOL not in prompt
     assert prompt.index("## Global Context") < prompt.index("## Project Context")
     assert prompt.index("## Project Context") < prompt.index("## Session Notes")
+
+
+# 功能：验证上下文中引用相同四条规则时 composer 不删除或改写原始文本
+# 设计：把 canonical block 作为 project context 原文输入，断言可信注入与引用各保留一份
+def test_quoted_policy_in_project_context_is_preserved() -> None:
+    quoted = "Discussion quote:\n" + _REPOSITORY_CHANGE_DISCIPLINE
+    ctx = _make_ctx(project_context=quoted)
+
+    prompt = ctx.system_prompt("BASE")
+
+    assert prompt.count(_REPOSITORY_CHANGE_DISCIPLINE) == 2
+    assert "## Project Context\n" + quoted in prompt
+
+
+# 功能：验证 repository instructions 位于可信 policy 后且早于既有 context layers
+# 设计：同时填充所有 slot 并比较索引，防止 repository instructions 被误放入可替换 base 或 generated context
+def test_repository_instructions_have_dedicated_composition_slot() -> None:
+    ctx = _make_ctx(
+        repository_instructions="source: AGENTS.md\nroot rule",
+        global_context="global",
+        project_context="generated project context",
+        session_notes="session",
+    )
+
+    prompt = ctx.system_prompt("BASE")
+
+    assert "## Repository Instructions\nsource: AGENTS.md\nroot rule" in prompt
+    assert prompt.index(_REPOSITORY_CHANGE_DISCIPLINE) < prompt.index(
+        "## Repository Instructions"
+    )
+    assert prompt.index("## Repository Instructions") < prompt.index(
+        "## Global Context"
+    )

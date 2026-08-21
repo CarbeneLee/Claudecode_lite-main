@@ -9,9 +9,43 @@ import pytest
 
 from kama_claude.cli.commands import chat as chat_module
 from kama_claude.core.config import KamaConfig
+from kama_claude.core.plan_view import PlanViewV1, projection_digest
 from kama_claude.core.transport.socket_client import EventDelivery, IpcError
 
 type DeliveryHandler = Callable[[EventDelivery], Awaitable[None]]
+
+
+# 构造最小合法 V1 PlanReady payload，供 CLI authority wiring 测试复用
+def _plan_event() -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "decision_key": "decision-1:v1",
+        "projection_key": "pv1:run-1:decision-1:v1",
+        "decision_id": "decision-1",
+        "decision_version": 1,
+        "decision_content_digest": "decision-digest",
+        "architecture_slice_id": "slice-1",
+        "architecture_slice_version": 1,
+        "architecture_slice_content_digest": "slice-digest",
+        "snapshot_digest": "snapshot-digest",
+        "goal": "change behavior",
+        "architecture_mode": "preserve",
+        "selected_approach": "edit existing module",
+        "projection_digest": "placeholder",
+    }
+    plan = PlanViewV1.model_validate(payload)
+    full_payload = plan.model_dump(mode="json")
+    full_payload["projection_digest"] = projection_digest(full_payload)
+    plan = PlanViewV1.model_validate(full_payload)
+    return {
+        "type": "planner.decision_ready",
+        "event_id": "plan-ready:pv1:run-1:decision-1:v1",
+        "run_id": "run-1",
+        "planner_run_id": "planner-1",
+        "session_id": "sess-1",
+        "plan": plan.model_dump(mode="json"),
+        "ts": "t",
+    }
 
 
 class _ChatClient:
@@ -61,6 +95,8 @@ class _ChatClient:
                 "high_watermark_seq": params["after_seq"],
                 "daemon_instance_id": self.daemon_id,
             }
+        if method == "session.get_agent_mode":
+            return {"agent_mode": "direct", "revision": 0}
         if method == "session.send_message":
             return {"run_id": "run-test"}
         return {}
@@ -99,14 +135,371 @@ async def test_chat_creates_session_before_session_scoped_subscription(
 
     assert exit_code == 0
     methods = [method for method, _params in clients[0].commands]
-    assert methods[:2] == ["session.create", "event.subscribe"]
+    assert methods[:3] == [
+        "session.create",
+        "event.subscribe",
+        "session.get_agent_mode",
+    ]
     assert clients[0].subscriptions == [
         {
-            "topics": ["session.*", "run.*", "tool.*", "llm.token", "permission.*"],
+            "topics": [
+                "session.*",
+                "run.*",
+                "tool.*",
+                "llm.token",
+                    "permission.*",
+                    "planner.*",
+                    "plan.*",
+            ],
             "scope": "session:sess-old",
             "after_seq": 0,
         }
     ]
+
+
+# 功能：验证 equal-revision mode conflict 只设置 deferred refresh，不在 delivery callback 发 RPC
+# 设计：直接运行真实 ChatDeliveryState handler，检查 callback 返回后的 signal 而非伪造 SocketClient 调用
+async def test_chat_mode_conflict_is_deferred_without_rpc() -> None:
+    state = chat_module._ChatDeliveryState(
+        chat_module.ChatPrinter(),
+        "session:sess-1",
+        "daemon-a",
+        asyncio.Event(),
+        asyncio.Event(),
+        mode_snapshot=chat_module.AgentModeSnapshot("direct", 5),
+    )
+
+    await state.handle(
+        EventDelivery(
+            subscription_id="sub",
+            delivery="live",
+            event_id="mode-1",
+            stream_id="session:sess-1",
+            seq=2,
+            daemon_instance_id="daemon-a",
+            event={
+                "type": "session.agent_mode_changed",
+                "previous_mode": "direct",
+                "agent_mode": "plan",
+                "revision": 5,
+                "ts": "t",
+            },
+        )
+    )
+
+    assert state.mode_refresh_required.is_set()
+    assert state.printer.agent_mode == "direct"
+
+
+# 功能：验证 CLI 只从 committed PlanView 建立 exact approval target 并通过 authority GET 获得 receipt
+# 设计：真实 ChatDeliveryState 处理 PlanReady，再走 authority apply 和 command 参数生成，排除 raw 文本猜测路径
+async def test_chat_committed_plan_wires_exact_approval_authority() -> None:
+    class _Client:
+        # 返回与 committed target 完全一致的 authority snapshot
+        async def send_command(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            assert method == "plan.get_approval"
+            assert params == {
+                "session_id": "sess-1",
+                "projection_key": "pv1:run-1:decision-1:v1",
+            }
+            return {
+                "session_id": "sess-1",
+                "projection_key": "pv1:run-1:decision-1:v1",
+                "status": "pending",
+                "decision_id": "decision-1",
+                "decision_version": 1,
+                "content_digest": "decision-digest",
+                "commit_receipt_digest": "receipt-digest",
+            }
+
+    state = chat_module._ChatDeliveryState(
+        chat_module.ChatPrinter(),
+        "session:sess-1",
+        "daemon-a",
+        asyncio.Event(),
+        asyncio.Event(),
+    )
+    await state.handle(
+        EventDelivery(
+            subscription_id="sub",
+            delivery="replay",
+            event_id="plan-1",
+            stream_id="session:sess-1",
+            seq=1,
+            daemon_instance_id="daemon-a",
+            event=_plan_event(),
+        )
+    )
+    await state.handle(
+        EventDelivery(
+            subscription_id="sub",
+            delivery="replay",
+            event_id="run-finished-1",
+            stream_id="session:sess-1",
+            seq=2,
+            daemon_instance_id="daemon-a",
+            event={"type": "run.finished", "run_id": "run-1", "status": "success"},
+        )
+    )
+
+    projection_key = "pv1:run-1:decision-1:v1"
+    assert state.approval_targets[projection_key].decision_id == "decision-1"
+    assert state.approval_states[projection_key].snapshot.status == "pending"
+    await chat_module._refresh_chat_approvals(_Client(), state)  # type: ignore[arg-type]
+    command = state.approval_command_params(projection_key, "approve")
+    assert command is not None
+    method, params = command
+    assert method == "plan.approve"
+    assert params["content_digest"] == "decision-digest"
+    assert params["commit_receipt_digest"] == "receipt-digest"
+
+
+# 功能：验证 CLI approval notification 冲突只进入 unknown 并设置 deferred refresh
+# 设计：先注入 authority approved，再投递冲突 rejected event，确认 delivery callback 不会直接伪造终态
+async def test_chat_approval_conflict_sets_deferred_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = chat_module._ChatDeliveryState(
+        chat_module.ChatPrinter(),
+        "session:sess-1",
+        "daemon-a",
+        asyncio.Event(),
+        asyncio.Event(),
+    )
+    rendered: list[str] = []
+    monkeypatch.setattr(
+        state.printer,
+        "show_approval",
+        lambda snapshot: rendered.append(snapshot.status),
+    )
+    await state.handle(
+        EventDelivery(
+            subscription_id="sub",
+            delivery="replay",
+            event_id="plan-1",
+            stream_id="session:sess-1",
+            seq=1,
+            daemon_instance_id="daemon-a",
+            event=_plan_event(),
+        )
+    )
+    await state.handle(
+        EventDelivery(
+            subscription_id="sub",
+            delivery="replay",
+            event_id="run-finished-1",
+            stream_id="session:sess-1",
+            seq=2,
+            daemon_instance_id="daemon-a",
+            event={"type": "run.finished", "run_id": "run-1", "status": "success"},
+        )
+    )
+    projection_key = "pv1:run-1:decision-1:v1"
+    state.apply_approval_authority(
+        projection_key,
+        {
+            "session_id": "sess-1",
+            "projection_key": projection_key,
+            "status": "approved",
+            "decision_id": "decision-1",
+            "decision_version": 1,
+            "content_digest": "decision-digest",
+            "commit_receipt_digest": "receipt-digest",
+            "action": "approve",
+            "record_digest": "record-a",
+        },
+        epoch=None,
+    )
+    await state.handle(
+        EventDelivery(
+            subscription_id="sub",
+            delivery="live",
+            event_id="approval-1",
+            stream_id="session:sess-1",
+            seq=2,
+            daemon_instance_id="daemon-a",
+            event={
+                "type": "plan.approval_changed",
+                "session_id": "sess-1",
+                "projection_key": projection_key,
+                "status": "rejected",
+                "action": "reject",
+                "record_digest": "record-b",
+                "commit_receipt_digest": "receipt-digest",
+                "ts": "t",
+            },
+        )
+    )
+
+    assert state.approval_states[projection_key].snapshot.status == "conflicted/unknown"
+    assert state.approval_refresh_required.is_set()
+    assert rendered == ["approved", "conflicted/unknown"]
+    assert "rejected" not in rendered
+
+
+# 功能：验证 CLI approve/reject RPC 冲突只渲染本地 conflicted/unknown 状态
+# 设计：先注入 approved authority，再合并 disputed rejected response，确保 UI 不把争议输入当作事实
+async def test_chat_approval_response_conflict_renders_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = chat_module._ChatDeliveryState(
+        chat_module.ChatPrinter(),
+        "session:sess-1",
+        "daemon-a",
+        asyncio.Event(),
+        asyncio.Event(),
+    )
+    rendered: list[str] = []
+    monkeypatch.setattr(
+        state.printer,
+        "show_approval",
+        lambda snapshot: rendered.append(snapshot.status),
+    )
+    await state.handle(
+        EventDelivery(
+            subscription_id="sub",
+            delivery="replay",
+            event_id="plan-1",
+            stream_id="session:sess-1",
+            seq=1,
+            daemon_instance_id="daemon-a",
+            event=_plan_event(),
+        )
+    )
+    await state.handle(
+        EventDelivery(
+            subscription_id="sub",
+            delivery="replay",
+            event_id="run-finished-1",
+            stream_id="session:sess-1",
+            seq=2,
+            daemon_instance_id="daemon-a",
+            event={"type": "run.finished", "run_id": "run-1", "status": "success"},
+        )
+    )
+    projection_key = "pv1:run-1:decision-1:v1"
+    state.apply_approval_authority(
+        projection_key,
+        {
+            "session_id": "sess-1",
+            "projection_key": projection_key,
+            "status": "approved",
+            "decision_id": "decision-1",
+            "decision_version": 1,
+            "content_digest": "decision-digest",
+            "commit_receipt_digest": "receipt-digest",
+            "action": "approve",
+            "record_digest": "record-a",
+        },
+        epoch=None,
+    )
+
+    relation = state.merge_approval_response(
+        {
+            "session_id": "sess-1",
+            "projection_key": projection_key,
+            "status": "rejected",
+            "decision_id": "decision-1",
+            "decision_version": 1,
+            "content_digest": "decision-digest",
+            "commit_receipt_digest": "receipt-digest",
+            "action": "reject",
+            "record_digest": "record-b",
+        }
+    )
+
+    assert relation is chat_module.ApprovalSnapshotRelation.CONFLICT
+    assert state.approval_states[projection_key].snapshot.status == "conflicted/unknown"
+    assert rendered == ["approved", "conflicted/unknown"]
+    assert "rejected" not in rendered
+
+
+# 功能：验证 CLI refresh response 返回到新 client/view 后不会覆盖旧 approval state
+# 设计：阻塞旧 client 的 authority GET，替换 state.approval_client 后放行，覆盖 await 后 owner/state identity 检查
+async def test_chat_stale_approval_refresh_owner_is_discarded() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class _Client:
+        # 让旧 authority response 跨越 client replacement
+        async def send_command(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            assert method == "plan.get_approval"
+            started.set()
+            await release.wait()
+            return {
+                "session_id": "sess-1",
+                "projection_key": "pv1:run-1:decision-1:v1",
+                "status": "approved",
+                "decision_id": "decision-1",
+                "decision_version": 1,
+                "content_digest": "decision-digest",
+                "commit_receipt_digest": "receipt-digest",
+                "action": "approve",
+                "record_digest": "record-old",
+            }
+
+    state = chat_module._ChatDeliveryState(
+        chat_module.ChatPrinter(),
+        "session:sess-1",
+        "daemon-a",
+        asyncio.Event(),
+        asyncio.Event(),
+    )
+    await state.handle(
+        EventDelivery(
+            subscription_id="sub",
+            delivery="replay",
+            event_id="plan-1",
+            stream_id="session:sess-1",
+            seq=1,
+            daemon_instance_id="daemon-a",
+            event=_plan_event(),
+        )
+    )
+    await state.handle(
+        EventDelivery(
+            subscription_id="sub",
+            delivery="replay",
+            event_id="run-finished-1",
+            stream_id="session:sess-1",
+            seq=2,
+            daemon_instance_id="daemon-a",
+            event={"type": "run.finished", "run_id": "run-1", "status": "success"},
+        )
+    )
+    old_client = _Client()
+    state.approval_client = old_client  # type: ignore[assignment]
+    state.approval_refresh_required.set()
+    task = asyncio.create_task(chat_module._refresh_chat_approvals(old_client, state))  # type: ignore[arg-type]
+    await started.wait()
+    state.approval_client = object()  # type: ignore[assignment]
+    release.set()
+    await task
+
+    assert state.approval_states["pv1:run-1:decision-1:v1"].snapshot.status == "pending"
+
+
+# 功能：验证 CLI 放弃旧 view 时清除遗留 mode refresh signal
+# 设计：直接调用 fresh-view mode reset 边界，防止新 session 继承旧 session 的 deferred 状态
+def test_chat_fresh_view_clears_abandoned_mode_refresh_signal() -> None:
+    state = chat_module._ChatDeliveryState(
+        chat_module.ChatPrinter(),
+        "session:sess-1",
+        "daemon-a",
+        asyncio.Event(),
+        asyncio.Event(),
+        mode_snapshot=chat_module.AgentModeSnapshot("plan", 20),
+    )
+    state.mode_refresh_required.set()
+    state.printer.agent_mode = "plan"
+    state.printer.agent_mode_revision = 20
+
+    chat_module._reset_chat_mode_view(state, state.printer)
+
+    assert not state.mode_refresh_required.is_set()
+    assert state.mode_snapshot is None
+    assert state.printer.agent_mode == "direct"
+    assert state.printer.agent_mode_revision == 0
 
 
 # 功能：验证 transient EOF 后沿用同一 session 与 handler-success cursor 重连
@@ -163,7 +556,15 @@ async def test_chat_reconnects_same_daemon_with_session_and_cursor(
     assert len(clients) == 2
     assert clients[0].subscriptions[0]["after_seq"] == 0
     assert clients[1].subscriptions[0] == {
-        "topics": ["session.*", "run.*", "tool.*", "llm.token", "permission.*"],
+        "topics": [
+            "session.*",
+            "run.*",
+            "tool.*",
+            "llm.token",
+                "permission.*",
+                "planner.*",
+                "plan.*",
+        ],
         "scope": "session:sess-old",
         "after_seq": 1,
     }

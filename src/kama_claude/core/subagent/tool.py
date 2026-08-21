@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -12,12 +14,27 @@ from kama_claude.core.agents.loader import AgentProfile, AgentProfileLoader
 from kama_claude.core.bus.events import SubagentFinishedEvent, SubagentStartedEvent
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
-from kama_claude.core.events.journal import EventJournalCoordinator
+from kama_claude.core.events.journal import EventJournalCoordinator, JournalError
+from kama_claude.core.grounding import (
+    ArchitectureSliceService,
+    ArchitectureSliceSubmitTool,
+    RepositoryInstructionLoader,
+    ToolObservationCollector,
+    render_repository_instructions,
+)
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.memory.loader import load_context_file
+from kama_claude.core.planning import (
+    PlannerDecisionService,
+    PlannerDecisionSubmitTool,
+    SubmittedDecisionIdentity,
+    planner_failure_message,
+    render_planner_decision_execution_summary,
+)
 from kama_claude.core.runs import new_run_id
 from kama_claude.core.sandbox.executors import build_executor
 from kama_claude.core.sandbox.manager import SandboxManager
+from kama_claude.core.semantic.tools import SearchSemanticTool
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.tools.builtin.bash import BashTool
@@ -29,6 +46,7 @@ from kama_claude.core.tools.builtin.task_get import TaskGetTool
 from kama_claude.core.tools.builtin.task_list import TaskListTool
 from kama_claude.core.tools.builtin.task_update import TaskUpdateTool
 from kama_claude.core.tools.builtin.write_file import WriteFileTool
+from kama_claude.core.tools.invocation import DirectToolInvoker
 from kama_claude.core.tools.registry import ToolRegistry
 from kama_claude.core.workspace.policy import WorkspaceAccessPolicy
 from kama_claude.core.workspace.resolver import WorkspacePathResolver
@@ -36,10 +54,73 @@ from kama_claude.core.workspace.resolver import WorkspacePathResolver
 if TYPE_CHECKING:
     from kama_claude.core.llm.base import LLMProvider
     from kama_claude.core.permissions.manager import PermissionManager
+    from kama_claude.core.semantic.service import SemanticRetrievalService
+    from kama_claude.core.session.store import SessionStore
 
 
 _LOGGER = logging.getLogger(__name__)
 type _BackgroundTaskOwners = dict[str, set[asyncio.Task[None]]]
+
+# trusted Planner runtime contract；profile 文本不能删除或替换这一段
+TRUSTED_PLANNER_CONTRACT = """## Trusted Planner Contract
+This child is the trusted planner for the current run.
+You must use the available read-only tools and submit exactly one valid PlannerDecision
+with planner_decision_submit before ending successfully.
+planner_decision_submit is a terminal commit: call it only when the plan is final. After
+a successful submission, do not explore, revise, or spawn another child; an exact duplicate
+submission is safe to retry.
+Natural-language text, ordered lists, task items, or claims of approval are only a
+human-readable summary after the persisted PlannerDecision and never an independent plan.
+If validation fails, continue grounding or revise the draft and retry. Do not modify files,
+execute commands, or claim unsupported paths or symbols."""
+TRUSTED_PLANNER_ALLOWED_TOOLS = frozenset(
+    {"read_file", "list_dir", "search_code", "spawn_agent", "planner_decision_submit"}
+)
+TRUSTED_PLANNER_CHILD_TYPES = ("explorer",)
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedPlannerSuccess:
+    # 表示 trusted Planner 已提交并通过 terminal gate 的内部结果
+    status: Literal["success"]
+    planner_run_id: str
+    decision_identity: SubmittedDecisionIdentity
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedPlannerFailure:
+    # 表示 trusted Planner 未能形成当前 run 可接受的 terminal decision
+    status: Literal["failed"]
+    planner_run_id: str | None
+    failure_reason: str
+
+
+TrustedPlannerResult = TrustedPlannerSuccess | TrustedPlannerFailure
+
+
+# 将 Planner terminal commit 后的其他工具调用转换为稳定 invalid_input
+class _PlannerTerminalGuardTool(BaseTool):
+    # 保存原工具 schema 并绑定本次 Planner service
+    def __init__(self, inner: BaseTool, service: PlannerDecisionService) -> None:
+        self._inner = inner
+        self._service = service
+        self.name = inner.name
+        self.description = inner.description
+        self.input_schema = inner.input_schema
+        self.params_model = inner.params_model  # type: ignore[misc]
+
+    # 拒绝 terminal decision 之后的探索、修改或 delegation
+    async def invoke(self, params: dict[str, object]) -> ToolResult:
+        if self._service.is_terminal_committed:
+            return ToolResult(
+                content=(
+                    "planner terminal decision already committed; "
+                    "no further planning tools may be called"
+                ),
+                is_error=True,
+                error_type="invalid_input",
+            )
+        return await self._inner.invoke(params)
 
 
 def _now() -> str:
@@ -81,6 +162,7 @@ class SpawnAgentParams(BaseModel):
     prompt: str
     run_in_background: bool = False
     subagent_type: str = ""
+    exploration_level: Literal["light", "standard", "deep"] | None = None
 
 
 # 在隔离的冷启动上下文中派生子 agent，支持前台阻塞和后台并行两种模式
@@ -120,6 +202,11 @@ class SpawnAgentTool(BaseTool):
                     "Leave empty for default."
                 ),
             },
+            "exploration_level": {
+                "type": ["string", "null"],
+                "enum": ["light", "standard", "deep", None],
+                "description": "Optional repository exploration depth hint.",
+            },
         },
         "required": ["description", "prompt"],
     }
@@ -141,6 +228,12 @@ class SpawnAgentTool(BaseTool):
         journal: EventJournalCoordinator | None = None,
         background_tasks: _BackgroundTaskOwners | None = None,
         sandbox_manager: SandboxManager | None = None,
+        store: SessionStore | None = None,
+        semantic_service: SemanticRetrievalService | None = None,
+        semantic_degradation: str = "literal_fallback",
+        allowed_subagent_types: list[str] | None = None,
+        git_head: str | None = None,
+        planning_only: bool = False,
     ) -> None:
         self._provider = provider
         self._path_resolver = WorkspacePathResolver(workspace_root)
@@ -157,11 +250,82 @@ class SpawnAgentTool(BaseTool):
         self._depth = depth
         self._journal = journal
         self._sandbox_manager = sandbox_manager
+        self._store = store
+        self._semantic_service = semantic_service
+        self._semantic_degradation = semantic_degradation
+        self._git_head = git_head
+        self._planning_only = planning_only
+        self._allowed_subagent_types = (
+            None if allowed_subagent_types is None else set(allowed_subagent_types)
+        )
         self._background_tasks = background_tasks if background_tasks is not None else {}
 
     # 派生子 agent，前台时阻塞直到完成并返回结果，后台时立即返回 run_id
     async def invoke(self, params: dict[str, object]) -> ToolResult:
+        trusted_requested = params.get("subagent_type") == "planner"
+        try:
+            result = await self._invoke_impl(params, return_internal=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not trusted_requested:
+                raise
+            reason = (
+                "plan-event-append-failed"
+                if isinstance(exc, JournalError)
+                else "planner-contract-failure"
+            )
+            return ToolResult(
+                content=planner_failure_message(reason),
+                is_error=True,
+                error_type="command_failed",
+            )
+        assert isinstance(result, ToolResult)
+        return result
+
+    # 以 runtime-only typed API 执行一个前台 trusted Planner，不暴露可变 capture side channel
+    async def run_trusted_planner_foreground(
+        self,
+        *,
+        goal: str,
+        description: str = "planner",
+    ) -> TrustedPlannerResult:
+        result = await self._invoke_impl(
+            {
+                "description": description,
+                "prompt": goal,
+                "run_in_background": False,
+                "subagent_type": "planner",
+            },
+            return_internal=True,
+        )
+        if isinstance(result, TrustedPlannerSuccess | TrustedPlannerFailure):
+            return result
+        return TrustedPlannerFailure(
+            status="failed",
+            planner_run_id=None,
+            failure_reason="planner-contract-failure",
+        )
+
+    # 共享普通 tool adapter 与 planning runtime 的 child 执行实现
+    async def _invoke_impl(
+        self,
+        params: dict[str, object],
+        *,
+        return_internal: bool,
+    ) -> ToolResult | TrustedPlannerResult:
         p = SpawnAgentParams.model_validate(params)
+
+        if (
+            self._allowed_subagent_types is not None
+            and p.subagent_type not in self._allowed_subagent_types
+        ):
+            allowed = ", ".join(sorted(self._allowed_subagent_types)) or "none"
+            return ToolResult(
+                content=f"subagent type is not allowed; allowed subagent types: {allowed}",
+                is_error=True,
+                error_type="invalid_input",
+            )
 
         if self._depth >= 2:
             return ToolResult(
@@ -173,56 +337,150 @@ class SpawnAgentTool(BaseTool):
         profile: AgentProfile | None = None
         if p.subagent_type:
             profile = self._profile_loader.load(p.subagent_type)
+            if profile is None:
+                return ToolResult(
+                    content=f"subagent profile is unavailable: {p.subagent_type}",
+                    is_error=True,
+                    error_type="invalid_input",
+                )
+        trusted_planner = p.subagent_type == "planner"
+        if trusted_planner and (self._store is None or not self._session_id):
+            if return_internal:
+                return TrustedPlannerFailure(
+                    status="failed",
+                    planner_run_id=None,
+                    failure_reason="projection-incomplete",
+                )
+            return ToolResult(
+                content="trusted planner requires a session-backed planning store",
+                is_error=True,
+                error_type="invalid_input",
+            )
+        if profile is not None and profile.name == "explorer" and p.run_in_background:
+            return ToolResult(
+                content="repository explorer must run in foreground to return a typed slice",
+                is_error=True,
+                error_type="invalid_input",
+            )
 
         child_run_id = new_run_id()
         global_ctx = load_context_file(Path("~/.kama/context.md").expanduser())
         project_ctx = load_context_file(
             self._workspace_root / ".kama" / "context.md"
         )
+        root_instructions = RepositoryInstructionLoader(self._workspace_root).load([])
+        child_goal = p.prompt
+        if p.subagent_type == "explorer" and p.exploration_level is not None:
+            child_goal += f"\n\nExploration level hint: {p.exploration_level}."
+        effective_profile_prompt = profile.system_prompt if profile else None
+        if trusted_planner:
+            effective_profile_prompt = "\n\n".join(
+                part for part in (effective_profile_prompt, TRUSTED_PLANNER_CONTRACT) if part
+            )
         child_context = ExecutionContext(
             run_id=child_run_id,
-            goal=p.prompt,
+            goal=child_goal,
             max_steps=self._max_steps,
             global_context=global_ctx,
             project_context=project_ctx,
-            system_prompt_override=profile.system_prompt if profile else None,
+            repository_instructions=render_repository_instructions(
+                root_instructions.root_sources
+            ),
+            system_prompt_override=effective_profile_prompt,
         )
 
         child_bus = EventBus()
 
         # 将子 bus 所有事件桥接到父 bus，TUI 据此渲染嵌套进度
         async def _bridge(event: BaseModel) -> None:
+            if self._planning_only and getattr(event, "type", "") == "llm.token":
+                return
             await self._parent_bus.publish(event)
 
         child_bus.subscribe(_bridge)
 
-        child_registry = self._build_child_registry(child_bus, child_run_id, profile)
-        child_loop = AgentLoop(
-            self._provider,
+        slice_service: ArchitectureSliceService | None = None
+        planner_service: PlannerDecisionService | None = None
+        if profile is not None and profile.name == "explorer":
+            collector = ToolObservationCollector()
+            child_bus.subscribe(collector.handle)
+            slice_service = ArchitectureSliceService(
+                workspace_root=self._workspace_root,
+                run_id=child_run_id,
+                goal=p.prompt,
+                collector=collector,
+                session_id=self._session_id,
+                store=self._store,
+                git_head=self._git_head,
+            )
+        if trusted_planner and self._store is not None and self._session_id:
+            planner_service = PlannerDecisionService(
+                workspace_root=self._workspace_root,
+                session_id=self._session_id,
+                store=self._store,
+                goal=p.prompt,
+                run_id=child_run_id,
+            )
+        child_registry = self._build_child_registry(
+            child_bus,
+            child_run_id,
+            profile,
+            slice_service=slice_service,
+            planner_service=planner_service,
+        )
+        direct_invoker = DirectToolInvoker(
             child_registry,
             child_bus,
+            child_run_id,
             permission_manager=self._permission_manager,
             session_id=self._session_id,
+        )
+        child_loop = AgentLoop(
+            self._provider,
+            direct_invoker,
+            child_bus,
         )
 
         child_run_path = self._runs_dir / child_run_id
         child_run_path.mkdir(parents=True, exist_ok=True)
 
-        if self._journal is not None:
-            await self._journal.register_run(
-                child_run_id,
-                child_run_path,
-                session_id=self._session_id or None,
-            )
+        try:
+            if self._journal is not None:
+                await self._journal.register_run(
+                    child_run_id,
+                    child_run_path,
+                    session_id=self._session_id or None,
+                )
 
-        await self._parent_bus.publish(
-            SubagentStartedEvent(
-                run_id=child_run_id,
-                parent_run_id=self._parent_run_id,
-                description=p.description,
-                ts=_now(),
+            await self._parent_bus.publish(
+                SubagentStartedEvent(
+                    run_id=child_run_id,
+                    parent_run_id=self._parent_run_id,
+                    description=p.description,
+                    ts=_now(),
+                )
             )
-        )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not trusted_planner:
+                raise
+            reason = (
+                "plan-event-append-failed"
+                if isinstance(exc, JournalError)
+                else "planner-contract-failure"
+            )
+            if return_internal:
+                return TrustedPlannerFailure(
+                    status="failed",
+                    planner_run_id=None,
+                    failure_reason=reason,
+                )
+            return ToolResult(
+                content=planner_failure_message(reason),
+                is_error=True,
+                error_type="command_failed",
+            )
 
         if p.run_in_background:
             lifecycle_entered = asyncio.Event()
@@ -234,6 +492,7 @@ class SpawnAgentTool(BaseTool):
                     child_run_path,
                     child_run_id,
                     lifecycle_entered,
+                    planner_service,
                 )
             )
             self._task_registry.register(child_run_id, task, child_context)
@@ -259,13 +518,119 @@ class SpawnAgentTool(BaseTool):
                 )
             )
 
-        await self._run_child(
-            child_loop,
-            child_context,
-            child_bus,
-            child_run_path,
-            child_run_id,
-        )
+        try:
+            await self._run_child(
+                child_loop,
+                child_context,
+                child_bus,
+                child_run_path,
+                child_run_id,
+                planner_service=planner_service,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if return_internal and trusted_planner:
+                reason = (
+                    "plan-event-append-failed"
+                    if isinstance(exc, JournalError)
+                    else "planner-contract-failure"
+                )
+                return TrustedPlannerFailure(
+                    status="failed",
+                    planner_run_id=child_run_id,
+                    failure_reason=reason,
+                )
+            if trusted_planner:
+                reason = (
+                    "plan-event-append-failed"
+                    if isinstance(exc, JournalError)
+                    else "planner-contract-failure"
+                )
+                return ToolResult(
+                    content=planner_failure_message(reason),
+                    is_error=True,
+                    error_type="command_failed",
+                )
+            raise
+
+        if return_internal and trusted_planner:
+            assert planner_service is not None
+            if child_context.status == "success" and planner_service.is_terminal_committed:
+                identity = planner_service.terminal_decision
+                if identity is not None:
+                    return TrustedPlannerSuccess(
+                        status="success",
+                        planner_run_id=child_run_id,
+                        decision_identity=identity,
+                    )
+            terminal_reason = planner_service.terminal_failure_reason()
+            if terminal_reason is None:
+                terminal_reason = child_context.reason or "planner-contract-failure"
+            return TrustedPlannerFailure(
+                status="failed",
+                planner_run_id=child_run_id,
+                failure_reason=terminal_reason,
+            )
+
+        if trusted_planner and planner_service is not None:
+            if child_context.status != "success" or not planner_service.is_terminal_committed:
+                reason = planner_service.terminal_failure_reason() or "planner-contract-failure"
+                return ToolResult(
+                    content=planner_failure_message(reason),
+                    is_error=True,
+                    error_type="command_failed",
+                )
+            try:
+                # /orchestrate 读取完整 immutable V2 decision，而不是 bounded PlanView 或 child 原文
+                summary = render_planner_decision_execution_summary(
+                    planner_service.read_terminal_decision()
+                )
+            except ValueError as exc:
+                if str(exc) == "planner-result-too-large":
+                    return ToolResult(
+                        content=planner_failure_message("planner-result-too-large"),
+                        is_error=True,
+                        error_type="command_failed",
+                    )
+                return ToolResult(
+                    content=planner_failure_message("artifact-corrupt"),
+                    is_error=True,
+                    error_type="command_failed",
+                )
+            except Exception:
+                return ToolResult(
+                    content=planner_failure_message("artifact-corrupt"),
+                    is_error=True,
+                    error_type="command_failed",
+                )
+            return ToolResult(content=summary)
+
+        if slice_service is not None:
+            architecture_slice = slice_service.submitted
+            if architecture_slice is None:
+                completeness: Literal["partial", "blocked"] = (
+                    "partial"
+                    if child_context.reason == "exceeded_max_steps"
+                    else "blocked"
+                )
+                reason = child_context.reason or "explorer ended without a valid submit"
+                architecture_slice = slice_service.record_incomplete(
+                    completeness,
+                    reason,
+                )
+            return ToolResult(
+                content=json.dumps(
+                    {
+                        "slice_id": architecture_slice.slice_id,
+                        "version": architecture_slice.version,
+                        "snapshot_digest": architecture_slice.snapshot_digest,
+                        "content_digest": architecture_slice.content_digest,
+                        "completeness": architecture_slice.completeness,
+                    },
+                    sort_keys=True,
+                )
+            )
 
         if child_context.status == "success":
             return ToolResult(
@@ -286,6 +651,7 @@ class SpawnAgentTool(BaseTool):
         run_path: Path,
         run_id: str,
         lifecycle_entered: asyncio.Event | None = None,
+        planner_service: PlannerDecisionService | None = None,
     ) -> None:
         primary_failure: BaseException | None = None
         delivery_failure: BaseException | None = None
@@ -300,6 +666,17 @@ class SpawnAgentTool(BaseTool):
             _LOGGER.exception("subagent execution failed run_id=%s", run_id)
             context.mark_failed("subagent_error")
             primary_failure = exc
+
+        if (
+            planner_service is not None
+            and not isinstance(primary_failure, asyncio.CancelledError)
+        ):
+            terminal_reason = planner_service.terminal_failure_reason()
+            if terminal_reason is None and context.status != "success":
+                terminal_reason = "planner-contract-failure"
+            if terminal_reason is not None:
+                context.result = planner_failure_message(terminal_reason)
+                context.mark_failed(terminal_reason)
 
         try:
             await _cancel_background_tasks(self._background_tasks.pop(run_id, set()))
@@ -328,6 +705,11 @@ class SpawnAgentTool(BaseTool):
             delivery_failure = exc
 
         if primary_failure is not None:
+            if (
+                planner_service is not None
+                and not isinstance(primary_failure, asyncio.CancelledError)
+            ):
+                return
             if delivery_failure is not None:
                 _LOGGER.error(
                     "finished delivery failure treated as secondary run_id=%s",
@@ -351,6 +733,7 @@ class SpawnAgentTool(BaseTool):
         run_path: Path,
         run_id: str,
         lifecycle_entered: asyncio.Event,
+        planner_service: PlannerDecisionService | None = None,
     ) -> None:
         await self._run_child(
             loop,
@@ -359,6 +742,7 @@ class SpawnAgentTool(BaseTool):
             run_path,
             run_id,
             lifecycle_entered,
+            planner_service,
         )
 
     # 构造子 registry；基于角色配置过滤工具，深度允许时注册嵌套 SpawnAgentTool
@@ -367,17 +751,50 @@ class SpawnAgentTool(BaseTool):
         child_bus: EventBus,
         child_run_id: str,
         profile: AgentProfile | None,
+        *,
+        slice_service: ArchitectureSliceService | None = None,
+        planner_service: PlannerDecisionService | None = None,
     ) -> ToolRegistry:
         from kama_claude.core.task.manager import TaskManager
 
         allowed: set[str] | None = (
-            set(profile.allowed_tools) if profile and profile.allowed_tools else None
+            set(profile.allowed_tools) if profile is not None else None
         )
+        if planner_service is not None:
+            allowed = (
+                set(TRUSTED_PLANNER_ALLOWED_TOOLS)
+                if profile is None
+                else set(profile.allowed_tools) & set(TRUSTED_PLANNER_ALLOWED_TOOLS)
+            )
+
+        effective_child_types: list[str] | None = (
+            profile.allowed_subagent_types if profile is not None else None
+        )
+        if planner_service is not None:
+            if profile is None:
+                effective_child_types = list(TRUSTED_PLANNER_CHILD_TYPES)
+            else:
+                requested_child_types = profile.allowed_subagent_types
+                effective_child_types = [
+                    name
+                    for name in TRUSTED_PLANNER_CHILD_TYPES
+                    if requested_child_types is not None
+                    and name in requested_child_types
+                ]
 
         def _allowed(name: str) -> bool:
             return allowed is None or name in allowed
 
         registry = ToolRegistry()
+
+        def _register(tool: BaseTool) -> None:
+            guarded = (
+                _PlannerTerminalGuardTool(tool, planner_service)
+                if planner_service is not None and tool.name != "planner_decision_submit"
+                else tool
+            )
+            registry.register(guarded)
+
         _all_tools = [
             ReadFileTool(self._path_resolver, self._access_policy),
             BashTool(
@@ -392,7 +809,20 @@ class SpawnAgentTool(BaseTool):
         ]
         for t in _all_tools:
             if _allowed(t.name):
-                registry.register(t)
+                _register(t)
+
+        if self._semantic_service is not None and _allowed("search_semantic"):
+            _register(
+                SearchSemanticTool(
+                    self._semantic_service,
+                    fallback=SearchCodeTool(self._path_resolver, self._access_policy),
+                    degradation=self._semantic_degradation,
+                )
+            )
+        if slice_service is not None and _allowed("architecture_slice_submit"):
+            _register(ArchitectureSliceSubmitTool(slice_service))
+        if planner_service is not None and _allowed("planner_decision_submit"):
+            _register(PlannerDecisionSubmitTool(planner_service))
 
         child_task_manager = TaskManager(self._runs_dir / child_run_id / ".tasks")
         for t in [
@@ -402,7 +832,7 @@ class SpawnAgentTool(BaseTool):
             TaskGetTool(child_task_manager),
         ]:
             if _allowed(t.name):
-                registry.register(t)
+                _register(t)
 
         if self._depth < 1:
             nested = SpawnAgentTool(
@@ -419,11 +849,19 @@ class SpawnAgentTool(BaseTool):
                 journal=self._journal,
                 background_tasks=self._background_tasks,
                 sandbox_manager=self._sandbox_manager,
+                store=self._store,
+                semantic_service=self._semantic_service,
+                semantic_degradation=self._semantic_degradation,
+                git_head=self._git_head,
+                allowed_subagent_types=(
+                    effective_child_types
+                ),
+                planning_only=self._planning_only,
             )
             if _allowed("spawn_agent"):
-                registry.register(nested)
+                _register(nested)
             if _allowed("agent_result"):
-                registry.register(AgentResultTool(self._task_registry))
+                _register(AgentResultTool(self._task_registry))
 
         return registry
 

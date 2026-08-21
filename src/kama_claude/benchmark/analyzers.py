@@ -82,7 +82,7 @@ class BenchmarkMetrics(_StrictModel):
     categories: dict[str, AggregateMetrics]
 
 
-# 定位 Phase 8A 为指定 report 创建的唯一 attempt artifact 目录
+# 定位 evaluation 为指定 report 创建的唯一 attempt artifact 目录
 def _attempt_dir(attempt: BenchmarkAttempt) -> Path:
     return (
         attempt.evaluation_output
@@ -140,7 +140,7 @@ def _diff_counts(path: Path) -> tuple[int | None, int | None]:
     return additions, deletions
 
 
-# 从已通过 Phase 8A sanity 的 journal 计算发生真实 retry 的序列及恢复数
+# 从已通过 evaluation sanity 的 journal 计算发生真实 retry 的序列及恢复数
 def _retry_evidence(path: Path) -> tuple[int, int]:
     failed_attempts: dict[str, int] = {}
     finished: set[str] = set()
@@ -201,7 +201,7 @@ def _private_numeric_metrics(path: Path) -> _PrivateNumericMetrics:
         raise BenchmarkAnalysisError("private numeric metrics evidence is invalid") from exc
 
 
-# 将 Phase 8A report 与其 canonical artifacts 机械转换为单 attempt benchmark metrics
+# 将 evaluation report 与其 canonical artifacts 机械转换为单 attempt benchmark metrics
 def analyze_attempt(
     attempt: BenchmarkAttempt,
     metadata: BenchmarkTaskSpec,

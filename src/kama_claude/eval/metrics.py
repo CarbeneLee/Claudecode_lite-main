@@ -28,7 +28,7 @@ class BasicMetrics(_StrictModel):
     failure_category: FailureCategory
 
 
-# 从已经通过 sanity 的事件机械计算 Phase 8A basic metrics
+# 从已经通过 sanity 的事件机械计算 evaluation basic metrics
 def compute_basic_metrics(
     events: list[dict[str, Any]],
     *,

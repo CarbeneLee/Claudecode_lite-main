@@ -9,12 +9,10 @@ from kama_claude.core.bus.events import StepFinishedEvent, StepStartedEvent
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.base import LLMProvider
-from kama_claude.core.tools.invocation import invoke_tool
-from kama_claude.core.tools.registry import ToolRegistry
+from kama_claude.core.tools.invocation import ToolInvoker
 
 if TYPE_CHECKING:
     from kama_claude.core.compact.compactor import Compactor  # TYPE_CHECKING 避免循环导入问题
-    from kama_claude.core.permissions.manager import PermissionManager
 
 
 log = logging.getLogger(__name__)
@@ -78,28 +76,25 @@ async def _publish_step_finished_once(bus: EventBus, event: StepFinishedEvent) -
 
 # AgentLoop 是核心循环驱动器，负责执行 plan→act→observe 循环，直到上下文终止。
 class AgentLoop:
-    # 初始化循环依赖：LLM provider、工具注册表、事件总线和可选管理器
+    # 初始化循环依赖：LLM provider、强制工具调用器和事件总线
     def __init__(
         self,
         provider: LLMProvider, # LLMProvider 是一个抽象类，定义了与语言模型交互的接口
-        registry: ToolRegistry, # ToolRegistry 是一个工具注册表，管理可用的工具和它们的模式
+        tool_invoker: ToolInvoker, # ToolInvoker 同时提供 provider schema 与唯一执行入口
         bus: EventBus, # EventBus 是一个事件总线，用于在系统中发布和订阅事件
         *,
-        # PermissionManager 控制工具调用权限
-        permission_manager: PermissionManager | None = None,
         # Compactor 在对话中压缩上下文以节省 token
         compactor: Compactor | None = None,
         # compact_threshold 表示触发上下文压缩的百分比阈值
         compact_threshold: float = 0.80,
-        session_id: str = "", # session_id 是一个字符串，表示当前会话的唯一标识符
     ) -> None:
+        if tool_invoker is None:
+            raise TypeError("tool_invoker is required")
         self._provider = provider
-        self._registry = registry
         self._bus = bus
-        self._permission_manager = permission_manager
         self._compactor = compactor
         self._compact_threshold = compact_threshold
-        self._session_id = session_id
+        self._tool_invoker = tool_invoker
 
     # 每步发布 step.started，并向 LLM 传入消息、工具 schema 和 system prompt
     # 驱动 plan→act→observe 循环直到上下文终止；CancelledError 向上传播
@@ -119,8 +114,8 @@ class AgentLoop:
                 try:
                     response = await self._provider.chat(
                         messages=context.messages,#携带完整的对话消息列表，包括系统提示和用户输入。
-                        # 将所有注册工具以 Anthropic API 格式传给 LLM
-                        tool_schemas=self._registry.tool_schemas(),
+                        # 将实际 invocation boundary 的 exact schema 传给 LLM
+                        tool_schemas=self._tool_invoker.tool_schemas(),
                         bus=self._bus,
                         run_id=context.run_id,
                         step=context.step,
@@ -180,12 +175,12 @@ class AgentLoop:
                 # [act] execute each requested tool; errors become tool results so loop continues
                 if response.stop_reason == "tool_use":
                     for tc in response.tool_calls:
-                        result = await invoke_tool(
-                            self._registry, tc, self._bus, context.run_id,
-                            permission_manager=self._permission_manager,
-                            session_id=self._session_id,
-                        )
+                        result = await self._tool_invoker.invoke(tc)
                         context.add_tool_result(tc.id, result.content, is_error=result.is_error)
+                        terminal_reason = self._tool_invoker.terminal_reason()
+                        if terminal_reason is not None:
+                            context.mark_failed(terminal_reason)
+                            break
                 # LLM 输出工具参数时被截断，tool_calls 可能包含不完整参数
                 elif response.stop_reason == "max_tokens" and response.tool_calls:
                     # Output token limit hit mid-tool-call; input is incomplete.
@@ -222,6 +217,7 @@ class AgentLoop:
             except asyncio.CancelledError as exc:
                 if primary_failure is None:
                     primary_failure = exc
+                    context.mark_failed("cancelled")
                 raise
             except Exception as exc:
                 if primary_failure is None:

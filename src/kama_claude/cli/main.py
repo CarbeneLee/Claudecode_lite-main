@@ -28,6 +28,12 @@ def main() -> None:
 
     run_parser = subparsers.add_parser("run", help="Run an agent task")
     run_parser.add_argument("--goal", required=True, help="Goal for the agent to accomplish")
+    run_parser.add_argument(
+        "--mode",
+        choices=("direct", "plan"),
+        default="direct",
+        help="Execution mode for this run",
+    )
 
     core_parser = subparsers.add_parser("core", help="Manage the core daemon")
     core_sub = core_parser.add_subparsers(dest="core_command")
@@ -56,7 +62,7 @@ def main() -> None:
     elif args.command == "chat":
         cmd_chat(config)
     elif args.command == "run":
-        cmd_run(args.goal, config)
+        cmd_run(args.goal, config, agent_mode=args.mode)
     elif args.command == "echo":
         message = args.message_option if args.message_option is not None else args.message
         if message is None:

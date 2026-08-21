@@ -168,6 +168,10 @@ class EventJournalCoordinator:
         self._on_live_only = on_live_only
         self._on_stream_failure = on_stream_failure
         self._accepting = True
+        self._event_outcomes: dict[str, JournalPublishOutcome] = {}
+        self._event_payloads: dict[str, dict[str, Any]] = {}
+        # 串行化显式 event_id 的 reservation，避免并发 PlanReady 重复入队
+        self._explicit_event_lock = asyncio.Lock()
 
     @property
     # 暴露 identity registry 供 lifecycle 注册测试与只读查询
@@ -276,16 +280,57 @@ class EventJournalCoordinator:
             return v2_records[-1].seq
         return len(legacy_records)
 
-    # 将一个 domain event 原子预留到全部目标 stream queue
+    # 将普通 domain event 入队；PlanReady 由显式 durable API 等待全部 stream receipt
     async def handle(self, event: BaseModel) -> None:
+        await self._publish_event(event, await_all=False)
+
+    # 将必须 durable 的 projection 入队并等待全部目标 stream flush 成功
+    async def publish_required_durable(self, event: BaseModel) -> JournalPublishOutcome:
+        return await self._publish_event(event, await_all=True)
+
+    # 按显式 event_id 串行化 reservation，再将 domain event 交给单次发布实现
+    async def _publish_event(
+        self,
+        event: BaseModel,
+        *,
+        await_all: bool,
+    ) -> JournalPublishOutcome:
+        event_data = event.model_dump(mode="json")
+        requested_event_id = event_data.get("event_id")
+        if isinstance(requested_event_id, str) and requested_event_id:
+            async with self._explicit_event_lock:
+                return await self._publish_event_once(event, await_all=await_all)
+        return await self._publish_event_once(event, await_all=await_all)
+
+    # 将一个 domain event 原子预留到全部目标 stream queue
+    async def _publish_event_once(
+        self,
+        event: BaseModel,
+        *,
+        await_all: bool,
+    ) -> JournalPublishOutcome:
         if not self._accepting:
             raise JournalError("journal coordinator is closing")
         targets, terminal_targets = self._route_event(event)
-        event_id = f"evt-{uuid.uuid4().hex}"
+        event_data = event.model_dump(mode="json")
+        requested_event_id = event_data.get("event_id")
+        event_id = (
+            requested_event_id
+            if isinstance(requested_event_id, str) and requested_event_id
+            else f"evt-{uuid.uuid4().hex}"
+        )
+        previous_payload = self._event_payloads.get(event_id)
+        if previous_payload is not None:
+            if previous_payload != event_data:
+                raise JournalError("event_id payload conflict")
+            return self._event_outcomes[event_id]
         if not targets:
             if self._on_live_only is not None:
                 await self._on_live_only(event)
-            return
+            outcome = JournalPublishOutcome(event_id=event_id, streams=())
+            self._event_payloads[event_id] = event_data
+            self._event_outcomes[event_id] = outcome
+            return outcome
 
         states = [self._streams[target] for target in sorted(targets)]
         for state in states:
@@ -293,7 +338,6 @@ class EventJournalCoordinator:
         queued: list[_QueuedRecord] = []
         limiting_state: _StreamState | None = None
         try:
-            event_data = event.model_dump(mode="json")
             for state in states:
                 try:
                     if state.lifecycle is not StreamLifecycle.OPEN:
@@ -357,9 +401,21 @@ class EventJournalCoordinator:
             for state in reversed(states):
                 state.lock.release()
 
-        terminal_receipts = [item.durable for item in queued if item.terminal]
-        if terminal_receipts:
-            await _await_preserving_cancellation(terminal_receipts)
+        receipts = (
+            [item.durable for item in queued]
+            if await_all
+            else [item.durable for item in queued if item.terminal]
+        )
+        if receipts:
+            await _await_preserving_cancellation(receipts)
+        outcome = JournalPublishOutcome(
+            event_id=event_id,
+            streams=tuple(sorted(targets)),
+        )
+        if requested_event_id:
+            self._event_payloads[event_id] = event_data
+            self._event_outcomes[event_id] = outcome
+        return outcome
 
     # 依据冻结 routing table 计算 durable targets 与 terminal stream
     def _route_event(self, event: BaseModel) -> tuple[set[str], set[str]]:
@@ -378,6 +434,19 @@ class EventJournalCoordinator:
             targets.add(stream_id)
             if event_type == "session.closed":
                 terminals.add(stream_id)
+            return targets, terminals
+
+        # 将无 run_id 的 session-scoped domain event 路由到 session stream
+        direct_session = data.get("session_id")
+        if (
+            isinstance(direct_session, str)
+            and direct_session
+            and not isinstance(data.get("run_id"), str)
+        ):
+            stream_id = f"session:{direct_session}"
+            if stream_id not in self._streams:
+                raise UnknownStreamError(f"unknown durable stream {stream_id}")
+            targets.add(stream_id)
             return targets, terminals
 
         run_id = data.get("run_id")
@@ -544,6 +613,25 @@ class EventJournalCoordinator:
     # 返回 durable stream 是否已由唯一 owner 注册
     def has_stream(self, stream_id: str) -> bool:
         return stream_id in self._streams
+
+    # 检查指定 run stream 是否已经持久化 terminal run.finished 事件
+    async def has_terminal_run(self, run_id: str) -> bool:
+        stream_id = f"run:{run_id}"
+        if not self.has_stream(stream_id):
+            return False
+        high_watermark = self.high_watermark(stream_id)
+        if high_watermark <= 0:
+            return False
+        replay = await self.read_replay(
+            stream_id,
+            after_seq=0,
+            high_watermark=high_watermark,
+        )
+        return any(
+            record.event.get("type") == "run.finished"
+            and record.event.get("run_id") == run_id
+            for record in replay.records
+        )
 
     # 在 stream lock 内捕获 durable watermark 并同步登记 catch-up observer
     async def capture_high_watermark(

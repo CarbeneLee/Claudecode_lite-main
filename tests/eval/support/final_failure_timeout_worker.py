@@ -14,6 +14,7 @@ from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.runner import RunOutcome
 from kama_claude.core.tools.base import BaseTool, ToolResult
+from kama_claude.core.tools.invocation import DirectToolInvoker
 from kama_claude.core.tools.registry import ToolRegistry
 from kama_claude.core.trace.provider import TracingProvider
 from kama_claude.core.trace.writer import TraceWriter
@@ -131,7 +132,8 @@ class _TimeoutRunner:
             goal=goal,
             max_steps=self._config.agent.max_steps,
         )
-        await AgentLoop(provider, registry, self._bus).run(context)
+        invoker = DirectToolInvoker(registry, self._bus, run_id)
+        await AgentLoop(provider, invoker, self._bus).run(context)
         return RunOutcome(
             status=context.status,
             result=context.result,

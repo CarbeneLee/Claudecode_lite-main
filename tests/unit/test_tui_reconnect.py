@@ -9,6 +9,9 @@ from typing import Any
 import pytest
 
 import kama_claude.tui.app as tui_app_module
+from kama_claude.core.approval import ApprovalSnapshotState
+from kama_claude.core.plan_view import PlanViewV1, projection_digest
+from kama_claude.core.session.model import AgentModeSnapshot
 from kama_claude.core.transport.socket_client import EventDelivery
 from kama_claude.tui.app import (
     KamaTuiApp,
@@ -16,6 +19,37 @@ from kama_claude.tui.app import (
     _SessionCreateOutcomeUnknown,
     _TuiReconnectState,
 )
+
+
+# 构造最小合法 PlanReady projection，覆盖 TUI committed approval wiring
+def _plan_event() -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "decision_key": "decision-1:v1",
+        "projection_key": "pv1:run-1:decision-1:v1",
+        "decision_id": "decision-1",
+        "decision_version": 1,
+        "decision_content_digest": "decision-digest",
+        "architecture_slice_id": "slice-1",
+        "architecture_slice_version": 1,
+        "architecture_slice_content_digest": "slice-digest",
+        "snapshot_digest": "snapshot-digest",
+        "goal": "change behavior",
+        "architecture_mode": "preserve",
+        "selected_approach": "edit existing module",
+        "projection_digest": "placeholder",
+    }
+    payload = PlanViewV1.model_validate(payload).model_dump(mode="json")
+    payload["projection_digest"] = projection_digest(payload)
+    return {
+        "type": "planner.decision_ready",
+        "event_id": "plan-ready:pv1:run-1:decision-1:v1",
+        "run_id": "run-1",
+        "planner_run_id": "planner-1",
+        "session_id": "sess-1",
+        "plan": PlanViewV1.model_validate(payload).model_dump(mode="json"),
+        "ts": "t",
+    }
 
 
 # 构造指定持久元数据的 delivery，便于验证失败重放边界
@@ -81,6 +115,8 @@ class _ScriptedClient:
             return {"removed": True}
         if method == "session.get_history":
             return {"messages": []}
+        if method == "session.get_agent_mode":
+            return {"agent_mode": "direct", "revision": 0}
         if method == "session.create":
             if self.fail_create_response:
                 raise asyncio.CancelledError
@@ -157,6 +193,455 @@ def test_replay_subscription_uses_run_stream_cursor() -> None:
     assert state.subscription_target() == ("run:run-7", 12)
 
 
+# 功能：验证 TUI authority GET 的 stale response 不会降低本地 mode revision
+# 设计：直接调用纯 authority 应用边界，隔离 socket 重连，锁定 daemon response 的四分支语义
+def test_tui_stale_authority_response_cannot_downgrade_revision() -> None:
+    app = KamaTuiApp("127.0.0.1", 9999)
+    app._mode_snapshot = AgentModeSnapshot("plan", 5)
+    app._agent_mode = "plan"
+    app._agent_mode_revision = 5
+
+    app._apply_mode_authority(AgentModeSnapshot("direct", 4))
+
+    assert app._agent_mode == "plan"
+    assert app._agent_mode_revision == 5
+
+
+# 功能：验证 equal-revision conflict 只设置刷新标记且 delivery callback 不同步发 RPC
+# 设计：fake client 记录调用，先 await delivery callback 再检查调用列表，随后清理 deferred worker
+async def test_tui_mode_conflict_defers_and_coalesces_refresh() -> None:
+    class _Client:
+        # 记录 deferred worker 的 authority 查询次数
+        def __init__(self) -> None:
+            self.calls = 0
+
+        # 独立 worker 调用的最小 mode response
+        async def send_command(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            assert method == "session.get_agent_mode"
+            self.calls += 1
+            return {"agent_mode": "plan", "revision": 5}
+
+    app = KamaTuiApp("127.0.0.1", 9999)
+    client = _Client()
+    app._client = client  # type: ignore[assignment]
+    app._session_id = "sess-1"
+    app._mode_snapshot = AgentModeSnapshot("direct", 5)
+    app._agent_mode = "direct"
+    app._agent_mode_revision = 5
+
+    delivery = EventDelivery(
+        subscription_id="sub",
+        delivery="live",
+        event_id="mode-conflict",
+        stream_id="session:sess-1",
+        seq=4,
+        daemon_instance_id="daemon-a",
+        event={
+            "type": "session.agent_mode_changed",
+            "previous_mode": "direct",
+            "agent_mode": "plan",
+            "revision": 5,
+            "ts": "t",
+        },
+    )
+    await app._handle_delivery(delivery)
+    assert client.calls == 0
+
+    app._schedule_mode_refresh()
+    app._schedule_mode_refresh()
+    assert app._mode_refresh_task is not None
+    await app._mode_refresh_task
+
+    assert client.calls == 1
+    assert app._agent_mode == "plan"
+
+
+# 功能：验证 deferred mode response 不会污染 session replacement 后的新视图
+# 设计：用两个 session owner 和 response gate 模拟旧 RPC 跨 await 返回，直接断言新视图保持 authority
+async def test_tui_deferred_mode_refresh_discards_stale_session_response() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class _Client:
+        # 阻塞旧 session 的 mode 查询直到测试完成 view replacement
+        async def send_command(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            assert method == "session.get_agent_mode"
+            assert params["session_id"] == "sess-1"
+            started.set()
+            await release.wait()
+            return {"agent_mode": "plan", "revision": 20}
+
+    app = KamaTuiApp("127.0.0.1", 9999)
+    client = _Client()
+    app._client = client  # type: ignore[assignment]
+    app._session_id = "sess-1"
+    app._reconnect_state.daemon_instance_id = "daemon-a"
+    app._mode_snapshot = AgentModeSnapshot("plan", 20)
+    app._agent_mode = "plan"
+    app._agent_mode_revision = 20
+
+    app._schedule_mode_refresh()
+    await started.wait()
+
+    app._client = object()  # type: ignore[assignment]
+    app._session_id = "sess-2"
+    app._reconnect_state.daemon_instance_id = "daemon-b"
+    app._mode_snapshot = AgentModeSnapshot("direct", 0)
+    app._agent_mode = "direct"
+    app._agent_mode_revision = 0
+    release.set()
+
+    assert app._mode_refresh_task is not None
+    await app._mode_refresh_task
+
+    assert app._agent_mode == "direct"
+    assert app._agent_mode_revision == 0
+
+
+# 功能：验证旧 client/daemon 的 deferred response 被丢弃而不依赖 revision 比较
+# 设计：保持 session id 相同但替换 client 与 daemon identity，覆盖不同连接 lineage 的 owner 校验
+async def test_tui_deferred_mode_refresh_discards_stale_client_response() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class _OldClient:
+        # 阻塞旧 client 的 mode 查询
+        async def send_command(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            assert method == "session.get_agent_mode"
+            started.set()
+            await release.wait()
+            return {"agent_mode": "plan", "revision": 20}
+
+    app = KamaTuiApp("127.0.0.1", 9999)
+    old_client = _OldClient()
+    app._client = old_client  # type: ignore[assignment]
+    app._session_id = "sess-1"
+    app._reconnect_state.daemon_instance_id = "daemon-a"
+    app._mode_snapshot = AgentModeSnapshot("direct", 0)
+
+    app._schedule_mode_refresh()
+    await started.wait()
+
+    app._client = object()  # type: ignore[assignment]
+    app._reconnect_state.daemon_instance_id = "daemon-b"
+    release.set()
+    assert app._mode_refresh_task is not None
+    await app._mode_refresh_task
+
+    assert app._agent_mode == "direct"
+    assert app._agent_mode_revision == 0
+
+
+# 功能：验证 TUI PlanReady 绑定 exact approval target，并在独立 worker 中查询 authority
+# 设计：fake client 记录 get_approval 调用，先处理真实 event 再等待 refresh task，覆盖 callback 不同步 RPC 的边界
+async def test_tui_committed_plan_queries_exact_approval_authority() -> None:
+    class _Client:
+        # 返回与 committed PlanView 完全一致的 pending authority
+        async def send_command(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            assert method == "plan.get_approval"
+            assert params["projection_key"] == "pv1:run-1:decision-1:v1"
+            return {
+                "session_id": "sess-1",
+                "projection_key": "pv1:run-1:decision-1:v1",
+                "status": "pending",
+                "decision_id": "decision-1",
+                "decision_version": 1,
+                "content_digest": "decision-digest",
+                "commit_receipt_digest": "receipt-digest",
+            }
+
+    app = KamaTuiApp("127.0.0.1", 9999)
+    app._client = _Client()  # type: ignore[assignment]
+    app._session_id = "sess-1"
+    app._reconnect_state.daemon_instance_id = "daemon-a"
+    app._append = lambda _widget: None  # type: ignore[method-assign]
+
+    app._handle_event(_plan_event())
+    app._handle_event({"type": "run.finished", "run_id": "run-1", "status": "success"})
+    projection_key = "pv1:run-1:decision-1:v1"
+    app._schedule_approval_refresh(projection_key)
+    assert app._approval_refresh_tasks[projection_key] is not None
+    await app._approval_refresh_tasks[projection_key]
+
+    state = app._approval_states[projection_key]
+    assert state.snapshot.status == "pending"
+    assert state.snapshot.commit_receipt_digest == "receipt-digest"
+
+
+# 功能：验证 TUI approve control 使用 authority receipt 和 exact decision identity
+# 设计：同一个 fake client 先响应 get 再响应 approve，直接运行 worker 方法而非只检查 slash 文案
+async def test_tui_approval_control_merges_rpc_result() -> None:
+    class _Client:
+        # 返回 pending authority 或 approved command result
+        async def send_command(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "plan.get_approval":
+                return {
+                    "session_id": "sess-1",
+                    "projection_key": "pv1:run-1:decision-1:v1",
+                    "status": "pending",
+                    "decision_id": "decision-1",
+                    "decision_version": 1,
+                    "content_digest": "decision-digest",
+                    "commit_receipt_digest": "receipt-digest",
+                }
+            assert method == "plan.approve"
+            assert params["content_digest"] == "decision-digest"
+            assert params["commit_receipt_digest"] == "receipt-digest"
+            return {
+                "session_id": "sess-1",
+                "projection_key": "pv1:run-1:decision-1:v1",
+                "status": "approved",
+                "decision_id": "decision-1",
+                "decision_version": 1,
+                "content_digest": "decision-digest",
+                "commit_receipt_digest": "receipt-digest",
+                "action": "approve",
+                "record_digest": "record-a",
+            }
+
+    app = KamaTuiApp("127.0.0.1", 9999)
+    app._client = _Client()  # type: ignore[assignment]
+    app._session_id = "sess-1"
+    app._reconnect_state.daemon_instance_id = "daemon-a"
+    app._append = lambda _widget: None  # type: ignore[method-assign]
+    app._handle_event(_plan_event())
+    app._handle_event({"type": "run.finished", "run_id": "run-1", "status": "success"})
+
+    await app._do_approval_command("/approve", "approve")
+
+    assert app._approval_states["pv1:run-1:decision-1:v1"].snapshot.status == "approved"
+
+
+# 功能：验证 TUI approval event 冲突只渲染本地 conflicted/unknown 状态
+# 设计：先应用 approved，再投递 disputed rejected event，确保 UI 不把 incoming terminal 当作 authority
+def test_tui_approval_event_conflict_renders_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = KamaTuiApp("127.0.0.1", 9999)
+    app._client = object()  # type: ignore[assignment]
+    app._session_id = "sess-1"
+    app._reconnect_state.daemon_instance_id = "daemon-a"
+    rendered: list[str] = []
+    monkeypatch.setattr(
+        app,
+        "_show_approval_snapshot",
+        lambda snapshot: rendered.append(snapshot.status),
+    )
+    app._append = lambda _widget: None  # type: ignore[method-assign]
+    app._handle_event(_plan_event())
+    app._handle_event({"type": "run.finished", "run_id": "run-1", "status": "success"})
+    projection_key = "pv1:run-1:decision-1:v1"
+
+    app._handle_approval_event(
+        {
+            "type": "plan.approval_changed",
+            "session_id": "sess-1",
+            "projection_key": projection_key,
+            "status": "approved",
+            "action": "approve",
+            "record_digest": "record-a",
+            "commit_receipt_digest": "receipt-digest",
+        }
+    )
+    app._handle_approval_event(
+        {
+            "type": "plan.approval_changed",
+            "session_id": "sess-1",
+            "projection_key": projection_key,
+            "status": "rejected",
+            "action": "reject",
+            "record_digest": "record-b",
+            "commit_receipt_digest": "receipt-digest",
+        }
+    )
+
+    assert app._approval_states[projection_key].snapshot.status == "conflicted/unknown"
+    assert rendered == ["approved", "conflicted/unknown"]
+    assert "rejected" not in rendered
+
+
+# 功能：验证 TUI approve/reject RPC 冲突只渲染本地 conflicted/unknown 状态
+# 设计：先合并 approved authority，再合并 disputed rejected response，覆盖非 notification 的同一 UI 边界
+def test_tui_approval_response_conflict_renders_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = KamaTuiApp("127.0.0.1", 9999)
+    app._client = object()  # type: ignore[assignment]
+    app._session_id = "sess-1"
+    app._reconnect_state.daemon_instance_id = "daemon-a"
+    rendered: list[str] = []
+    monkeypatch.setattr(
+        app,
+        "_show_approval_snapshot",
+        lambda snapshot: rendered.append(snapshot.status),
+    )
+    app._append = lambda _widget: None  # type: ignore[method-assign]
+    app._handle_event(_plan_event())
+    app._handle_event({"type": "run.finished", "run_id": "run-1", "status": "success"})
+    projection_key = "pv1:run-1:decision-1:v1"
+
+    app._handle_approval_event(
+        {
+            "type": "plan.approval_changed",
+            "session_id": "sess-1",
+            "projection_key": projection_key,
+            "status": "approved",
+            "action": "approve",
+            "record_digest": "record-a",
+            "commit_receipt_digest": "receipt-digest",
+        }
+    )
+    merged = app._merge_approval_response(
+        {
+            "session_id": "sess-1",
+            "projection_key": projection_key,
+            "status": "rejected",
+            "action": "reject",
+            "record_digest": "record-b",
+            "commit_receipt_digest": "receipt-digest",
+            "decision_id": "decision-1",
+            "decision_version": 1,
+            "content_digest": "decision-digest",
+        }
+    )
+
+    assert merged is True
+    assert app._approval_states[projection_key].snapshot.status == "conflicted/unknown"
+    assert rendered == ["approved", "conflicted/unknown"]
+    assert "rejected" not in rendered
+
+
+# 功能：验证 TUI approval refresh 返回到被替换的 projection state 后不会更新新 view
+# 设计：阻塞旧 GET，替换同 key 的 state object 后放行，覆盖 await 后 owner/state identity 检查
+async def test_tui_stale_approval_refresh_state_is_discarded() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class _Client:
+        # 让旧 view 的 authority response 跨过 state replacement
+        async def send_command(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            assert method == "plan.get_approval"
+            started.set()
+            await release.wait()
+            return {
+                "session_id": "sess-1",
+                "projection_key": "pv1:run-1:decision-1:v1",
+                "status": "approved",
+                "decision_id": "decision-1",
+                "decision_version": 1,
+                "content_digest": "decision-digest",
+                "commit_receipt_digest": "receipt-digest",
+                "action": "approve",
+                "record_digest": "record-old",
+            }
+
+    app = KamaTuiApp("127.0.0.1", 9999)
+    client = _Client()
+    app._client = client  # type: ignore[assignment]
+    app._session_id = "sess-1"
+    app._reconnect_state.daemon_instance_id = "daemon-a"
+    app._append = lambda _widget: None  # type: ignore[method-assign]
+    app._handle_event(_plan_event())
+    app._handle_event({"type": "run.finished", "run_id": "run-1", "status": "success"})
+    projection_key = "pv1:run-1:decision-1:v1"
+    old_state = app._approval_states[projection_key]
+    app._schedule_approval_refresh(projection_key)
+    await started.wait()
+    app._approval_states[projection_key] = ApprovalSnapshotState(old_state.owner)
+    release.set()
+    task = app._approval_refresh_tasks.get(projection_key)
+    assert task is not None
+    await task
+
+    assert app._approval_states[projection_key].snapshot.status == "pending"
+
+
+# 功能：验证 /plan、/direct、/mode worker 返回后若 view owner 已替换，不渲染旧结果
+# 设计：参数化三条 mode command，共用 response gate 覆盖 command 与 query 两种 RPC 路径
+@pytest.mark.parametrize("content", ["/plan", "/direct", "/mode"])
+async def test_tui_mode_command_discards_stale_owner_response(content: str) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    rendered: list[str] = []
+
+    class _Client:
+        # 阻塞旧 owner 的 set mode 命令
+        async def send_command(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            expected_method = (
+                "session.get_agent_mode"
+                if content == "/mode"
+                else "session.set_agent_mode"
+            )
+            assert method == expected_method
+            assert params["session_id"] == "sess-1"
+            started.set()
+            await release.wait()
+            return {"agent_mode": "plan", "revision": 20}
+
+    app = KamaTuiApp("127.0.0.1", 9999)
+    old_client = _Client()
+    app._client = old_client  # type: ignore[assignment]
+    app._session_id = "sess-1"
+    app._reconnect_state.daemon_instance_id = "daemon-a"
+    app._append = lambda widget: rendered.append(str(widget))  # type: ignore[method-assign]
+    app._update_header = lambda state: None  # type: ignore[method-assign]
+
+    command_task = asyncio.create_task(app._do_mode_command(content))
+    await started.wait()
+    app._client = object()  # type: ignore[assignment]
+    app._session_id = "sess-2"
+    app._reconnect_state.daemon_instance_id = "daemon-b"
+    app._mode_snapshot = AgentModeSnapshot("direct", 0)
+    release.set()
+    await command_task
+
+    assert app._agent_mode == "direct"
+    assert app._agent_mode_revision == 0
+    assert rendered == []
+
+
+# 功能：验证当前 owner 的 mode command 仍应用 authority 并渲染成功提示
+# 设计：不替换 owner，使用最小 fake client 证明正常路径没有被 stale guard 误拒绝
+async def test_tui_mode_command_applies_current_owner_response() -> None:
+    rendered: list[str] = []
+
+    class _Client:
+        # 返回当前 owner 的完整 mode response
+        async def send_command(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            assert method == "session.set_agent_mode"
+            assert params["session_id"] == "sess-1"
+            return {"agent_mode": "plan", "revision": 1}
+
+    app = KamaTuiApp("127.0.0.1", 9999)
+    app._client = _Client()  # type: ignore[assignment]
+    app._session_id = "sess-1"
+    app._reconnect_state.daemon_instance_id = "daemon-a"
+    app._append = lambda widget: rendered.append(str(widget))  # type: ignore[method-assign]
+    app._update_header = lambda state: None  # type: ignore[method-assign]
+
+    await app._do_mode_command("/plan")
+
+    assert app._agent_mode == "plan"
+    assert app._agent_mode_revision == 1
+    assert len(rendered) == 1
+
+
+# 功能：验证 mode RPC 缺少任一必需字段时 fail closed 而不合成默认 snapshot
+# 设计：参数化缺失 mode/revision 两种 wire contract 破坏，区分新 RPC 严格性与 legacy event 兼容
+@pytest.mark.parametrize("payload", [{"agent_mode": "plan"}, {"revision": 5}])
+async def test_tui_mode_rpc_missing_fields_fails_closed(
+    payload: dict[str, object],
+) -> None:
+    class _Client:
+        # 返回缺少一个必需字段的非法新 mode response
+        async def send_command(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            return payload
+
+    app = KamaTuiApp("127.0.0.1", 9999)
+
+    assert await app._refresh_agent_mode(_Client(), "sess-1") is None  # type: ignore[arg-type]
+
+
 # 功能：验证 handler 失败不提交 cursor，同 daemon 重连后仍从旧 seq 重放
 # 设计：用 Event 门控首次 handler 异常与第二次成功，不依赖 sleep 或 task 私有字段
 async def test_handler_failure_keeps_delivery_retryable_after_same_daemon_reconnect() -> None:
@@ -199,6 +684,10 @@ async def test_initial_connection_uses_response_gate_then_session_stream() -> No
 
     task = asyncio.create_task(app._run_connection(client))  # type: ignore[arg-type]
     await client.subscribed.wait()
+    for _ in range(20):
+        if rendered:
+            break
+        await asyncio.sleep(0)
 
     assert app._session_id == "sess-new"
     assert app._reconnect_state.daemon_instance_id == "daemon-a"
@@ -214,6 +703,7 @@ async def test_initial_connection_uses_response_gate_then_session_stream() -> No
     ]
     assert client.commands[3][1]["scope"] == "session:sess-new"
     assert client.commands[3][1]["after_seq"] == 0
+    assert client.commands[4][0] == "session.get_agent_mode"
 
     client.release.set()
     await task

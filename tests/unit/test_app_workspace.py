@@ -18,7 +18,7 @@ from kama_claude.core.sandbox.config import SandboxConfig
 from kama_claude.core.sandbox.executors import ExecResult
 from kama_claude.core.sandbox.manager import SandboxManager
 from kama_claude.core.semantic.service import SemanticRetrievalService
-from kama_claude.core.session.model import Session, SessionMode
+from kama_claude.core.session.model import AgentModeSnapshot, Session, SessionMode
 from kama_claude.core.workspace.context import WorkspaceContext
 from kama_claude.core.workspace.errors import INVALID_WORKSPACE
 
@@ -44,11 +44,13 @@ class _Sessions:
         title: str = "",
         *,
         workspace_root: Path,
+        agent_mode: str = "direct",
     ) -> Session:
         self.created.append((mode, title, workspace_root))
         return Session(
             id="sess-test",
             mode=mode,
+            agent_mode=agent_mode,  # type: ignore[arg-type]
             status="active",
             title=title,
             created_at="t",
@@ -66,6 +68,17 @@ class _Sessions:
     ) -> str:
         self.messages.append((sid, content, run_id))
         return run_id or "run-test"
+
+    # 返回固定 mode authority，覆盖 CoreApp 到 wire result 的 revision 映射
+    async def get_agent_mode(self, sid: str) -> AgentModeSnapshot:
+        assert sid == "sess-test"
+        return AgentModeSnapshot("plan", 4)
+
+    # 返回固定 committed mode authority，覆盖 set handler 的 revision 映射
+    async def set_agent_mode(self, sid: str, agent_mode: str) -> AgentModeSnapshot:
+        assert sid == "sess-test"
+        assert agent_mode == "direct"
+        return AgentModeSnapshot("direct", 5)
 
 
 # 功能：验证 agent.run 校验 workspace 后用 canonical Path 创建 one_shot Session
@@ -89,6 +102,23 @@ async def test_agent_run_handler_creates_session_with_canonical_workspace(
     assert result.run_id
     assert sessions.created == [("one_shot", "inspect", workspace.resolve(strict=True))]
     assert sessions.messages == [("sess-test", "inspect", result.run_id)]
+
+
+# 功能：验证 CoreApp mode handlers 将 SessionManager snapshot 映射为带 revision 的 wire result
+# 设计：使用轻量 session manager stub，隔离 socket 层并直接检查 daemon handler 的公共协议边界
+async def test_mode_handlers_return_authoritative_revision() -> None:
+    app = CoreApp()
+    app._sessions = _Sessions()  # type: ignore[assignment]
+
+    get_result = await app._session_get_agent_mode_handler({"session_id": "sess-test"})
+    set_result = await app._session_set_agent_mode_handler(
+        {"session_id": "sess-test", "agent_mode": "direct"}
+    )
+
+    assert get_result.agent_mode == "plan"
+    assert get_result.revision == 4
+    assert set_result.agent_mode == "direct"
+    assert set_result.revision == 5
 
 
 # 功能：验证 agent.run 对相对 workspace 返回与 session.create 相同的 domain error

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from kama_claude.core.bus.events import (
     PermissionDeniedEvent,
@@ -16,6 +16,13 @@ from kama_claude.core.bus.events import (
     ToolCallStartedEvent,
 )
 from kama_claude.core.events.bus import EventBus
+from kama_claude.core.execution_scope import (
+    AuthorizationAttempt,
+    ExecutionScopeAuthorization,
+    ExecutionScopeError,
+    ScopedExecutionContext,
+    ScopeRequiredError,
+)
 from kama_claude.core.llm.types import ToolCallBlock
 from kama_claude.core.tools.base import ToolResult
 from kama_claude.core.tools.errors import (
@@ -37,6 +44,117 @@ _RETRY_BASE_S: float = 2.0  # backoff base; tests can monkeypatch to 0
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+class InvocationAuthorization(Protocol):
+    # 描述 shared invocation pipeline 的 scope authorization 三个生命周期钩子
+    async def authorize_call(self, *, tool_call: ToolCallBlock, tool: Any = None) -> None: ...
+
+    # 在每次 attempt 前检查当前 execution state
+    async def before_attempt(
+        self,
+        *,
+        tool_call: ToolCallBlock,
+        tool: Any = None,
+        attempt: int,
+    ) -> None: ...
+
+    # 在 retry decision 前审计 attempt 的实际结果
+    async def after_attempt(
+        self,
+        *,
+        tool_call: ToolCallBlock,
+        tool: Any = None,
+        attempt: int,
+        outcome: object,
+    ) -> AuthorizationAttempt: ...
+
+
+class ToolInvoker(Protocol):
+    # 描述 AgentLoop 必须注入的受控工具调用边界
+    def tool_schemas(self) -> list[dict[str, object]]: ...
+
+    # 执行一次已经过 lookup/schema/permission/scope 管线的工具调用
+    async def invoke(self, tool_call: ToolCallBlock) -> ToolResult: ...
+
+    # 返回不可继续执行的硬终止原因，普通工具错误返回 None
+    def terminal_reason(self) -> str | None: ...
+
+
+class UnscopedAuthorization:
+    # 为 Direct invocation 提供不改变现有行为的 no-op authorization
+    async def authorize_call(self, *, tool_call: ToolCallBlock, tool: Any = None) -> None:
+        del tool_call, tool
+
+    # Direct invocation 不维护 execution-local pre-state
+    async def before_attempt(
+        self,
+        *,
+        tool_call: ToolCallBlock,
+        tool: Any = None,
+        attempt: int,
+    ) -> None:
+        del tool_call, tool, attempt
+
+    # Direct invocation 保留既有 retry policy
+    async def after_attempt(
+        self,
+        *,
+        tool_call: ToolCallBlock,
+        tool: Any = None,
+        attempt: int,
+        outcome: object,
+    ) -> AuthorizationAttempt:
+        del tool_call, tool, attempt, outcome
+        return AuthorizationAttempt()
+
+
+class DirectToolInvoker:
+    # 为 Direct Mode 封装既有 generic invoke_tool，避免 AgentLoop 直接依赖 registry
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        bus: EventBus,
+        run_id: str,
+        timeout: float = _DEFAULT_TIMEOUT,
+        *,
+        permission_manager: PermissionManager | None = None,
+        session_id: str = "",
+    ) -> None:
+        self._registry = registry
+        self._bus = bus
+        self._run_id = run_id
+        self._timeout = timeout
+        self._permission_manager = permission_manager
+        self._session_id = session_id
+
+    # Direct Mode 的 provider schema 与实际 generic registry 保持一致
+    def tool_schemas(self) -> list[dict[str, object]]:
+        return self._registry.tool_schemas()
+
+    # 调用既有 unscoped pipeline，保持 Direct Mode 的 retry/permission 语义
+    async def invoke(self, tool_call: ToolCallBlock) -> ToolResult:
+        return await invoke_tool(
+            self._registry,
+            tool_call,
+            self._bus,
+            self._run_id,
+            self._timeout,
+            permission_manager=self._permission_manager,
+            session_id=self._session_id,
+        )
+
+    # Direct Mode 没有 scoped hard terminal
+    def terminal_reason(self) -> str | None:
+        return None
+
+
+# 将 scoped audit 失败标记为 execution secondary inconclusive 状态
+def _mark_audit_inconclusive(authorization: InvocationAuthorization) -> None:
+    marker = getattr(authorization, "_context", None)
+    mutation_state = getattr(marker, "mutation_state", None)
+    if mutation_state is not None:
+        mutation_state.mark_audit_inconclusive()
 
 
 # 发布 ToolCallFailedEvent 并返回对应 ToolResult
@@ -66,8 +184,8 @@ async def _fail(
     return ToolResult(content=error_message, is_error=True, error_type=error_class)
 
 
-# 校验参数、检查权限、限时调用工具并发布事件；普通失败返回 ToolResult，取消信号原样传播
-async def invoke_tool(
+# 复用 lookup、schema、permission、attempt audit、retry 与 event 生命周期
+async def _invoke_with_authorization(
     registry: ToolRegistry,
     tool_call: ToolCallBlock,
     bus: EventBus,
@@ -76,6 +194,7 @@ async def invoke_tool(
     *,
     permission_manager: PermissionManager | None = None,
     session_id: str = "",
+    authorization: InvocationAuthorization,
 ) -> ToolResult:
     # monotonic 不受 NTP 或人工校时影响，保证 elapsed_ms 准确
     t0 = time.monotonic()
@@ -114,7 +233,20 @@ async def invoke_tool(
                 bus, run_id, tool_call,
                 validation_error_class, validation_error_message, elapsed(),
             )
-# 权限检查
+
+    try:
+        await authorization.authorize_call(tool_call=tool_call, tool=tool)
+    except ExecutionScopeError as exc:
+        return await _fail(
+            bus,
+            run_id,
+            tool_call,
+            exc.error_type,
+            str(exc),
+            elapsed(),
+        )
+
+    # 权限检查
     if permission_manager is not None:
         async def _emit_permission(raw: dict[str, Any]) -> None:
             await bus.publish(PermissionRequestedEvent(**raw, run_id=run_id))
@@ -156,43 +288,111 @@ async def invoke_tool(
                 elapsed(),
             )
 
-    for attempt in range(1, _MAX_RETRIES + 2):# 唯一正常返回的路径——所有其他路径都通向 _fail()
+    for attempt in range(1, _MAX_RETRIES + 2):  # 唯一正常返回的路径——其余路径通向 _fail()
         error_class: str | None = None
         error_message: str | None = None
+        result: ToolResult | None = None
+        caught_exception: Exception | None = None
+
+        try:
+            await authorization.before_attempt(
+                tool_call=tool_call,
+                tool=tool,
+                attempt=attempt,
+            )
+        except ExecutionScopeError as exc:
+            return await _fail(
+                bus,
+                run_id,
+                tool_call,
+                exc.error_type,
+                str(exc),
+                elapsed(),
+                attempt=attempt,
+            )
 
         try:
             result = await asyncio.wait_for(
                 tool.invoke(dict(tool_call.input)), timeout=timeout
             )
-            ms = elapsed()
-
-            if result.is_error:
-                error_class, error_message = normalize_tool_error(
-                    result.error_type,
-                    result.content,
+        except asyncio.CancelledError as cancellation:
+            # 取消是 primary outcome；audit 失败只能记录 secondary inconclusive
+            try:
+                await authorization.after_attempt(
+                    tool_call=tool_call,
+                    tool=tool,
+                    attempt=attempt,
+                    outcome=cancellation,
                 )
-            else:
-                await bus.publish(
-                    ToolCallFinishedEvent(
-                        run_id=run_id,
-                        tool_use_id=tool_call.id,
-                        tool_name=tool_call.name,
-                        elapsed_ms=ms,
-                        output=result.content,
-                        ts=_now(),
-                    )
-                )
-                return result
-
-        except asyncio.CancelledError:
+            except asyncio.CancelledError:
+                _mark_audit_inconclusive(authorization)
+                raise cancellation
+            except Exception:
+                _mark_audit_inconclusive(authorization)
             raise
         except Exception as exc:
-            error_class, error_message = classify_tool_exception(exc)
+            caught_exception = exc
+
+        try:
+            audit_result = await authorization.after_attempt(
+                tool_call=tool_call,
+                tool=tool,
+                attempt=attempt,
+                outcome=result if result is not None else caught_exception,
+            )
+        except ExecutionScopeError as exc:
+            _mark_audit_inconclusive(authorization)
+            return await _fail(
+                bus,
+                run_id,
+                tool_call,
+                exc.error_type,
+                str(exc),
+                elapsed(),
+                attempt=attempt,
+            )
+        except Exception:
+            _mark_audit_inconclusive(authorization)
+            return await _fail(
+                bus,
+                run_id,
+                tool_call,
+                "scope_audit_failed",
+                "scoped post-state audit failed",
+                elapsed(),
+                attempt=attempt,
+            )
+
+        ms = elapsed()
+        if caught_exception is None and result is not None and not result.is_error:
+            await bus.publish(
+                ToolCallFinishedEvent(
+                    run_id=run_id,
+                    tool_use_id=tool_call.id,
+                    tool_name=tool_call.name,
+                    elapsed_ms=ms,
+                    output=result.content,
+                    ts=_now(),
+                )
+            )
+            return result
+
+        if caught_exception is not None:
+            error_class, error_message = classify_tool_exception(caught_exception)
+        else:
+            assert result is not None
+            error_class, error_message = normalize_tool_error(
+                result.error_type,
+                result.content,
+            )
 
         assert error_class is not None and error_message is not None
-        ms = elapsed() # 
 
-        if error_class in RETRYABLE_ERROR_TYPES and attempt <= _MAX_RETRIES:
+        if (
+            error_class in RETRYABLE_ERROR_TYPES
+            and attempt <= _MAX_RETRIES
+            and audit_result.retry_allowed
+        ):
             await bus.publish(
                 # 每次重试前发布失败事件，以追踪失败的 attempt
                 ToolCallFailedEvent(
@@ -221,6 +421,138 @@ async def invoke_tool(
         is_error=True,
         error_type="execution_error",
     )
+
+
+# 保持 Direct Mode 的原有无 scope invocation API 与 retry 语义
+async def invoke_tool(
+    registry: ToolRegistry,
+    tool_call: ToolCallBlock,
+    bus: EventBus,
+    run_id: str,
+    timeout: float = _DEFAULT_TIMEOUT,
+    *,
+    permission_manager: PermissionManager | None = None,
+    session_id: str = "",
+) -> ToolResult:
+    return await _invoke_with_authorization(
+        registry,
+        tool_call,
+        bus,
+        run_id,
+        timeout,
+        permission_manager=permission_manager,
+        session_id=session_id,
+        authorization=UnscopedAuthorization(),
+    )
+
+
+class ScopedToolInvoker:
+    # 构造必须绑定 non-null context，防止 scoped execution 退回 unscoped path
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        bus: EventBus,
+        run_id: str,
+        context: ScopedExecutionContext,
+        timeout: float = _DEFAULT_TIMEOUT,
+        *,
+        permission_manager: PermissionManager | None = None,
+        session_id: str = "",
+    ) -> None:
+        if context is None:
+            raise ScopeRequiredError("scope-required")
+        self._registry = registry
+        self._bus = bus
+        self._run_id = run_id
+        self._timeout = timeout
+        self._permission_manager = permission_manager
+        self._session_id = session_id
+        self._context = context
+        self._authorization = ExecutionScopeAuthorization(context)
+        # 未来如需并行工具执行，必须单独评审 authorization state 与 ledger attribution
+        self._flight_lock = asyncio.Lock()
+
+    # 使用与 generic invoke_tool 相同的 pipeline，并串行化单一 execution context 的调用
+    async def invoke(self, tool_call: ToolCallBlock) -> ToolResult:
+        async with self._flight_lock:
+            return await _invoke_with_authorization(
+                self._registry,
+                tool_call,
+                self._bus,
+                self._run_id,
+                self._timeout,
+                permission_manager=self._permission_manager,
+                session_id=self._session_id,
+                authorization=self._authorization,
+            )
+
+    # 为 scoped provider 返回与实际 invocation 相同的受控 schema
+    def tool_schemas(self) -> list[dict[str, object]]:
+        return self._registry.tool_schemas()
+
+    # 普通 scoped invocation 不声明 approved-run hard terminal
+    def terminal_reason(self) -> str | None:
+        return None
+
+    @property
+    # 暴露只读 execution context 供审计测试读取，不提供替换入口
+    def context(self) -> ScopedExecutionContext:
+        return self._context
+
+
+class ApprovedScopedToolInvoker(ScopedToolInvoker):
+    # 只接受不可变 trusted registry，防止 approved execution 退回普通 registry
+    def __init__(self, registry: Any, *args: Any, **kwargs: Any) -> None:
+        from kama_claude.core.execution import TrustedScopedToolRegistry
+
+        if not isinstance(registry, TrustedScopedToolRegistry):
+            raise ScopeRequiredError("trusted scoped registry is required")
+        context = kwargs.get("context")
+        if context is None and len(args) >= 3:
+            context = args[2]
+        if context is None or registry.workspace_root != context.workspace_root:
+            raise ScopeRequiredError("trusted registry workspace does not match scope")
+        self._trusted_registry = registry
+        self._terminal_reason: str | None = None
+        super().__init__(registry, *args, **kwargs)  # type: ignore[arg-type]
+
+    # approved provider 只能看到构造时 sealed registry 的 exact schema
+    def tool_schemas(self) -> list[dict[str, object]]:
+        return self._trusted_registry.tool_schemas()
+
+    # 返回 approved execution 已经锁存的 hard terminal reason
+    def terminal_reason(self) -> str | None:
+        return self._terminal_reason
+
+    # 将 scope hard failure 锁存为不可继续执行的 terminal reason
+    async def invoke(self, tool_call: ToolCallBlock) -> ToolResult:
+        if self._terminal_reason is not None:
+            return ToolResult(
+                content="approved execution is terminal",
+                is_error=True,
+                error_type=self._terminal_reason,
+            )
+        result = await super().invoke(tool_call)
+        if result.error_type in {
+            "unknown_tool",
+            "scope_denied",
+            "external_workspace_drift",
+        }:
+            self._terminal_reason = "scope_denied"
+        elif result.error_type in {
+            "scope_mutation_inconclusive",
+            "scope_audit_failed",
+            "scope_required",
+        }:
+            self._terminal_reason = "inconclusive"
+        elif self._context.mutation_state.status == "inconclusive":
+            self._terminal_reason = "inconclusive"
+        return result
+
+    # 暴露 immutable scope 与 execution-local ledger 的只读入口
+    @property
+    def context(self) -> ScopedExecutionContext:
+        return self._context
 '''
 invoke_tool(tool_call)
 │

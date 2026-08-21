@@ -111,7 +111,7 @@ async def execute_experiment(
     evaluate = evaluate_task if evaluator is None else evaluator
     observations: list[ObservedExperimentIdentity] = []
 
-    # 在真实 Phase 8A evaluator 后只读 artifact，identity mismatch 不进入 analyzer/metrics
+    # 在真实 evaluation evaluator 后只读 artifact，identity mismatch 不进入 analyzer/metrics
     async def evaluate_and_verify(
         task_dir: Path | str,
         evaluation_output: Path | str,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -9,19 +10,31 @@ import pytest
 
 from kama_claude.core.agents.loader import AgentProfile
 from kama_claude.core.bus.events import (
+    LlmTokenEvent,
     SubagentFinishedEvent,
     SubagentStartedEvent,
     ToolCallFailedEvent,
     ToolCallFinishedEvent,
     ToolCallStartedEvent,
 )
+from kama_claude.core.config import KamaConfig
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
+from kama_claude.core.events.journal import EventJournalCoordinator
+from kama_claude.core.grounding import (
+    ArchitectureSliceDraft,
+    ArchitectureSliceService,
+    ToolObservationCollector,
+)
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock, UsageStats
 from kama_claude.core.loop import AgentLoop
+from kama_claude.core.runner import AgentRunner
 from kama_claude.core.sandbox.config import SandboxConfig
 from kama_claude.core.sandbox.executors import ContainerExecutor, HostExecutor
 from kama_claude.core.sandbox.manager import SandboxManager
+from kama_claude.core.session.model import Session
+from kama_claude.core.session.store import SessionStore
+from kama_claude.core.skills.loader import SkillLoader
 from kama_claude.core.subagent import tool as subagent_tool_module
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.subagent.tool import AgentResultTool, SpawnAgentTool
@@ -53,6 +66,11 @@ _STATE_TRANSITION_PROTOCOL = (
     "compensation preserves the stated invariant. Do not apply this protocol to tasks "
     "without multi-step side effects."
 )
+_REPOSITORY_CHANGE_DISCIPLINE = """## Repository Change Discipline
+Prefer editing existing files to creating new ones
+Don't add features, refactor, or introduce abstractions beyond what the task requires
+Don't design for hypothetical future requirements
+A bug fix doesn't need surrounding cleanup"""
 
 
 def _make_provider(result_text: str = "child done") -> Any:
@@ -80,6 +98,8 @@ def _make_tool(
     depth: int = 0,
     journal: Any = None,
     sandbox_manager: SandboxManager | None = None,
+    store: SessionStore | None = None,
+    planning_only: bool = False,
 ) -> tuple[SpawnAgentTool, BackgroundTaskRegistry, EventBus]:
     bus = EventBus()
     registry = BackgroundTaskRegistry()
@@ -96,8 +116,248 @@ def _make_tool(
         depth=depth,
         journal=journal,
         sandbox_manager=sandbox_manager,
+        store=store,
+        planning_only=planning_only,
     )
     return tool, registry, bus
+
+
+# 通过真实 grounding artifact 构造 trusted Planner 的 terminal submit 输入
+async def _prepare_orchestrate_grounding(
+    tmp_path: Path,
+    *,
+    selected_approach: str,
+) -> tuple[Path, SessionStore, dict[str, object]]:
+    workspace = tmp_path / "workspace"
+    source = workspace / "src" / "target.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    collector = ToolObservationCollector()
+    await collector.handle(
+        ToolCallStartedEvent(
+            run_id="explorer-run",
+            tool_use_id="read-target",
+            tool_name="read_file",
+            params={"path": "src/target.py"},
+            ts="t1",
+        )
+    )
+    await collector.handle(
+        ToolCallFinishedEvent(
+            run_id="explorer-run",
+            tool_use_id="read-target",
+            tool_name="read_file",
+            elapsed_ms=1,
+            output=source.read_text(encoding="utf-8"),
+            ts="t2",
+        )
+    )
+    store = SessionStore(tmp_path / "sessions")
+    slice_service = ArchitectureSliceService(
+        workspace_root=workspace,
+        run_id="explorer-run",
+        goal="Change target behavior",
+        collector=collector,
+        session_id="sess-orchestrate",
+        store=store,
+    )
+    architecture_slice = slice_service.submit(
+        ArchitectureSliceDraft(
+            relevant_modules=("src/target.py",),
+            related_tests=(),
+            existing_patterns=("single module edit",),
+            likely_change_targets=("src/target.py",),
+            evidence_tool_call_ids=("read-target",),
+            completeness="complete_for_task",
+            confidence=0.9,
+        )
+    )
+    draft: dict[str, object] = {
+        "architecture_slice_id": architecture_slice.slice_id,
+        "architecture_slice_version": architecture_slice.version,
+        "architecture_mode": "preserve",
+        "selected_approach": selected_approach,
+        "existing_patterns_reused": ["single module edit"],
+        "requirements": [
+            {
+                "requirement_id": "R1",
+                "statement": "Change target behavior.",
+                "required": True,
+            }
+        ],
+        "intended_changes": [
+            {
+                "change_id": "C1",
+                "description": "Update the existing target.",
+                "requirement_ids": ["R1"],
+                "target_paths": ["src/target.py"],
+                "evidence_refs": ["read-target"],
+            }
+        ],
+        "files_to_modify": ["src/target.py"],
+        "files_to_create": [],
+        "allowed_capabilities": ["read_file", "write_file"],
+        "dependency_changes": [],
+        "protocol_or_schema_changes": [],
+        "verification_plan": [
+            {"requirement_ids": ["R1"], "strategy": "Run focused tests."}
+        ],
+        "non_goals": ["No surrounding cleanup."],
+        "assumptions": [],
+        "unresolved_questions": [],
+        "requires_user_approval": True,
+    }
+    return workspace, store, draft
+
+
+class _OrchestrateRuntimeProvider:
+    MAX_ROOT_PROVIDER_CALLS = 4
+    MAX_TOTAL_PROVIDER_CALLS = 8
+    MAX_TOTAL_CHILD_SPAWNS = 3
+
+    # 按 root/planner/executor tool schema 驱动真实三阶段 AgentLoop 流程
+    def __init__(
+        self,
+        draft: dict[str, object],
+        root_run_id: str,
+        *,
+        oversized: bool,
+    ) -> None:
+        self._draft = draft
+        self._root_run_id = root_run_id
+        self._oversized = oversized
+        self._root_calls = 0
+        self._planner_calls = 0
+        self._executor_calls = 0
+        self._total_provider_calls = 0
+        self._child_spawns = 0
+        self.planner_result_contents: list[str] = []
+        self.executor_prompts: list[str] = []
+
+    # 返回规划提交、协调派生或终态响应并记录 executor 是否被派生
+    async def chat(
+        self,
+        messages: list[dict[str, object]],
+        tool_schemas: list[dict[str, object]],
+        bus: EventBus,
+        run_id: str,
+        *,
+        step: int = 0,
+        system: str | None = None,
+    ) -> LlmResponse:
+        del bus, step, system
+        self._total_provider_calls += 1
+        if self._total_provider_calls > self.MAX_TOTAL_PROVIDER_CALLS:
+            raise AssertionError(
+                "orchestrate provider-call budget exceeded: "
+                f"{self._total_provider_calls}>{self.MAX_TOTAL_PROVIDER_CALLS}"
+            )
+        names = {str(schema.get("name")) for schema in tool_schemas}
+        if "planner_decision_submit" in names:
+            if run_id == self._root_run_id:
+                raise AssertionError("root unexpectedly received planner tool schema")
+            self._planner_calls += 1
+            if self._planner_calls == 1:
+                return LlmResponse(
+                    stop_reason="tool_use",
+                    tool_calls=[
+                        ToolCallBlock(
+                            id=f"planner-submit-{self._planner_calls}",
+                            name="planner_decision_submit",
+                            input=self._draft,
+                        )
+                    ],
+                )
+            if self._planner_calls == 2:
+                return LlmResponse(
+                    stop_reason="end_turn",
+                    text="UNTRUSTED CHILD SUMMARY",
+                )
+            raise AssertionError(
+                f"unexpected planner provider call #{self._planner_calls}"
+            )
+        if run_id == self._root_run_id:
+            self._root_calls += 1
+            if self._root_calls > self.MAX_ROOT_PROVIDER_CALLS:
+                raise AssertionError(
+                    "orchestrate root-call budget exceeded: "
+                    f"{self._root_calls}>{self.MAX_ROOT_PROVIDER_CALLS}"
+                )
+            if self._root_calls == 1:
+                self._child_spawns += 1
+                if self._child_spawns > self.MAX_TOTAL_CHILD_SPAWNS:
+                    raise AssertionError(
+                        "orchestrate child-spawn budget exceeded: "
+                        f"{self._child_spawns}>{self.MAX_TOTAL_CHILD_SPAWNS}"
+                    )
+                return LlmResponse(
+                    stop_reason="tool_use",
+                    tool_calls=[
+                        ToolCallBlock(
+                            id="spawn-planner",
+                            name="spawn_agent",
+                            input={
+                                "description": "规划任务",
+                                "prompt": "Change target behavior",
+                                "subagent_type": "planner",
+                            },
+                        )
+                    ],
+                )
+            if self._root_calls == 2:
+                transcript = json.dumps(messages, ensure_ascii=False, default=str)
+                self.planner_result_contents.extend(
+                    str(block.get("content"))
+                    for message in messages
+                    for block in message.get("content", [])
+                    if isinstance(block, dict)
+                    and block.get("type") == "tool_result"
+                )
+                if self._oversized:
+                    if "planner-result-too-large" not in transcript:
+                        raise AssertionError(
+                            "oversized scenario did not receive planner-result-too-large"
+                        )
+                    return LlmResponse(
+                        stop_reason="end_turn",
+                        text="planner failed; stop",
+                    )
+                prompt = transcript
+                self.executor_prompts.append(prompt)
+                self._child_spawns += 1
+                if self._child_spawns > self.MAX_TOTAL_CHILD_SPAWNS:
+                    raise AssertionError(
+                        "orchestrate child-spawn budget exceeded: "
+                        f"{self._child_spawns}>{self.MAX_TOTAL_CHILD_SPAWNS}"
+                    )
+                return LlmResponse(
+                    stop_reason="tool_use",
+                    tool_calls=[
+                        ToolCallBlock(
+                            id="spawn-executor",
+                            name="spawn_agent",
+                            input={
+                                "description": "执行计划",
+                                "prompt": prompt,
+                                "subagent_type": "executor",
+                            },
+                        )
+                    ],
+                )
+            if self._root_calls == 3 and not self._oversized:
+                return LlmResponse(stop_reason="end_turn", text="orchestrate done")
+            raise AssertionError(
+                "unexpected root provider call "
+                f"#{self._root_calls} for oversized={self._oversized}"
+            )
+        if {"bash", "write_file"}.issubset(names):
+            self._executor_calls += 1
+            if self._executor_calls == 1:
+                return LlmResponse(stop_reason="end_turn", text="executor done")
+            raise AssertionError(
+                f"unexpected executor provider call #{self._executor_calls}"
+            )
+        raise AssertionError(f"unexpected child tool schema for run_id={run_id}")
 
 
 # 功能：验证 child run stream 注册严格早于 SubagentStartedEvent 发布
@@ -134,6 +394,69 @@ async def test_child_stream_registers_before_subagent_started(tmp_path: Path) ->
         index for index, item in enumerate(order) if item.startswith("event:")
     )
     assert register_index < event_index
+
+
+# 功能：验证 trusted Planner 在 child stream 注册前失败时不伪造 planner_run_id
+# 设计：让 journal owner 在 pre-child registration 抛出稳定错误，直接检查 typed internal result 的身份边界
+async def test_trusted_planner_pre_child_failure_has_no_planner_run_id(
+    tmp_path: Path,
+) -> None:
+    from kama_claude.core.events.journal import JournalError
+
+    class FailingJournal:
+        # 在 child 创建前拒绝 journal registration
+        async def register_run(
+            self,
+            run_id: str,
+            run_path: Path,
+            *,
+            session_id: str | None,
+        ) -> object:
+            raise JournalError("registration failed")
+
+    tool, _registry, _bus = _make_tool(
+        tmp_path,
+        journal=FailingJournal(),
+        store=SessionStore(tmp_path / "sessions"),
+    )
+
+    result = await tool.run_trusted_planner_foreground(goal="inspect")
+
+    assert result.status == "failed"
+    assert result.planner_run_id is None
+    assert result.failure_reason == "plan-event-append-failed"
+    assert not hasattr(result, "summary")
+
+
+# 功能：验证 trusted Planner typed result 不再携带自然语言 summary side channel
+# 设计：直接构造 success/failure discriminated union，锁定唯一可返回的 identity/reason 字段
+def test_trusted_planner_typed_result_has_no_summary_field() -> None:
+    from kama_claude.core.planning import SubmittedDecisionIdentity
+    from kama_claude.core.subagent.tool import (
+        TrustedPlannerFailure,
+        TrustedPlannerSuccess,
+    )
+
+    success = TrustedPlannerSuccess(
+        status="success",
+        planner_run_id="planner-1",
+        decision_identity=SubmittedDecisionIdentity(
+            decision_id="decision-1",
+            version=1,
+            snapshot_digest="snapshot",
+            content_digest="content",
+        ),
+    )
+    failure = TrustedPlannerFailure(
+        status="failed",
+        planner_run_id="planner-1",
+        failure_reason="missing-terminal-decision",
+    )
+
+    assert not hasattr(success, "summary")
+    assert not hasattr(failure, "summary")
+    assert success.decision_identity.decision_id == "decision-1"
+    assert failure.failure_reason == "missing-terminal-decision"
 
 
 # 功能：验证 SpawnAgentTool 必须显式接收 workspace_root
@@ -325,7 +648,11 @@ async def test_subagents_isolate_profile_and_context_by_workspace(tmp_path: Path
             encoding="utf-8",
         )
         provider = _make_provider()
-        tool, _, _ = _make_tool(workspace, provider)
+        tool, _, _ = _make_tool(
+            workspace,
+            provider,
+            store=SessionStore(tmp_path / f"sessions-{name}"),
+        )
 
         await tool.invoke(
             {
@@ -347,10 +674,653 @@ async def test_subagents_isolate_profile_and_context_by_workspace(tmp_path: Path
     assert "context-b" in systems[1]
     assert "profile-a" not in systems[1]
     assert "context-a" not in systems[1]
-    assert _REQUIREMENT_CONTRACT not in systems[0]
-    assert _REQUIREMENT_CONTRACT not in systems[1]
+    assert "PlannerDecision" in systems[0]
+    assert "PlannerDecision" in systems[1]
     assert _STATE_TRANSITION_PROTOCOL not in systems[0]
     assert _STATE_TRANSITION_PROTOCOL not in systems[1]
+    assert systems[0].count(_REPOSITORY_CHANGE_DISCIPLINE) == 1
+    assert systems[1].count(_REPOSITORY_CHANGE_DISCIPLINE) == 1
+
+
+# 功能：验证 runtime trusted planner contract 覆盖同名 custom profile 的 prompt
+# 设计：local profile 只提供自定义文本，真实 child provider 捕获最终 system prompt 并检查提交要求
+async def test_custom_planner_cannot_remove_trusted_contract(tmp_path: Path) -> None:
+    agents = tmp_path / ".kama" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "planner.toml").write_text(
+        '[agent]\nsystem_prompt = "custom planner prompt"\n'
+        'allowed_tools = ["read_file", "spawn_agent", "task_create", "bash"]\n',
+        encoding="utf-8",
+    )
+    provider = _make_provider()
+    tool, _, _ = _make_tool(
+        tmp_path,
+        provider,
+        store=SessionStore(tmp_path / "sessions"),
+    )
+
+    result = await tool.invoke(
+        {
+            "description": "plan",
+            "prompt": "inspect",
+            "subagent_type": "planner",
+        }
+    )
+
+    assert result.is_error is True
+    system = provider.chat.await_args.kwargs["system"]
+    assert "custom planner prompt" in system
+    assert "planner_decision_submit" in system
+    assert "terminal" in system.lower()
+
+
+@pytest.mark.parametrize(
+    ("oversized", "executor_expected"),
+    [(False, True), (True, False)],
+)
+# 功能：验证真实 /orchestrate AgentLoop 将完整 Planner ToolResult 交给 executor，超限则停止派生
+# 设计：运行 root→planner→executor 的真实 SpawnAgent 链路，用同一 provider 记录 prompt 和 executor 派生边界
+async def test_orchestrate_runtime_uses_full_planner_result_or_fails_closed(
+    tmp_path: Path,
+    oversized: bool,
+    executor_expected: bool,
+) -> None:
+    approach = "x" * 20_000 if oversized else "Keep the existing target module."
+    workspace, store, draft = await _prepare_orchestrate_grounding(
+        tmp_path,
+        selected_approach=approach,
+    )
+    session = Session(
+        id="sess-orchestrate",
+        mode="chat",
+        status="active",
+        title="",
+        created_at="t",
+        updated_at="t",
+        workspace_root=workspace.resolve(),
+    )
+    store.write_meta(session)
+    loader = SkillLoader(workspace)
+    skill = loader.resolve("orchestrate")
+    assert skill is not None
+    root_run_id = "orchestrate-root"
+    provider = _OrchestrateRuntimeProvider(
+        draft,
+        root_run_id,
+        oversized=oversized,
+    )
+    journal = EventJournalCoordinator()
+    await journal.register_session(session.id, store.session_dir(session.id))
+    runner = AgentRunner(
+        KamaConfig(),
+        workspace_root=workspace,
+        provider=provider,
+        runs_dir=tmp_path / "runs",
+        journal=journal,
+    )
+
+    try:
+        outcome = await runner.run_and_capture(
+            loader.render_prompt(skill, "Change target behavior"),
+            run_id=root_run_id,
+            session=session,
+            store=store,
+            system_prompt_override=skill.system_prompt_template,
+            tool_whitelist=skill.allowed_tools,
+        )
+    finally:
+        await journal.close()
+
+    assert outcome.status == "success"
+    assert bool(provider.executor_prompts) is executor_expected
+    if executor_expected:
+        planner_result_transcript = provider.executor_prompts[0]
+        messages = json.loads(planner_result_transcript)
+        tool_results = [
+            block
+            for message in messages
+            for block in message.get("content", [])
+            if isinstance(block, dict) and block.get("type") == "tool_result"
+        ]
+        planner_result = next(
+            json.loads(str(block["content"]))
+            for block in tool_results
+            if "planner_decision" in str(block.get("content"))
+        )
+        decision_payload = planner_result["planner_decision"]
+        assert decision_payload["schema_version"] == 2
+        assert "architecture_slice_content_digest" in decision_payload
+        assert "verification_plan" in decision_payload
+        assert "executor done" not in planner_result_transcript
+    else:
+        assert any(
+            "planner-result-too-large" in content
+            for content in provider.planner_result_contents
+        )
+    expected_root_calls = 3 if executor_expected else 2
+    expected_provider_calls = 6 if executor_expected else 4
+    assert provider._root_calls == expected_root_calls
+    assert provider._total_provider_calls == expected_provider_calls
+    assert provider._total_provider_calls <= provider.MAX_TOTAL_PROVIDER_CALLS
+    assert provider._child_spawns == (2 if executor_expected else 1)
+    assert provider._planner_calls == 2
+    assert provider._executor_calls == int(executor_expected)
+    with pytest.raises(AssertionError, match="unexpected root provider call"):
+        await provider.chat(
+            messages=[],
+            tool_schemas=[],
+            bus=EventBus(),
+            run_id=root_run_id,
+        )
+
+
+# 功能：验证 trusted planner registry 移除 task 与 mutation 工具但保留 Explorer delegation
+# 设计：使用同名 custom profile 请求超集 allowlist，检查 builtin 上界和 planner 专属工具集合
+def test_trusted_planner_registry_excludes_task_and_mutation_tools(
+    tmp_path: Path,
+) -> None:
+    from kama_claude.core.planning import PlannerDecisionService
+
+    agents = tmp_path / ".kama" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "planner.toml").write_text(
+        '[agent]\nsystem_prompt = "custom planner"\n'
+        'allowed_tools = ["read_file", "list_dir", "search_code", "spawn_agent", '
+        '"planner_decision_submit", "task_create", "task_update", "bash", "write_file"]\n',
+        encoding="utf-8",
+    )
+    tool, _, _ = _make_tool(
+        tmp_path,
+        store=SessionStore(tmp_path / "sessions"),
+    )
+    profile = tool._profile_loader.load("planner")
+    assert profile is not None
+    service = PlannerDecisionService(
+        workspace_root=tmp_path,
+        session_id="sess-test",
+        store=tool._store,
+        goal="inspect",
+        run_id="planner-run",
+    )
+    registry = tool._build_child_registry(
+        EventBus(),
+        "planner-run",
+        profile,
+        planner_service=service,
+    )
+
+    assert registry.get("read_file") is not None
+    assert registry.get("list_dir") is not None
+    assert registry.get("search_code") is not None
+    assert registry.get("spawn_agent") is not None
+    assert registry.get("planner_decision_submit") is not None
+    assert registry.get("task_create") is None
+    assert registry.get("task_update") is None
+    assert registry.get("bash") is None
+    assert registry.get("write_file") is None
+
+
+# 功能：验证 custom Planner 空工具集合不会扩张，且无法提交时只返回安全失败摘要
+# 设计：先检查最终 schema，再运行真实 child 断言 missing-terminal failure 不泄漏模型计划文本
+async def test_custom_planner_empty_tools_remain_empty(tmp_path: Path) -> None:
+    from kama_claude.core.planning import PlannerDecisionService
+
+    agents = tmp_path / ".kama" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "planner.toml").write_text(
+        '[agent]\nsystem_prompt = "custom planner"\n'
+        'allowed_tools = []\nallowed_subagent_types = []\n',
+        encoding="utf-8",
+    )
+    tool, _, _ = _make_tool(
+        tmp_path,
+        _make_provider("直接修改 src/a.py，然后运行 bash ..."),
+        store=SessionStore(tmp_path / "sessions"),
+    )
+    profile = tool._profile_loader.load("planner")
+    assert profile is not None
+    service = PlannerDecisionService(
+        workspace_root=tmp_path,
+        session_id="sess-test",
+        store=tool._store,
+        goal="inspect",
+        run_id="planner-run",
+    )
+
+    registry = tool._build_child_registry(
+        EventBus(),
+        "planner-run",
+        profile,
+        planner_service=service,
+    )
+
+    assert registry.tool_schemas() == []
+
+    result = await tool.invoke(
+        {
+            "description": "plan",
+            "prompt": "inspect",
+            "subagent_type": "planner",
+        }
+    )
+
+    assert result.is_error is True
+    assert result.error_type == "command_failed"
+    assert "missing-terminal-decision" in result.content
+    assert "src/a.py" not in result.content
+    assert "运行 bash" not in result.content
+
+
+# 功能：验证 custom Planner 工具子集只保留显式声明且不补回其他 trusted capability
+# 设计：只请求 read_file 与 submit，按 schema 顺序断言 list/search/spawn 和 mutation 均不可见
+def test_custom_planner_tool_subset_is_preserved(tmp_path: Path) -> None:
+    from kama_claude.core.planning import PlannerDecisionService
+
+    agents = tmp_path / ".kama" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "planner.toml").write_text(
+        '[agent]\nsystem_prompt = "custom planner"\n'
+        'allowed_tools = ["read_file", "planner_decision_submit"]\n'
+        'allowed_subagent_types = []\n',
+        encoding="utf-8",
+    )
+    tool, _, _ = _make_tool(
+        tmp_path,
+        store=SessionStore(tmp_path / "sessions"),
+    )
+    profile = tool._profile_loader.load("planner")
+    assert profile is not None
+    service = PlannerDecisionService(
+        workspace_root=tmp_path,
+        session_id="sess-test",
+        store=tool._store,
+        goal="inspect",
+        run_id="planner-run",
+    )
+
+    registry = tool._build_child_registry(
+        EventBus(),
+        "planner-run",
+        profile,
+        planner_service=service,
+    )
+
+    assert [schema["name"] for schema in registry.tool_schemas()] == [
+        "read_file",
+        "planner_decision_submit",
+    ]
+
+
+# 功能：验证 custom Planner 工具超集最终只保留 trusted upper bound
+# 设计：请求所有越权工具并保留合法工具，断言 schema 顺序稳定且越权名称全部消失
+def test_custom_planner_tool_superset_is_narrowed(tmp_path: Path) -> None:
+    from kama_claude.core.planning import PlannerDecisionService
+
+    agents = tmp_path / ".kama" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "planner.toml").write_text(
+        '[agent]\nsystem_prompt = "custom planner"\n'
+        'allowed_tools = ["read_file", "list_dir", "search_code", "spawn_agent", '
+        '"planner_decision_submit", "bash", "write_file", "task_create", "task_update"]\n'
+        'allowed_subagent_types = ["explorer", "executor", "reviewer"]\n',
+        encoding="utf-8",
+    )
+    tool, _, _ = _make_tool(
+        tmp_path,
+        store=SessionStore(tmp_path / "sessions"),
+    )
+    profile = tool._profile_loader.load("planner")
+    assert profile is not None
+    service = PlannerDecisionService(
+        workspace_root=tmp_path,
+        session_id="sess-test",
+        store=tool._store,
+        goal="inspect",
+        run_id="planner-run",
+    )
+
+    registry = tool._build_child_registry(
+        EventBus(),
+        "planner-run",
+        profile,
+        planner_service=service,
+    )
+
+    assert [schema["name"] for schema in registry.tool_schemas()] == [
+        "read_file",
+        "list_dir",
+        "search_code",
+        "planner_decision_submit",
+        "spawn_agent",
+    ]
+    assert profile.allowed_subagent_types == ["explorer"]
+
+
+# 功能：验证 spawn_agent 可见但空 child-type 集合不会自动恢复 Explorer
+# 设计：保留 delegation schema，实际调用用稳定 invalid_input 检查 child authorization 与 tool visibility 分离
+async def test_custom_planner_empty_child_types_reject_spawn(tmp_path: Path) -> None:
+    from kama_claude.core.planning import PlannerDecisionService
+
+    agents = tmp_path / ".kama" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "planner.toml").write_text(
+        '[agent]\nsystem_prompt = "custom planner"\n'
+        'allowed_tools = ["spawn_agent"]\nallowed_subagent_types = []\n',
+        encoding="utf-8",
+    )
+    tool, _, _ = _make_tool(
+        tmp_path,
+        store=SessionStore(tmp_path / "sessions"),
+    )
+    profile = tool._profile_loader.load("planner")
+    assert profile is not None
+    service = PlannerDecisionService(
+        workspace_root=tmp_path,
+        session_id="sess-test",
+        store=tool._store,
+        goal="inspect",
+        run_id="planner-run",
+    )
+    registry = tool._build_child_registry(
+        EventBus(),
+        "planner-run",
+        profile,
+        planner_service=service,
+    )
+    spawn = registry.get("spawn_agent")
+    assert spawn is not None
+
+    result = await spawn.invoke(
+        {
+            "description": "explore",
+            "prompt": "inspect",
+            "subagent_type": "explorer",
+        }
+    )
+
+    assert result.is_error is True
+    assert result.error_type == "invalid_input"
+    assert "allowed subagent types: none" in result.content
+
+
+# 功能：验证 custom Planner child-type 超集最多保留 Explorer
+# 设计：通过真实 nested spawn 调用 executor/reviewer，断言 runtime authorization 仍受 trusted upper bound
+async def test_custom_planner_child_type_superset_rejects_executor_and_reviewer(
+    tmp_path: Path,
+) -> None:
+    from kama_claude.core.planning import PlannerDecisionService
+
+    agents = tmp_path / ".kama" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "planner.toml").write_text(
+        '[agent]\nsystem_prompt = "custom planner"\n'
+        'allowed_tools = ["spawn_agent"]\n'
+        'allowed_subagent_types = ["explorer", "executor", "reviewer"]\n',
+        encoding="utf-8",
+    )
+    tool, _, _ = _make_tool(
+        tmp_path,
+        store=SessionStore(tmp_path / "sessions"),
+    )
+    profile = tool._profile_loader.load("planner")
+    assert profile is not None
+    service = PlannerDecisionService(
+        workspace_root=tmp_path,
+        session_id="sess-test",
+        store=tool._store,
+        goal="delegate",
+        run_id="planner-run",
+    )
+    registry = tool._build_child_registry(
+        EventBus(),
+        "planner-run",
+        profile,
+        planner_service=service,
+    )
+    spawn = registry.get("spawn_agent")
+    assert spawn is not None
+
+    results = [
+        await spawn.invoke(
+            {
+                "description": role,
+                "prompt": "delegate",
+                "subagent_type": role,
+            }
+        )
+        for role in ("executor", "reviewer")
+    ]
+
+    assert all(result.is_error for result in results)
+    assert all(result.error_type == "invalid_input" for result in results)
+    assert all("allowed subagent types: explorer" in result.content for result in results)
+    assert profile.allowed_subagent_types == ["explorer"]
+
+
+# 功能：验证非 planner runtime role 不能通过 profile metadata 自称 trusted Planner
+# 设计：custom 角色写入伪造 name 字段但请求 subagent_type=custom，断言不启用 terminal contract
+async def test_runtime_role_identity_cannot_be_profile_forged(tmp_path: Path) -> None:
+    agents = tmp_path / ".kama" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "custom.toml").write_text(
+        '[agent]\nname = "planner"\nsystem_prompt = "custom role"\n'
+        'allowed_tools = ["read_file"]\n',
+        encoding="utf-8",
+    )
+    provider = _make_provider("custom done")
+    tool, _, _ = _make_tool(tmp_path, provider)
+
+    result = await tool.invoke(
+        {
+            "description": "custom",
+            "prompt": "inspect",
+            "subagent_type": "custom",
+        }
+    )
+
+    assert result.is_error is False
+    system = provider.chat.await_args.kwargs["system"]
+    assert "Trusted Planner Contract" not in system
+
+
+# 功能：验证 Planner terminal commit 后 read/search/spawn 等工具均被 invocation-time guard 拒绝
+# 设计：直接构造真实 read tool 与已提交状态 service，隔离 registry allowlist 只测试终态语义
+async def test_planner_terminal_guard_rejects_non_submit_tool(tmp_path: Path) -> None:
+    from kama_claude.core.planning import (
+        PlannerDecisionService,
+        SubmittedDecisionIdentity,
+    )
+    from kama_claude.core.subagent.tool import _PlannerTerminalGuardTool
+
+    tool, _, _ = _make_tool(tmp_path)
+    service = PlannerDecisionService(
+        workspace_root=tmp_path,
+        session_id="sess-test",
+        store=SessionStore(tmp_path / "sessions"),
+        goal="inspect",
+        run_id="planner-run",
+    )
+    service._terminal_decision = SubmittedDecisionIdentity(
+        decision_id="decision_one",
+        version=1,
+        snapshot_digest="snapshot",
+        content_digest="content",
+    )
+    guarded = _PlannerTerminalGuardTool(
+        ReadFileTool(tool._path_resolver, tool._access_policy),
+        service,
+    )
+
+    result = await guarded.invoke({"path": "missing.py"})
+
+    assert result.is_error is True
+    assert result.error_type == "invalid_input"
+    assert "terminal decision already committed" in result.content
+
+
+# 功能：验证 foreground planner 未提交 decision 时只返回安全 command_failed 摘要
+# 设计：provider 输出含敏感执行计划的普通文本，断言 terminal gate 在 finished event 前覆盖该文本
+async def test_planner_terminal_failure_sanitizes_foreground_result(
+    tmp_path: Path,
+) -> None:
+    provider = _make_provider("直接修改 src/a.py，然后运行 bash ...")
+    tool, _, bus = _make_tool(
+        tmp_path,
+        provider,
+        store=SessionStore(tmp_path / "sessions"),
+    )
+    events: list[Any] = []
+
+    async def _collect(event: Any) -> None:
+        events.append(event)
+
+    bus.subscribe(_collect)
+    result = await tool.invoke(
+        {
+            "description": "plan",
+            "prompt": "inspect",
+            "subagent_type": "planner",
+        }
+    )
+
+    assert result.is_error is True
+    assert result.error_type == "command_failed"
+    assert "missing-terminal-decision" in result.content
+    assert "src/a.py" not in result.content
+    assert "运行 bash" not in result.content
+    finished = [event for event in events if isinstance(event, SubagentFinishedEvent)]
+    assert len(finished) == 1
+    assert finished[0].status == "failed"
+
+
+# 功能：验证 background planner 使用同一 terminal gate 并通过 agent_result 返回安全失败
+# 设计：后台 child 不提交 artifact，等待唯一 finished event 后查询 AgentResultTool 的稳定错误摘要
+async def test_background_planner_terminal_failure_is_safe(tmp_path: Path) -> None:
+    provider = _make_provider("直接修改 src/a.py，然后运行 bash ...")
+    tool, registry, _ = _make_tool(
+        tmp_path,
+        provider,
+        store=SessionStore(tmp_path / "sessions"),
+    )
+    spawn_result = await tool.invoke(
+        {
+            "description": "plan",
+            "prompt": "inspect",
+            "subagent_type": "planner",
+            "run_in_background": True,
+        }
+    )
+    run_id = spawn_result.content.split("run_id=")[1].split(".")[0]
+    entry = registry.get(run_id)
+    assert entry is not None
+    task, _context = entry
+    await task
+
+    result = await AgentResultTool(registry).invoke({"run_id": run_id})
+    assert result.is_error is True
+    assert result.error_type == "command_failed"
+    assert "missing-terminal-decision" in result.content
+    assert "src/a.py" not in result.content
+    assert "运行 bash" not in result.content
+
+
+# 功能：验证 Planner terminal failure 不会先发布 transient success 或重复 finished event
+# 设计：收集父 bus 的完整 lifecycle 顺序，只允许一个最终 failed SubagentFinishedEvent
+async def test_planner_terminal_failure_emits_single_final_finished_event(
+    tmp_path: Path,
+) -> None:
+    provider = _make_provider("untrusted plan")
+    tool, _, bus = _make_tool(
+        tmp_path,
+        provider,
+        store=SessionStore(tmp_path / "sessions"),
+    )
+    events: list[Any] = []
+
+    async def _collect(event: Any) -> None:
+        events.append(event)
+
+    bus.subscribe(_collect)
+    await tool.invoke(
+        {
+            "description": "plan",
+            "prompt": "inspect",
+            "subagent_type": "planner",
+        }
+    )
+
+    finished = [event for event in events if isinstance(event, SubagentFinishedEvent)]
+    assert [event.status for event in finished] == ["failed"]
+
+
+# 功能：验证 planning-only invocation tree 不把 Planner child 的 LLM token 转发到 parent bus
+# 设计：provider 主动向 child bus 发布秘密 token，再比较 planning-only 与普通 child 两条桥接边界
+async def test_planning_only_token_bridge_isolated_without_changing_direct_children(
+    tmp_path: Path,
+) -> None:
+    class _TokenProvider:
+        # 在 child bus 发布一个仅用于隔离断言的 token 后结束本轮
+        async def chat(self, messages: Any, tool_schemas: Any, bus: EventBus, run_id: str, **kwargs: Any) -> LlmResponse:
+            await bus.publish(LlmTokenEvent(run_id=run_id, token="secret-token", ts="t"))
+            return LlmResponse(stop_reason="end_turn", text="done")
+
+    planning_events: list[Any] = []
+    planning_bus = EventBus()
+
+    async def collect_planning(event: Any) -> None:
+        planning_events.append(event)
+
+    planning_bus.subscribe(collect_planning)
+    planning_tool, _, _ = _make_tool(
+        tmp_path,
+        _TokenProvider(),
+        store=SessionStore(tmp_path / "planning-sessions"),
+        planning_only=True,
+    )
+    planning_tool._parent_bus = planning_bus
+    await planning_tool.invoke(
+        {"description": "plan", "prompt": "inspect", "subagent_type": "planner"}
+    )
+    assert not any(isinstance(event, LlmTokenEvent) for event in planning_events)
+
+    direct_events: list[Any] = []
+    direct_bus = EventBus()
+
+    async def collect_direct(event: Any) -> None:
+        direct_events.append(event)
+
+    direct_bus.subscribe(collect_direct)
+    direct_tool, _, _ = _make_tool(tmp_path, _TokenProvider())
+    direct_tool._parent_bus = direct_bus
+    await direct_tool.invoke({"description": "child", "prompt": "inspect"})
+    assert any(isinstance(event, LlmTokenEvent) for event in direct_events)
+
+
+# 功能：验证 profiled child 也加载 workspace root explicit instructions
+# 设计：让 profile 覆盖 base 并捕获 provider system，证明 root rules 来自独立 trusted slot
+async def test_profiled_child_loads_root_repository_instructions(tmp_path: Path) -> None:
+    agents = tmp_path / ".kama" / "agents"
+    agents.mkdir(parents=True)
+    (tmp_path / "AGENTS.md").write_text("root-child-rule", encoding="utf-8")
+    (agents / "custom.toml").write_text(
+        '[agent]\nsystem_prompt = "custom-role"\nallowed_tools = ["read_file"]\n',
+        encoding="utf-8",
+    )
+    provider = _make_provider()
+    tool, _, _ = _make_tool(tmp_path, provider)
+
+    await tool.invoke(
+        {
+            "description": "inspect",
+            "prompt": "inspect",
+            "subagent_type": "custom",
+        }
+    )
+
+    system = provider.chat.await_args.kwargs["system"]
+    assert system.startswith("custom-role\n\n" + _REPOSITORY_CHANGE_DISCIPLINE)
+    assert "## Repository Instructions" in system
+    assert "root-child-rule" in system
 
 
 # 功能：验证未指定 profile 的 subagent 各继承一次 repaired default v1 与 v2
@@ -451,7 +1421,7 @@ async def test_background_immediate_cancellation_after_run_id_is_paired(
     lifecycle_events = [
         event
         for event in events
-        if isinstance(event, (SubagentStartedEvent, SubagentFinishedEvent))
+        if isinstance(event, SubagentStartedEvent | SubagentFinishedEvent)
     ]
     assert [type(event) for event in lifecycle_events] == [
         SubagentStartedEvent,

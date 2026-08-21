@@ -48,7 +48,7 @@ _LIFECYCLE_CONTRACT_PATHS = (
     "src/kama_claude/eval/graders.py",
     "tests/unit/test_runner.py",
     "tests/eval/test_llm_error_lifecycle_contract.py",
-    "tests/eval/test_phase8a_graders.py",
+    "tests/eval/test_evaluation_rule_graders.py",
     "tests/eval/test_timeout_lifecycle_contract.py",
 )
 _TOP_LEVEL_KEYS = {

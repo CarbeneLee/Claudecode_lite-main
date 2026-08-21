@@ -41,12 +41,12 @@ def _validate_repeats(repeats: int) -> None:
         raise ValueError("repeats must be between 1 and 3")
 
 
-# 为单 task/repeat 生成唯一的 Phase 8A evaluation artifact 目录
+# 为单 task/repeat 生成唯一的 evaluation artifact 目录
 def _evaluation_output(root: Path, task_id: str, repeat: int) -> Path:
     return root / "tasks" / task_id / f"repeat-{repeat:02d}" / "evaluation"
 
 
-# 按 suite 顺序串行调用 Phase 8A evaluate_task，并保留 caller cancellation
+# 按 suite 顺序串行调用 evaluation task，并保留 caller cancellation
 async def run_suite(
     suite: LoadedBenchmarkSuite,
     output_root: Path | str,

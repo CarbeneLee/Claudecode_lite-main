@@ -67,6 +67,8 @@ class _BaseClient:
                 "high_watermark_seq": params["after_seq"],
                 "daemon_instance_id": self.daemon_id,
             }
+        if method == "session.get_agent_mode":
+            return {"agent_mode": "direct", "revision": 0}
         if method == "session.send_message":
             return {"run_id": "run-test"}
         return {}
@@ -134,6 +136,8 @@ async def test_chat_initial_handshake_transport_failure_recovers_safely(
                     "high_watermark_seq": params["after_seq"],
                     "daemon_instance_id": "daemon-a",
                 }
+            if method == "session.get_agent_mode":
+                return {"agent_mode": "direct", "revision": 0}
             return {}
 
     # 创建握手失败前后的 client
@@ -241,6 +245,8 @@ async def test_chat_fallback_handshake_eof_resumes_correct_phase(
                     "high_watermark_seq": params["after_seq"],
                     "daemon_instance_id": daemon_id,
                 }
+            if method == "session.get_agent_mode":
+                return {"agent_mode": "direct", "revision": 0}
             return {}
 
     # 创建 initial、fallback-failure 与最终恢复 client
@@ -309,6 +315,8 @@ async def test_chat_persistent_subscribe_ipc_error_has_fallback_budget(
             if method == "event.subscribe":
                 subscribe_calls += 1
                 raise IpcError(-32000, "secret-persistent-unavailable")
+            if method == "session.get_agent_mode":
+                return {"agent_mode": "direct", "revision": 0}
             return {}
 
     client = _PersistentUnavailableClient(0)

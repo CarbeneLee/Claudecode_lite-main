@@ -22,7 +22,7 @@ from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import ToolCallBlock
 from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.tools.base import BaseTool, ToolResult
-from kama_claude.core.tools.invocation import invoke_tool
+from kama_claude.core.tools.invocation import DirectToolInvoker, invoke_tool
 from kama_claude.core.tools.registry import ToolRegistry
 
 # --- stub tools --------------------------------------------------------------
@@ -269,6 +269,23 @@ async def _run(
 # --- tests -------------------------------------------------------------------
 
 
+# 功能：验证共享 invocation 模块暴露 mandatory ScopedToolInvoker 入口
+# 设计：先用已有 invocation 模块做最小 RED，避免在 production module 创建前让测试收集阶段直接 ImportError
+def test_invocation_exposes_scoped_tool_invoker() -> None:
+    assert hasattr(inv_mod, "ScopedToolInvoker")
+
+
+# 功能：验证 DirectToolInvoker 暴露 registry schema 且不声明 scoped terminal
+# 设计：用最小真实 registry 检查 provider schema 与 Direct invocation boundary 的一致性
+def test_direct_tool_invoker_preserves_schema_boundary() -> None:
+    registry = ToolRegistry()
+    registry.register(_EchoTool())
+    invoker = DirectToolInvoker(registry, EventBus(), "run-1")
+
+    assert invoker.tool_schemas() == registry.tool_schemas()
+    assert invoker.terminal_reason() is None
+
+
 # 功能：验证正常调用时返回工具内容且发布 started + finished 事件
 # 设计：同时检查返回值和事件序列，因为 invoke_tool 的双重职责是"返回结果 + 发布事件"，缺一不可
 async def test_success_returns_content_and_finished_event() -> None:
@@ -302,6 +319,18 @@ async def test_unknown_tool_returns_unknown_tool() -> None:
     assert "tool.call_finished" not in types
     failed = [event for event in events if isinstance(event, ToolCallFailedEvent)]
     assert [event.error_message for event in failed] == ["unknown tool: nonexistent"]
+
+
+# 功能：验证 DirectToolInvoker 的未知工具仍是可恢复 ordinary unknown_tool
+# 设计：直接走 mandatory Direct invoker 边界，确认它不继承 approved scope terminal 语义
+async def test_direct_tool_invoker_unknown_tool_remains_recoverable() -> None:
+    invoker = DirectToolInvoker(ToolRegistry(), EventBus(), "direct-unknown")
+
+    result = await invoker.invoke(_call("definitely_not_a_tool"))
+
+    assert result.is_error
+    assert result.error_type == "unknown_tool"
+    assert invoker.terminal_reason() is None
 
 
 # 功能：验证 elapsed_ms 使用 monotonic 秒差并精确换算为毫秒

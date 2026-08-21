@@ -7,6 +7,7 @@ import pytest
 
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.events.bus import EventBus
+from kama_claude.core.events.journal import EventJournalCoordinator
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
 from kama_claude.core.runner import AgentRunner
 from kama_claude.core.session.manager import SessionManager
@@ -77,12 +78,14 @@ def _runner(
     workspace_root: Path,
     provider: object,
     runs_dir: Path,
+    journal: EventJournalCoordinator | None = None,
 ) -> AgentRunner:
     return AgentRunner(
         KamaConfig(),
         workspace_root=workspace_root,
         provider=provider,  # type: ignore[arg-type]
         runs_dir=runs_dir,
+        journal=journal,
     )
 
 
@@ -207,10 +210,18 @@ async def test_runner_subagent_inherits_project_resources(tmp_path: Path) -> Non
         encoding="utf-8",
     )
     provider = _SpawnProvider()
-    runner = _runner(workspace.resolve(), provider, tmp_path / "runs")
+    store = SessionStore(tmp_path / "sessions")
+    journal = EventJournalCoordinator()
+    manager = SessionManager(
+        store,
+        lambda root: _runner(root, provider, tmp_path / "runs", journal),
+        EventBus(),
+        journal=journal,
+    )
+    session = await manager.create("chat", workspace_root=workspace.resolve())
+    await manager.send_message(session.id, "delegate")
+    await asyncio.gather(*manager.active_run_tasks())
 
-    outcome = await runner.run_and_capture("delegate")
-
-    assert outcome.status == "success"
+    assert session.status == "waiting_for_input"
     assert "local-planner" in provider.child_system
     assert "project-context" in provider.child_system

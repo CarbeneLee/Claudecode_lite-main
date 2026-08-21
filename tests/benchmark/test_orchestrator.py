@@ -22,7 +22,7 @@ def _orchestrator_module() -> ModuleType:
         pytest.fail("benchmark orchestrator module is missing")
 
 
-# 创建两个 criterion group 对应的最小 Phase 8A task
+# 创建两个 criterion group 对应的最小 evaluation task
 def _write_task(tasks_root: Path, task_id: str, category: str) -> None:
     task_dir = tasks_root / task_id
     workspace = task_dir / "public" / "workspace"
@@ -94,7 +94,7 @@ def _loaded_suite(tmp_path: Path) -> object:
     return load_suite(suite_path, tasks_root)
 
 
-# 构造只含公开 Phase 8A 字段的 deterministic attempt report
+# 构造只含公开 evaluation 字段的 deterministic attempt report
 def _report(task_id: str, attempt_id: str) -> EvaluationReport:
     return EvaluationReport(
         task_id=task_id,
@@ -121,10 +121,10 @@ def _report(task_id: str, attempt_id: str) -> EvaluationReport:
     )
 
 
-# 功能：验证 orchestrator 按 suite 顺序和 repeat 顺序逐次调用 Phase 8A evaluator
+# 功能：验证 orchestrator 按 suite 顺序和 repeat 顺序逐次调用 evaluation evaluator
 # 设计：fake evaluator 主动 yield 并记录最大并发数，既锁定调用参数也能杀死 gather 并发实现
 @pytest.mark.asyncio
-async def test_orchestrator_runs_phase8a_attempts_sequentially(tmp_path: Path) -> None:
+async def test_orchestrator_runs_evaluation_attempts_sequentially(tmp_path: Path) -> None:
     orchestrator = _orchestrator_module()
     suite = _loaded_suite(tmp_path)
     calls: list[tuple[str, Path]] = []
@@ -170,10 +170,10 @@ async def test_orchestrator_runs_phase8a_attempts_sequentially(tmp_path: Path) -
     ]
 
 
-# 功能：验证 orchestrator 默认依赖就是 Phase 8A evaluate_task 而非第二套 evaluator
+# 功能：验证 orchestrator 默认依赖就是 evaluation evaluate_task 而非第二套 evaluator
 # 设计：替换模块级 evaluate_task seam 后不传 evaluator，断言唯一调用收到原 task directory
 @pytest.mark.asyncio
-async def test_orchestrator_defaults_to_phase8a_evaluate_task(
+async def test_orchestrator_defaults_to_evaluation_evaluate_task(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -181,15 +181,15 @@ async def test_orchestrator_defaults_to_phase8a_evaluate_task(
     suite = _loaded_suite(tmp_path)
     seen: list[Path] = []
 
-    # 代替网络 Agent run，但保持与 Phase 8A evaluate_task 相同的调用合同
-    async def fake_phase8a(
+    # 代替网络 Agent run，但保持与 evaluation task 相同的调用合同
+    async def fake_evaluation(
         task_dir: Path | str,
         output: Path | str,
     ) -> EvaluationReport:
         seen.append(Path(task_dir))
         return _report(Path(task_dir).name, f"attempt-{len(seen)}")
 
-    monkeypatch.setattr(orchestrator, "evaluate_task", fake_phase8a)
+    monkeypatch.setattr(orchestrator, "evaluate_task", fake_evaluation)
 
     run = await orchestrator.run_suite(suite, tmp_path / "artifacts", repeats=1)
 

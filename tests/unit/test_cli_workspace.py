@@ -57,6 +57,8 @@ async def test_chat_sends_workspace_only_when_creating_session(
                     "high_watermark_seq": 0,
                     "daemon_instance_id": "daemon-a",
                 }
+            if method == "session.get_agent_mode":
+                return {"agent_mode": "direct", "revision": 0}
             if method == "session.send_message":
                 return {"run_id": "run-test"}
             return {}

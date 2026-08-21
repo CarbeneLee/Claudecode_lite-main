@@ -479,6 +479,178 @@ async def test_extra_handlers_receive_events(tmp_path: Path) -> None:
     assert len(secondary) > 0
 
 
+# 功能：验证 PlanReady 提交后 thread projection 失败不会回滚已经 durable 的成功 run
+# 设计：使用真实双路由 journal 与 fake trusted Planner，注入 thread 写入失败，确认只留下 candidate、成功终态和普通日志路径
+async def test_plan_thread_projection_failure_keeps_successful_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from kama_claude.core.context import ExecutionContext
+    from kama_claude.core.events.journal import EventJournalCoordinator
+    from kama_claude.core.planning import (
+        ExactPlannerDecisionV2,
+        SubmittedDecisionIdentity,
+        _exact_content_digest,
+    )
+    from kama_claude.core.session.model import Session
+    from kama_claude.core.session.store import SessionStore
+    from kama_claude.core.subagent.tool import TrustedPlannerSuccess
+
+    store = SessionStore(tmp_path / "sessions")
+    session = Session(
+        id="sess-plan",
+        mode="chat",
+        status="active",
+        title="",
+        created_at="t",
+        updated_at="t",
+        workspace_root=tmp_path.resolve(),
+    )
+    store.write_meta(session)
+    decision_payload: dict[str, object] = {
+        "schema_version": 2,
+        "decision_id": "decision-plan",
+        "version": 1,
+        "goal": "plan goal",
+        "requirements": [
+            {"requirement_id": "R1", "statement": "Keep the plan", "required": True}
+        ],
+        "architecture_slice_id": "slice-plan",
+        "architecture_slice_version": 1,
+        "architecture_slice_content_digest": "slice-digest",
+        "snapshot_digest": "snapshot-digest",
+        "architecture_mode": "preserve",
+        "selected_approach": "Keep the existing approach.",
+        "existing_patterns_reused": [],
+        "intended_changes": [
+            {
+                "change_id": "C1",
+                "description": "Keep the plan",
+                "requirement_ids": ["R1"],
+                "target_paths": ["src/plan.py"],
+                "evidence_refs": ["evidence-1"],
+            }
+        ],
+        "files_to_modify": ["src/plan.py"],
+        "files_to_create": [],
+        "allowed_capabilities": ["read_file"],
+        "dependency_changes": [],
+        "protocol_or_schema_changes": [],
+        "verification_plan": [{"requirement_ids": ["R1"], "strategy": "Inspect"}],
+        "non_goals": [],
+        "assumptions": [],
+        "unresolved_questions": [],
+        "requires_user_approval": True,
+    }
+    decision_payload["content_digest"] = _exact_content_digest(decision_payload)
+    decision = ExactPlannerDecisionV2.model_validate(decision_payload)
+    store.write_decision(
+        session.id,
+        decision.decision_id,
+        decision.version,
+        decision.model_dump(mode="json"),
+    )
+
+    journal = EventJournalCoordinator()
+    await journal.register_session(session.id, store.session_dir(session.id))
+    run_id = "run-plan-projection"
+    run_path = store.runs_dir(session.id) / run_id
+    await journal.register_run(run_id, run_path, session_id=session.id)
+    bus = EventBus()
+    bus.subscribe(journal.handle)
+    observed: list[BaseModel] = []
+
+    async def collect(event: BaseModel) -> None:
+        observed.append(event)
+
+    bus.subscribe(collect)
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path.resolve(),
+        bus=bus,
+        provider=_EndTurnProvider(),
+        runs_dir=tmp_path,
+        journal=journal,
+    )
+
+    class FakePlannerTool:
+        # 返回已提交 decision identity，跳过真实模型而保留 planning runner 生命周期
+        async def run_trusted_planner_foreground(
+            self,
+            *,
+            goal: str,
+            description: str,
+        ) -> TrustedPlannerSuccess:
+            return TrustedPlannerSuccess(
+                status="success",
+                planner_run_id="planner-child",
+                decision_identity=SubmittedDecisionIdentity(
+                    decision_id=decision.decision_id,
+                    version=decision.version,
+                    snapshot_digest=decision.snapshot_digest,
+                    content_digest=decision.content_digest,
+                ),
+            )
+
+    monkeypatch.setattr(
+        runner,
+        "_make_spawn_agent_tool",
+        lambda **kwargs: FakePlannerTool(),
+    )
+
+    order: list[str] = []
+    import kama_claude.core.runner as runner_module
+
+    original_materialize = runner_module.materialize_committed_plan_receipt
+
+    # 记录 receipt materialization 在 thread projection 之前发生
+    async def record_receipt(**kwargs: object) -> object:
+        order.append("receipt")
+        return await original_materialize(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runner_module, "materialize_committed_plan_receipt", record_receipt)
+
+    # 注入 thread projection failure 并记录其发生顺序
+    def fail_thread_projection(*args: object, **kwargs: object) -> bool:
+        order.append("thread")
+        raise OSError("injected thread projection failure")
+
+    monkeypatch.setattr(store, "append_plan_projection", fail_thread_projection)
+    context = ExecutionContext(run_id=run_id, goal="plan goal", max_steps=1)
+    with caplog.at_level("WARNING"):
+        outcome = await runner._run_planning_and_capture(
+            goal="plan goal",
+            run_id=run_id,
+            run_path=run_path,
+            context=context,
+            session=session,
+            store=store,
+            bus=bus,
+        )
+
+    assert outcome.status == "success"
+    assert order == ["receipt", "thread"]
+    finished = [event for event in observed if event.type == "run.finished"]
+    assert len(finished) == 1
+    assert finished[0].status == "success"
+    assert "plan-thread-projection-failed" in caplog.text
+    replay = await journal.read_replay(
+        f"run:{run_id}",
+        after_seq=0,
+        high_watermark=journal.high_watermark(f"run:{run_id}"),
+    )
+    assert [record.event["type"] for record in replay.records] == [
+        "planner.decision_ready",
+        "run.finished",
+    ]
+    assert not any(
+        "plan-thread-projection-failed" in str(record.event)
+        for record in replay.records
+    )
+    await journal.close()
+
+
 # 功能：验证 config.agent.max_steps 被正确传递给 AgentLoop，控制 LLM 调用次数上限
 # 设计：用 LoopingProvider 的调用次数反推 max_steps 是否生效，不依赖内部状态检查，从行为角度验证配置传递
 async def test_config_max_steps_passed_to_loop(tmp_path: Path) -> None:
@@ -647,6 +819,59 @@ async def test_project_context_uses_runner_workspace(
     assert provider.system is not None
     assert "workspace-context" in provider.system
     assert "daemon-context" not in provider.system
+
+
+# 功能：验证 Direct Mode 加载 workspace root 的全部 explicit instruction sources
+# 设计：用真实 Runner 与 capturing provider 读取 AGENTS/CLAUDE，并排除嵌套规则自动注入
+async def test_direct_runner_loads_only_root_explicit_instructions(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    nested = workspace / "src"
+    nested.mkdir(parents=True)
+    (workspace / "AGENTS.md").write_text("root-agents-rule", encoding="utf-8")
+    (workspace / "CLAUDE.md").write_text("root-claude-rule", encoding="utf-8")
+    (nested / "AGENTS.md").write_text("nested-rule", encoding="utf-8")
+    provider = _CapturingProvider(LlmResponse(stop_reason="end_turn", text="done"))
+    runner = AgentRunner(
+        _config(),
+        workspace_root=workspace,
+        provider=provider,
+        runs_dir=tmp_path / "runs",
+    )
+
+    await runner.run("direct task")
+
+    assert provider.system is not None
+    assert "## Repository Instructions" in provider.system
+    assert "root-agents-rule" in provider.system
+    assert "root-claude-rule" in provider.system
+    assert "nested-rule" not in provider.system
+
+
+# 功能：验证 custom coding skill override 仍继承 canonical policy 与 root repository instructions
+# 设计：直接走真实 Runner override composition，证明 SkillLoader 无需分类或改写即可得到 trusted slots
+async def test_custom_skill_override_keeps_policy_and_root_instructions(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "AGENTS.md").write_text("root-skill-rule", encoding="utf-8")
+    provider = _CapturingProvider(LlmResponse(stop_reason="end_turn", text="done"))
+    runner = AgentRunner(
+        _config(),
+        workspace_root=tmp_path,
+        provider=provider,
+        runs_dir=tmp_path / "runs",
+    )
+
+    await runner.run_and_capture(
+        "skill goal",
+        system_prompt_override="CUSTOM SKILL BASE",
+    )
+
+    assert provider.system is not None
+    assert provider.system.startswith(
+        "CUSTOM SKILL BASE\n\n## Repository Change Discipline"
+    )
+    assert provider.system.count("## Repository Change Discipline") == 1
+    assert "root-skill-rule" in provider.system
 
 
 # 功能：验证 workspace A/B 的 Runner 分别加载各自项目 context
@@ -1179,7 +1404,8 @@ async def test_parent_run_joins_background_child_before_terminal(
     # parent 真实调用 spawn_agent；child 只在可取消 gate 上等待
     async def controlled_run(loop: AgentLoop, context: Any) -> None:
         if context.run_id == "run-parent":
-            tool = loop._registry.get("spawn_agent")
+            invoker_registry = getattr(loop._tool_invoker, "_registry", None)
+            tool = invoker_registry.get("spawn_agent") if invoker_registry else None
             assert isinstance(tool, SpawnAgentTool)
             await tool.invoke(
                 {
@@ -1264,7 +1490,7 @@ class _FakeGitManager:
         self, run_id: str, step: int, label: str, *, force: bool = False
     ) -> object:
         self.calls.append(f"create_checkpoint:{run_id}:{step}:{label}")
-        return type("Cp", (), {"step": step})()
+        return type("Cp", (), {"step": step, "commit_sha": "a" * 40})()
 
     async def get_checkpoint(self, run_id: str, step: int) -> object:
         self.calls.append(f"get_checkpoint:{run_id}:{step}")
@@ -1377,6 +1603,28 @@ async def test_run_start_creates_baseline_in_order(tmp_path: Path) -> None:
         "diff",
     ]
     assert any(isinstance(e, GitRunDiffEvent) for e in collected)
+
+
+# 功能：验证 Runner 将 preflight 后 baseline commit SHA 传给顶层 SpawnAgentTool
+# 设计：捕获真实 registry build 参数而不运行 child，锁定 snapshot provenance 来源与 lifecycle 顺序
+async def test_runner_passes_baseline_head_to_spawn_agent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git = _FakeGitManager()
+    runner, _collected = _git_runner(tmp_path, git)
+    original = runner._build_registry
+    seen: list[str | None] = []
+
+    def _capture(*args: object, **kwargs: Any) -> object:
+        seen.append(kwargs.get("git_head"))
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runner, "_build_registry", _capture)
+
+    await runner.run_and_capture("goal", run_id="r1")
+
+    assert seen == ["a" * 40]
 
 
 # 功能：验证 dirty 工作树且用户批准时调用 snapshot_pre_run（含用户修改的 baseline）

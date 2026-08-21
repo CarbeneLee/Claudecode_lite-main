@@ -28,6 +28,11 @@ class WorkspaceAccessPolicy:
             )
         self._root = root
 
+    @property
+    # 返回 canonical workspace root，供 trusted registry 做 identity 校验
+    def root(self) -> Path:
+        return self._root
+
     # 检查 logical 与 canonical path parts 是否命中敏感路径规则
     def ensure_allowed(self, logical_path: str, resolved_path: Path) -> None:
         logical_parts = Path(logical_path).parts

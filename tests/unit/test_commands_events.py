@@ -13,8 +13,10 @@ from kama_claude.core.bus.commands import (
     PingCommand,
     PongResult,
     SessionCreateCommand,
+    SessionGetAgentModeResult,
+    SessionSetAgentModeResult,
 )
-from kama_claude.core.bus.events import CoreStartedEvent
+from kama_claude.core.bus.events import CoreStartedEvent, SessionAgentModeChangedEvent
 
 
 # 功能：验证 PingCommand 序列化后再反序列化，client 和 type 字段完整保留
@@ -188,3 +190,56 @@ def test_event_subscribe_result_carries_response_time_cursor_metadata() -> None:
     assert restored.stream_id == "run:run-1"
     assert restored.accepted_after_seq == 3
     assert restored.high_watermark_seq == 9
+
+
+# 功能：验证 mode result 与 changed event 在 wire 往返中携带 revision
+# 设计：同时覆盖 set/get response 和 event union 使用的 Pydantic 边界，防止只修改 daemon 内部模型
+def test_agent_mode_protocol_roundtrip_carries_revision() -> None:
+    set_result = SessionSetAgentModeResult(agent_mode="plan", revision=3)
+    get_result = SessionGetAgentModeResult(agent_mode="plan", revision=3)
+    event = SessionAgentModeChangedEvent(
+        session_id="sess-1",
+        previous_mode="direct",
+        agent_mode="plan",
+        revision=3,
+        ts="t",
+    )
+
+    assert SessionSetAgentModeResult.model_validate_json(set_result.model_dump_json()).revision == 3
+    assert SessionGetAgentModeResult.model_validate_json(get_result.model_dump_json()).revision == 3
+    assert SessionAgentModeChangedEvent.model_validate_json(event.model_dump_json()).revision == 3
+
+
+# 功能：验证旧 mode changed event 缺少 revision 时兼容为零且非法 mode 仍被拒绝
+# 设计：legacy payload 走默认值，伪造 executor 走 Literal 校验，覆盖 replay 兼容与 fail-closed 边界
+def test_legacy_mode_event_defaults_revision_and_rejects_invalid_mode() -> None:
+    legacy = SessionAgentModeChangedEvent.model_validate(
+        {
+            "session_id": "sess-1",
+            "previous_mode": "direct",
+            "agent_mode": "plan",
+            "ts": "t",
+        }
+    )
+
+    assert legacy.revision == 0
+    with pytest.raises(ValidationError):
+        SessionAgentModeChangedEvent.model_validate(
+            {
+                "session_id": "sess-1",
+                "previous_mode": "direct",
+                "agent_mode": "executor",
+                "revision": 1,
+                "ts": "t",
+            }
+        )
+    with pytest.raises(ValidationError):
+        SessionAgentModeChangedEvent.model_validate(
+            {
+                "session_id": "sess-1",
+                "previous_mode": "direct",
+                "agent_mode": "plan",
+                "revision": True,
+                "ts": "t",
+            }
+        )

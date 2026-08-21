@@ -2,7 +2,26 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Discriminator
+from pydantic import BaseModel, Discriminator, Field, StrictInt, model_validator
+
+from kama_claude.core.plan_view import (
+    LegacyPlanViewV0,
+    PlanViewEventValue,
+    PlanViewV1,
+    decode_plan_view_record,
+)
+from kama_claude.core.session.model import MAX_AGENT_MODE_REVISION, AgentMode
+
+ExecutionStatusValue = Literal[
+    "admitted",
+    "running",
+    "completed_unverified",
+    "failed",
+    "cancelled",
+    "scope_denied",
+    "inconclusive",
+    "interrupted",
+]
 
 
 class CoreStartedEvent(BaseModel):
@@ -16,6 +35,8 @@ class RunStartedEvent(BaseModel):
     run_id: str
     goal: str
     ts: str  # ISO 8601
+    execution_id: str | None = None
+    execution_status: Literal["admitted", "running"] | None = None
 
 
 class RunFinishedEvent(BaseModel):
@@ -25,6 +46,8 @@ class RunFinishedEvent(BaseModel):
     reason: str | None = None  # "exceeded_max_steps" | "cancelled" | "llm_error" | ...
     steps: int
     ts: str
+    execution_id: str | None = None
+    execution_status: ExecutionStatusValue | None = None
 
 
 class StepStartedEvent(BaseModel):
@@ -135,6 +158,15 @@ class SessionResumedEvent(BaseModel):
     ts: str
 
 
+class SessionAgentModeChangedEvent(BaseModel):
+    type: Literal["session.agent_mode_changed"] = "session.agent_mode_changed"
+    session_id: str
+    previous_mode: AgentMode
+    agent_mode: AgentMode
+    revision: StrictInt = Field(default=0, ge=0, le=MAX_AGENT_MODE_REVISION)
+    ts: str
+
+
 class SessionClosedEvent(BaseModel):
     type: Literal["session.closed"] = "session.closed"
     session_id: str
@@ -210,6 +242,83 @@ class SkillInvokedEvent(BaseModel):
     ts: str
 
 
+class PlannerDecisionReadyEvent(BaseModel):
+    type: Literal["planner.decision_ready"] = "planner.decision_ready"
+    event_id: str
+    run_id: str
+    planner_run_id: str
+    session_id: str
+    plan: PlanViewEventValue
+    # 旧客户端兼容 alias；V1 event 中由 projection_key 派生，不是第二事实源
+    plan_key: str = ""
+    decision_key: str = ""
+    projection_key: str = ""
+    decision_id: str = ""
+    decision_version: int = 0
+    ts: str
+    snapshot_digest: str = ""
+    content_digest: str = ""  # legacy alias for decision_content_digest
+    decision_content_digest: str = ""
+    projection_digest: str = ""
+
+    # 在 wire boundary 强制 outer identity 由 PlanViewV1 派生并保持一致
+    @model_validator(mode="after")
+    def _derive_identity_from_plan(self) -> PlannerDecisionReadyEvent:
+        if isinstance(self.plan, PlanViewV1):
+            # 直接传入模型实例时也必须重算 projection digest，不能只验证 outer alias
+            decode_plan_view_record(self.plan)
+            expected_projection_key = f"pv1:{self.run_id}:{self.plan.decision_key}"
+            if self.plan.projection_key != expected_projection_key:
+                raise ValueError(
+                    "PlannerDecisionReadyEvent plan projection does not match run"
+                )
+            expected = {
+                "decision_key": self.plan.decision_key,
+                "projection_key": self.plan.projection_key,
+                "decision_id": self.plan.decision_id,
+                "decision_version": self.plan.decision_version,
+                "snapshot_digest": self.plan.snapshot_digest,
+                "decision_content_digest": self.plan.decision_content_digest,
+                "projection_digest": self.plan.projection_digest,
+            }
+            for field, value in expected.items():
+                actual = getattr(self, field)
+                if actual not in ("", 0) and actual != value:
+                    raise ValueError(f"PlannerDecisionReadyEvent {field} does not match PlanView")
+                setattr(self, field, value)
+            if self.plan_key not in ("", self.projection_key):
+                raise ValueError("PlannerDecisionReadyEvent plan_key does not match projection")
+            if self.content_digest not in ("", self.decision_content_digest):
+                raise ValueError("PlannerDecisionReadyEvent content_digest does not match decision")
+            self.plan_key = self.projection_key
+            self.content_digest = self.decision_content_digest
+            expected_event_id = f"plan-ready:{self.projection_key}"
+            if self.event_id != expected_event_id:
+                raise ValueError("PlannerDecisionReadyEvent event_id does not match projection")
+        elif isinstance(self.plan, LegacyPlanViewV0):
+            if self.plan_key and self.plan_key != self.plan.plan_key:
+                raise ValueError("legacy PlannerDecisionReadyEvent plan_key conflict")
+            if self.content_digest and self.plan.content_digest:
+                if self.content_digest != self.plan.content_digest:
+                    raise ValueError("legacy PlannerDecisionReadyEvent content_digest conflict")
+            self.plan_key = self.plan.plan_key
+            if not self.content_digest:
+                self.content_digest = self.plan.content_digest
+        return self
+
+
+class PlanApprovalChangedEvent(BaseModel):
+    type: Literal["plan.approval_changed"] = "plan.approval_changed"
+    event_id: str
+    session_id: str
+    projection_key: str
+    status: Literal["approved", "rejected"]
+    action: Literal["approve", "reject"]
+    record_digest: str
+    commit_receipt_digest: str
+    ts: str
+
+
 # 根据 type 字段决定事件类型的判别联合
 Event = Annotated[
     CoreStartedEvent
@@ -228,6 +337,7 @@ Event = Annotated[
     | SessionMessageReceivedEvent
     | SessionWaitingForInputEvent
     | SessionResumedEvent
+    | SessionAgentModeChangedEvent
     | SessionClosedEvent
     | ContextCompactedEvent
     | GitRunDiffEvent
@@ -236,6 +346,8 @@ Event = Annotated[
     | PermissionDeniedEvent
     | SubagentStartedEvent
     | SubagentFinishedEvent
-    | SkillInvokedEvent,
+    | SkillInvokedEvent
+    | PlannerDecisionReadyEvent
+    | PlanApprovalChangedEvent,
     Discriminator("type"),
 ]

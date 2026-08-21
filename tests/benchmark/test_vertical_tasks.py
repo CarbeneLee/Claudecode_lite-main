@@ -40,7 +40,7 @@ def _apply_reference(task: LoadedBenchmarkTask, workspace: Path) -> None:
     )
 
 
-# 为 reference evaluator 写入最小合法 Phase 8A run journal
+# 为 reference evaluator 写入最小合法 evaluation run journal
 def _write_runtime_evidence(execution: AttemptExecution, goal: str) -> None:
     assert execution.worker_result is not None
     prepared = execution.prepared
@@ -91,7 +91,7 @@ def _write_runtime_evidence(execution: AttemptExecution, goal: str) -> None:
     prepared.trace_path.write_text("{}\n", encoding="utf-8")
 
 
-# 使用 private reference patch 构造真实 Phase 8A evaluate_task 的 deterministic execution seam
+# 使用 private reference patch 构造真实 evaluation task 的 deterministic execution seam
 async def _reference_evaluator(
     task_dir: Path | str,
     output_root: Path | str,
@@ -122,7 +122,7 @@ async def _reference_evaluator(
     )
     _write_runtime_evidence(execution, loaded.public.goal)
 
-    # 将固定 reference execution 注入 Phase 8A 唯一 evaluator，不复制 collector/grader
+    # 将固定 reference execution 注入 evaluation 唯一 evaluator，不复制 collector/grader
     async def fake_attempt(
         _task: object,
         _output: object,
@@ -160,7 +160,7 @@ def test_mvp_suite_contains_exactly_nine_approved_tasks() -> None:
 
 
 # 功能：验证 pristine fixture 的目标 criterion 失败但 regression criterion 通过
-# 设计：运行真实 Phase 8A rule grader 并按 benchmark groups 解读，证明每个 task 非平凡且初态健康
+# 设计：运行真实 evaluation rule grader 并按 benchmark groups 解读，证明每个 task 非平凡且初态健康
 @pytest.mark.asyncio
 async def test_pristine_tasks_fail_targets_but_keep_regressions(
     tmp_path: Path,
@@ -185,7 +185,7 @@ async def test_pristine_tasks_fail_targets_but_keep_regressions(
         assert any(not by_id[criterion_id] for criterion_id in target_ids)
 
 
-# 功能：验证 private reference patch 能使九个 task 的全部 Phase 8A criteria 通过
+# 功能：验证 private reference patch 能使九个 task 的全部 evaluation criteria 通过
 # 设计：只在 tmp copy 应用 patch 后运行真实 grader，证明 task 可解且不污染 public fixture
 @pytest.mark.asyncio
 async def test_reference_patches_satisfy_all_private_graders(tmp_path: Path) -> None:
@@ -213,7 +213,7 @@ async def test_reference_patches_satisfy_all_private_graders(tmp_path: Path) -> 
             assert '"coverage_delta":' in outputs
 
 
-# 功能：验证九个 reference tasks 贯通 Phase 8A evaluator、orchestrator 与 analyzer
+# 功能：验证九个 reference tasks 贯通 evaluation evaluator、orchestrator 与 analyzer
 # 设计：只替换 Agent execution 为 private reference patch，identity/report 全链路由独立测试覆盖
 @pytest.mark.asyncio
 async def test_nine_task_reference_pipeline_validates_framework(

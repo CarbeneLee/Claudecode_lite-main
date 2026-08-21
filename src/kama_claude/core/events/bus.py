@@ -13,7 +13,8 @@ class EventBus:
 
     # 注册一个事件处理函数
     def subscribe(self, handler: EventHandler) -> None:
-        self._subscribers.append(handler)
+        if handler not in self._subscribers:
+            self._subscribers.append(handler)
 
     # 注销事件处理函数（重复注销为 no-op）
     def unsubscribe(self, handler: EventHandler) -> None:

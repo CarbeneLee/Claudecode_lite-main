@@ -20,13 +20,32 @@ def test_builtin_planner_found(tmp_path: Path) -> None:
 
 # 功能：内建三种角色均可加载
 # 设计：参数化测试所有内建角色名
-@pytest.mark.parametrize("role", ["planner", "executor", "reviewer"])
+@pytest.mark.parametrize("role", ["planner", "executor", "reviewer", "explorer"])
 def test_all_builtin_roles_found(role: str, tmp_path: Path) -> None:
     loader = AgentProfileLoader(tmp_path.resolve())
     profile = loader.load(role)
     assert profile is not None, f"builtin role '{role}' not found"
     assert profile.allowed_tools  # 每个内建角色都有 allowed_tools
     assert "search_code" in profile.allowed_tools
+
+
+# 功能：验证 builtin Planner 只允许 Explorer child 且 Explorer 自身不可继续派生
+# 设计：读取真实 builtin profiles 并断言 profile-level child type contract，不检查 TOML 文本
+def test_builtin_planner_and_explorer_child_type_contract(tmp_path: Path) -> None:
+    loader = AgentProfileLoader(tmp_path.resolve())
+    planner = loader.load("planner")
+    explorer = loader.load("explorer")
+
+    assert planner is not None
+    assert explorer is not None
+    assert planner.allowed_subagent_types == ["explorer"]
+    assert "spawn_agent" in planner.allowed_tools
+    assert "planner_decision_submit" in planner.allowed_tools
+    assert "task_create" not in planner.allowed_tools
+    assert "task_update" not in planner.allowed_tools
+    assert explorer.allowed_subagent_types == []
+    assert "spawn_agent" not in explorer.allowed_tools
+    assert "architecture_slice_submit" in explorer.allowed_tools
 
 
 # 功能：未知角色名应返回 None
@@ -101,3 +120,96 @@ def test_profile_loaders_isolate_project_overrides(tmp_path: Path) -> None:
     assert profile_b is not None
     assert profile_a.system_prompt == "prompt-a"
     assert profile_b.system_prompt == "prompt-b"
+
+
+# 功能：验证 custom Planner 缺失 child-type 字段时保持空权限而不补回 Explorer
+# 设计：只提供工具子集并省略 child-type 配置，直接检查 loader 的 fail-closed 结果
+def test_custom_planner_missing_child_types_stays_empty(tmp_path: Path) -> None:
+    agents = tmp_path / ".kama" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "planner.toml").write_text(
+        '[agent]\nsystem_prompt = "custom"\nallowed_tools = ["read_file"]\n',
+        encoding="utf-8",
+    )
+
+    profile = AgentProfileLoader(tmp_path.resolve()).load("planner")
+
+    assert profile is not None
+    assert profile.allowed_subagent_types == []
+
+
+# 功能：验证 custom Planner 缺失工具字段时保持零工具而不补回 trusted allowlist
+# 设计：只提供自定义 prompt，锁定配置缺失与显式空集合都不能触发 runtime 默认权限
+def test_custom_planner_missing_tools_stays_empty(tmp_path: Path) -> None:
+    agents = tmp_path / ".kama" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "planner.toml").write_text(
+        '[agent]\nsystem_prompt = "custom"\n',
+        encoding="utf-8",
+    )
+
+    profile = AgentProfileLoader(tmp_path.resolve()).load("planner")
+
+    assert profile is not None
+    assert profile.allowed_tools == []
+
+
+# 功能：验证 custom Planner 显式空工具和空 child-type 集合不被 loader 扩张
+# 设计：分别写入两个空数组，锁定配置层保留 empty 与 missing 的收窄语义
+def test_custom_planner_explicit_empty_capabilities_stay_empty(tmp_path: Path) -> None:
+    agents = tmp_path / ".kama" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "planner.toml").write_text(
+        '[agent]\nsystem_prompt = "custom"\n'
+        'allowed_tools = []\nallowed_subagent_types = []\n',
+        encoding="utf-8",
+    )
+
+    profile = AgentProfileLoader(tmp_path.resolve()).load("planner")
+
+    assert profile is not None
+    assert profile.allowed_tools == []
+    assert profile.allowed_subagent_types == []
+
+
+# 功能：验证 malformed allowlist 类型不会被当作可迭代配置放行
+# 设计：参数化字符串和混合类型两类 TOML 输入，断言 loader fail closed 而非 substring 匹配
+@pytest.mark.parametrize(
+    "field_value",
+    ['"read_file"', '["read_file", 1]'],
+)
+def test_custom_planner_malformed_tool_allowlist_fails_closed(
+    tmp_path: Path,
+    field_value: str,
+) -> None:
+    agents = tmp_path / ".kama" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "planner.toml").write_text(
+        "[agent]\n"
+        f"system_prompt = \"custom\"\nallowed_tools = {field_value}\n",
+        encoding="utf-8",
+    )
+
+    assert AgentProfileLoader(tmp_path.resolve()).load("planner") is None
+
+
+# 功能：验证 malformed child-type 类型不会被错误解释为 Explorer 授权
+# 设计：覆盖字符串和混合列表输入，避免 `name in requested` 产生隐式 substring/类型语义
+@pytest.mark.parametrize(
+    "field_value",
+    ['"explorer"', '["explorer", 1]'],
+)
+def test_custom_planner_malformed_child_types_fail_closed(
+    tmp_path: Path,
+    field_value: str,
+) -> None:
+    agents = tmp_path / ".kama" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "planner.toml").write_text(
+        "[agent]\n"
+        'system_prompt = "custom"\nallowed_tools = ["spawn_agent"]\n'
+        f"allowed_subagent_types = {field_value}\n",
+        encoding="utf-8",
+    )
+
+    assert AgentProfileLoader(tmp_path.resolve()).load("planner") is None
