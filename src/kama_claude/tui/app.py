@@ -687,7 +687,7 @@ class ChatTextArea(TextArea):
 class KamaTuiApp(App[None]):
     """KamaClaude TUI：终端滚屏风格，实时展示 agent 执行过程。"""
 
-    TITLE = "KamaClaude"
+    TITLE = "Li Code"
     BINDINGS = [
         Binding("ctrl+q", "quit", "quit"),
     ]
@@ -715,13 +715,13 @@ class KamaTuiApp(App[None]):
     """
 
     _BANNER = (
-        "[bold cyan]██╗  ██╗ █████╗ ███╗   ███╗ █████╗  ██████╗██╗      █████╗ ██╗   ██╗██████╗ ███████╗[/bold cyan]\n"  # noqa: E501
-        "[bold cyan]██║ ██╔╝██╔══██╗████╗ ████║██╔══██╗██╔════╝██║     ██╔══██╗██║   ██║██╔══██╗██╔════╝[/bold cyan]\n"  # noqa: E501
-        "[bold cyan]█████╔╝ ███████║██╔████╔██║███████║██║     ██║     ███████║██║   ██║██║  ██║█████╗  [/bold cyan]\n"  # noqa: E501
-        "[bold cyan]██╔═██╗ ██╔══██║██║╚██╔╝██║██╔══██║██║     ██║     ██╔══██║██║   ██║██║  ██║██╔══╝  [/bold cyan]\n"  # noqa: E501
-        "[bold cyan]██║  ██╗██║  ██║██║ ╚═╝ ██║██║  ██║╚██████╗███████╗██║  ██║╚██████╔╝██████╔╝███████╗[/bold cyan]\n"  # noqa: E501
-        "[bold cyan]╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝[/bold cyan]\n"  # noqa: E501
-        "[dim]  输入消息开始对话  ·  键入 / 触发 skill  ·  Ctrl+C 退出[/dim]"
+        "[bold cyan]██╗     ██╗     ██████╗ ██████╗ ██████╗ ███████╗[/bold cyan]\n"
+        "[bold cyan]██║     ██║    ██╔════╝██╔═══██╗██╔══██╗██╔════╝[/bold cyan]\n"
+        "[bold cyan]██║     ██║    ██║     ██║   ██║██║  ██║█████╗[/bold cyan]\n"
+        "[bold cyan]██║     ██║    ██║     ██║   ██║██║  ██║██╔══╝[/bold cyan]\n"
+        "[bold cyan]███████╗██║    ╚██████╗╚██████╔╝██████╔╝███████╗[/bold cyan]\n"
+        "[bold cyan]╚══════╝╚═╝     ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝[/bold cyan]\n"
+        "[dim]Li Code · 输入消息开始对话 · 键入 / 触发 skill · Ctrl+C 退出[/dim]"
     )
 
     # 初始化连接参数和 TUI 内部状态
@@ -778,7 +778,7 @@ class KamaTuiApp(App[None]):
         self._reconnect_state.busy = value
 
     def compose(self) -> ComposeResult:
-        yield Label("[bold]KamaClaude[/bold]  [dim]connecting...[/dim]", id="header")
+        yield Label("[bold]Li Code[/bold]  [dim]connecting...[/dim]", id="header")
         yield VerticalScroll(id="log-view")
         yield ChatTextArea(id="prompt", show_line_numbers=False)
 
@@ -1201,7 +1201,7 @@ class KamaTuiApp(App[None]):
             "connecting": "dim",
         }.get(state, "dim")
         header.update(
-            f"[bold]KamaClaude[/bold]  [dim]{self._host}:{self._port}[/dim]"
+            f"[bold]Li Code[/bold]  [dim]{self._host}:{self._port}[/dim]"
             f"{session}  [magenta]MODE:{self._agent_mode.upper()}[/magenta]"
             f"  [{color}]{state}[/{color}]"
         )

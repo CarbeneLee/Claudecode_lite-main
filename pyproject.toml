@@ -18,11 +18,14 @@ dependencies = [
     "httpx[socks]>=0.28.1",
 ]
 
-# 安装后可在 PATH 中执行的入口：`kama` / `kama-core` / `kama-tui`
+# 安装后可在 PATH 中执行的 Li Code 主入口与 Kama legacy 兼容入口
 [project.scripts]
 kama = "kama_claude.cli.main:main"
 kama-core = "kama_claude.core.app:run"
 kama-tui = "kama_claude.tui.__main__:main"
+li = "kama_claude.cli.main:main"
+li-core = "kama_claude.core.app:run"
+li-tui = "kama_claude.tui.__main__:main"
 kama-eval = "kama_claude.eval.cli:main"
 kama-bench = "kama_claude.benchmark.cli:main"
 

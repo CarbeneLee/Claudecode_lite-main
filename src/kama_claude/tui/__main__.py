@@ -33,7 +33,7 @@ def _setup_logging(level: str) -> None:
 
 # kama-tui 入口：解析 --replay 参数后启动 TUI 应用
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="kama-tui", description="KamaClaude TUI")
+    parser = argparse.ArgumentParser(description="Li Code TUI")
     parser.add_argument(
         "--replay",
         metavar="RUN_ID",
