@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any, cast
 
@@ -842,6 +843,63 @@ async def test_send_message_persists_active_run_id(tmp_path: Path) -> None:
     runner.gate.set()
     await _await_no_active_runs(manager)
     assert store.read_meta(session.id).active_run_id is None
+
+
+# 功能：验证缺少 workspace_root 的 legacy session 被跳过且不阻塞后续合法 session 恢复
+# 设计：按字典序先写 legacy 再写合法记录，保留 legacy 原始 bytes，并通过公开查询、warning 与文件不变性覆盖 fail-soft 边界
+async def test_reconcile_skips_legacy_missing_workspace_root_and_continues(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = SessionStore(tmp_path / "sessions")
+    legacy_id = "sess-a-legacy"
+    legacy_path = store.session_dir(legacy_id) / "meta.json"
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "id": legacy_id,
+                "mode": "chat",
+                "status": "active",
+                "title": "legacy",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "updated_at": "2026-01-01T00:00:00+00:00",
+                "run_ids": [],
+                "active_run_id": None,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    legacy_before = legacy_path.read_bytes()
+    valid = Session(
+        id="sess-z-valid",
+        mode="chat",
+        status="waiting_for_input",
+        title="valid",
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+        workspace_root=tmp_path.resolve(),
+    )
+    store.write_meta(valid)
+    manager = SessionManager(
+        store,
+        lambda _workspace_root: _Runner(),
+        EventBus(),
+    )  # type: ignore[arg-type]
+
+    await manager.reconcile_persisted_sessions()
+
+    with pytest.raises(HandlerError) as exc:
+        await manager.get_history(legacy_id)
+    assert exc.value.code == SESSION_NOT_FOUND
+    assert legacy_path.read_bytes() == legacy_before
+    assert "workspace_root" not in json.loads(legacy_path.read_text(encoding="utf-8"))
+    assert await manager.get_history(valid.id) == []
+    assert legacy_id in caplog.text
+    assert "workspace_root" in caplog.text
 
 
 # 功能：验证重启时没有 terminal journal 的 active run 会拒绝新消息并返回 SESSION_INTERRUPTED

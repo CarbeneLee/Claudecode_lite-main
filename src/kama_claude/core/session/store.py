@@ -39,6 +39,19 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+# 按 verification status 校验 observed image identity 的强弱要求
+def _verification_image_identity_matches(
+    expected_image_id: str,
+    observed_image_id: str | None,
+    status: str,
+) -> bool:
+    if observed_image_id is not None and observed_image_id != expected_image_id:
+        return False
+    if status in {"verification_passed", "verification_failed"}:
+        return observed_image_id == expected_image_id
+    return True
+
+
 class SessionStore:
     # 初始化 session 文件存储根目录
     def __init__(self, root: Path) -> None:
@@ -436,6 +449,336 @@ class SessionStore:
         try:
             temporary.write_text(encoded, encoding="utf-8")
             temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    # 返回 execution output snapshot 的外部 artifact 根目录
+    def verification_root(self, sid: str) -> Path:
+        return self.session_dir(sid) / "planning" / "verification"
+
+    # 返回 execution output snapshot 的固定子目录
+    def verification_snapshot_root(self, sid: str) -> Path:
+        return self.verification_root(sid) / "snapshots"
+
+    # 返回按 manifest digest 固定的 sealed snapshot artifact 路径
+    def verification_snapshot_path(self, sid: str, manifest_digest: str) -> Path:
+        if not re.fullmatch(r"[0-9a-f]{64}", manifest_digest):
+            raise ValueError("invalid verification snapshot digest")
+        return self.verification_snapshot_root(sid) / manifest_digest
+
+    # 读取并校验 sealed snapshot artifact，缺失或损坏时 fail closed
+    def read_execution_output_snapshot(
+        self,
+        sid: str,
+        manifest_digest: str,
+    ) -> Any:
+        from kama_claude.core.verification import _read_snapshot_artifact
+
+        artifact = _read_snapshot_artifact(
+            self.verification_snapshot_path(sid, manifest_digest)
+        )
+        if artifact.manifest.manifest_digest != manifest_digest:
+            raise ValueError("verification snapshot identity mismatch")
+        return artifact
+
+    # 按 binding identity 查找 sealed snapshot，拒绝从 live workspace 重建
+    def find_execution_output_snapshot(
+        self,
+        sid: str,
+        *,
+        request_id: str,
+        execution_id: str,
+        execution_run_id: str,
+        projection_key: str,
+    ) -> Any:
+        from kama_claude.core.verification import _read_snapshot_artifact
+
+        root = self.verification_snapshot_root(sid)
+        if not root.exists():
+            raise ValueError("verification snapshot is missing")
+        matches: list[Any] = []
+        for directory in sorted(root.iterdir()):
+            if not directory.is_dir() or directory.name.startswith("."):
+                continue
+            artifact = _read_snapshot_artifact(directory)
+            manifest = artifact.manifest
+            if (
+                manifest.session_id == sid
+                and manifest.request_id == request_id
+                and manifest.execution_id == execution_id
+                and manifest.execution_run_id == execution_run_id
+                and manifest.projection_key == projection_key
+            ):
+                matches.append(artifact)
+        if len(matches) != 1:
+            raise ValueError("verification snapshot identity is missing or ambiguous")
+        return matches[0]
+
+    # 返回按 request identity 固定的 completion receipt 路径
+    def execution_completion_receipt_path(self, sid: str, request_id: str) -> Path:
+        key_hash = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+        return (
+            self.session_dir(sid)
+            / "planning"
+            / "verification"
+            / "completions"
+            / f"{key_hash}.json"
+        )
+
+    # 读取并校验 execution completion receipt，缺失时返回 None
+    def read_execution_completion_receipt(
+        self,
+        sid: str,
+        request_id: str,
+    ) -> Any | None:
+        from kama_claude.core.verification import ExecutionCompletionReceipt
+
+        path = self.execution_completion_receipt_path(sid, request_id)
+        if not path.exists():
+            return None
+        try:
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+            payload = envelope["payload"]
+            digest = envelope["digest"]
+            if not isinstance(payload, dict) or not isinstance(digest, str):
+                raise ValueError("completion receipt corrupt")
+            if _planning_digest(payload) != digest:
+                raise ValueError("completion receipt envelope digest mismatch")
+            receipt = ExecutionCompletionReceipt.model_validate(payload)
+            receipt.verify_digest()
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError("completion receipt corrupt") from exc
+        if receipt.session_id != sid or receipt.request_id != request_id:
+            raise ValueError("completion receipt identity mismatch")
+        return receipt
+
+    # 以 create-once 语义写入 execution completion receipt，禁止冲突覆盖
+    def write_execution_completion_receipt(
+        self,
+        receipt: Any,
+        *,
+        replace: bool = False,
+    ) -> None:
+        from kama_claude.core.verification import ExecutionCompletionReceipt
+
+        if not isinstance(receipt, ExecutionCompletionReceipt):
+            raise TypeError("invalid completion receipt")
+        receipt.verify_digest()
+        path = self.execution_completion_receipt_path(
+            receipt.session_id,
+            receipt.request_id,
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = receipt.model_dump(mode="json")
+        envelope = {"payload": payload, "digest": _planning_digest(payload)}
+        encoded = json.dumps(envelope, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        if path.exists() and not replace:
+            current = self.read_execution_completion_receipt(
+                receipt.session_id,
+                receipt.request_id,
+            )
+            if current == receipt:
+                return
+            raise ValueError("completion receipt conflict")
+        if path.exists() and replace:
+            try:
+                current = self.read_execution_completion_receipt(
+                    receipt.session_id,
+                    receipt.request_id,
+                )
+            except ValueError:
+                current = None
+            if current is not None:
+                if current == receipt:
+                    return
+                raise ValueError("completion receipt conflict")
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_text(encoded, encoding="utf-8")
+            if replace:
+                temporary.replace(path)
+                return
+            os.link(temporary, path)
+        except FileExistsError:
+            current = self.read_execution_completion_receipt(
+                receipt.session_id,
+                receipt.request_id,
+            )
+            if current != receipt:
+                raise ValueError("completion receipt conflict") from None
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    # 返回按 verification request identity 固定的 immutable binding 路径
+    def verification_binding_path(self, sid: str, request_id: str) -> Path:
+        key_hash = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+        return (
+            self.session_dir(sid)
+            / "planning"
+            / "verification"
+            / "bindings"
+            / f"{key_hash}.json"
+        )
+
+    # 读取并校验 verification admission binding，缺失时返回 None
+    def read_verification_binding(
+        self,
+        sid: str,
+        request_id: str,
+    ) -> Any | None:
+        from kama_claude.core.verification import VerificationBinding
+
+        path = self.verification_binding_path(sid, request_id)
+        if not path.exists():
+            return None
+        try:
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+            payload = envelope["payload"]
+            digest = envelope["digest"]
+            if not isinstance(payload, dict) or not isinstance(digest, str):
+                raise ValueError("verification binding corrupt")
+            if _planning_digest(payload) != digest:
+                raise ValueError("verification binding envelope digest mismatch")
+            binding = VerificationBinding.model_validate(payload)
+            binding.verify_digest()
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError("verification binding corrupt") from exc
+        if binding.session_id != sid or binding.verification_request_id != request_id:
+            raise ValueError("verification binding identity mismatch")
+        return binding
+
+    # 以 create-once 语义写入 verification admission binding
+    def write_verification_binding(self, binding: Any) -> None:
+        from kama_claude.core.verification import VerificationBinding
+
+        if not isinstance(binding, VerificationBinding):
+            raise TypeError("invalid verification binding")
+        binding.verify_digest()
+        path = self.verification_binding_path(
+            binding.session_id,
+            binding.verification_request_id,
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = binding.model_dump(mode="json")
+        envelope = {"payload": payload, "digest": _planning_digest(payload)}
+        encoded = json.dumps(envelope, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        if path.exists():
+            current = self.read_verification_binding(
+                binding.session_id,
+                binding.verification_request_id,
+            )
+            if current == binding:
+                return
+            raise ValueError("verification binding conflict")
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_text(encoded, encoding="utf-8")
+            os.link(temporary, path)
+        except FileExistsError:
+            current = self.read_verification_binding(
+                binding.session_id,
+                binding.verification_request_id,
+            )
+            if current != binding:
+                raise ValueError("verification binding conflict") from None
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    # 返回按 verification identity 固定的 terminal result 路径
+    def verification_result_path(self, sid: str, verification_id: str) -> Path:
+        key_hash = hashlib.sha256(verification_id.encode("utf-8")).hexdigest()
+        return (
+            self.session_dir(sid)
+            / "planning"
+            / "verification"
+            / "results"
+            / f"{key_hash}.json"
+        )
+
+    # 读取并校验 verification terminal result，缺失时返回 None
+    def read_verification_result(
+        self,
+        sid: str,
+        verification_id: str,
+    ) -> Any | None:
+        from kama_claude.core.verification import VerificationResult
+
+        path = self.verification_result_path(sid, verification_id)
+        if not path.exists():
+            return None
+        try:
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+            payload = envelope["payload"]
+            digest = envelope["digest"]
+            if not isinstance(payload, dict) or not isinstance(digest, str):
+                raise ValueError("verification result corrupt")
+            if _planning_digest(payload) != digest:
+                raise ValueError("verification result envelope digest mismatch")
+            result = VerificationResult.model_validate(payload)
+            result.verify_digest()
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError("verification result corrupt") from exc
+        if result.verification_id != verification_id:
+            raise ValueError("verification result identity mismatch")
+        binding = self.read_verification_binding(sid, result.verification_request_id)
+        if binding is None or (
+            binding.verification_id != result.verification_id
+            or binding.execution_id != result.execution_id
+            or binding.input_digest != result.input_digest
+            or binding.spec_digest != result.spec_digest
+            or binding.runtime_profile_digest != result.runtime_profile_digest
+            or binding.expected_image_id != result.expected_image_id
+            or not _verification_image_identity_matches(
+                binding.expected_image_id,
+                result.observed_container_image_id,
+                result.status,
+            )
+        ):
+            raise ValueError("verification result identity mismatch")
+        return result
+
+    # 以 create-once 语义写入 verification terminal result
+    def write_verification_result(self, sid: str, result: Any) -> None:
+        from kama_claude.core.verification import VerificationResult
+
+        if not isinstance(result, VerificationResult):
+            raise TypeError("invalid verification result")
+        result.verify_digest()
+        binding = self.read_verification_binding(sid, result.verification_request_id)
+        if binding is None:
+            raise ValueError("verification binding is missing")
+        if (
+            binding.verification_id != result.verification_id
+            or binding.execution_id != result.execution_id
+            or binding.input_digest != result.input_digest
+            or binding.spec_digest != result.spec_digest
+            or binding.runtime_profile_digest != result.runtime_profile_digest
+            or binding.expected_image_id != result.expected_image_id
+            or not _verification_image_identity_matches(
+                binding.expected_image_id,
+                result.observed_container_image_id,
+                result.status,
+            )
+        ):
+            raise ValueError("verification result identity mismatch")
+        path = self.verification_result_path(sid, result.verification_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = result.model_dump(mode="json")
+        envelope = {"payload": payload, "digest": _planning_digest(payload)}
+        encoded = json.dumps(envelope, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        if path.exists():
+            current = self.read_verification_result(sid, result.verification_id)
+            if current == result:
+                return
+            raise ValueError("verification result conflict")
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_text(encoded, encoding="utf-8")
+            os.link(temporary, path)
+        except FileExistsError:
+            current = self.read_verification_result(sid, result.verification_id)
+            if current != result:
+                raise ValueError("verification result conflict") from None
         finally:
             temporary.unlink(missing_ok=True)
 

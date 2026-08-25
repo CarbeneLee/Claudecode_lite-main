@@ -23,7 +23,11 @@ from kama_claude.core.config import KamaConfig
 from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus, EventHandler
 from kama_claude.core.events.journal import EventJournalCoordinator, JournalError
-from kama_claude.core.execution import ExecutionStatus, TrustedScopedToolRegistry
+from kama_claude.core.execution import (
+    ApprovedExecutionBinding,
+    ExecutionStatus,
+    TrustedScopedToolRegistry,
+)
 from kama_claude.core.execution_scope import (
     ExternalWorkspaceDriftError,
     ScopedExecutionContext,
@@ -85,6 +89,12 @@ from kama_claude.core.tools.invocation import ApprovedScopedToolInvoker, DirectT
 from kama_claude.core.tools.registry import ToolRegistry
 from kama_claude.core.trace.provider import TracingProvider
 from kama_claude.core.trace.writer import TraceWriter
+from kama_claude.core.verification import (
+    ExecutionCompletionReceipt,
+    SnapshotCaptureError,
+    VerificationPathStateV1,
+    capture_execution_output_snapshot_async,
+)
 from kama_claude.core.workspace.policy import WorkspaceAccessPolicy
 from kama_claude.core.workspace.resolver import WorkspacePathResolver
 
@@ -738,6 +748,7 @@ class AgentRunner:
         session: Session,
         store: SessionStore,
         execution_context: ScopedExecutionContext,
+        execution_binding: ApprovedExecutionBinding | None = None,
     ) -> RunOutcome:
         if not summary:
             raise ValueError("approved execution summary is empty")
@@ -819,6 +830,69 @@ class AgentRunner:
             _LOGGER.exception("approved execution failed run_id=%s", run_id)
             context.mark_failed("failed")
 
+        snapshot_manifest = None
+        if context.status == "success" and execution_binding is not None:
+            expected_targets = {
+                path: VerificationPathStateV1.from_path_state(state)
+                for path, state in execution_context.mutation_state.expected_path_states.items()
+            }
+            target_paths = set(expected_targets)
+            relevant_states: dict[str, VerificationPathStateV1] = {}
+            for mapping in (
+                execution_context.admission_snapshot.instruction_file_digests,
+                execution_context.admission_snapshot.grounding_file_digests,
+                execution_context.admission_snapshot.relevant_manifest_digests,
+                execution_context.admission_snapshot.relevant_untracked_target_digests,
+            ):
+                for path, digest in mapping.items():
+                    if path not in target_paths:
+                        relevant_states[path] = VerificationPathStateV1.create(
+                            exists=True,
+                            kind="file",
+                            content_digest=digest,
+                        )
+            try:
+                snapshot_manifest = (
+                    await capture_execution_output_snapshot_async(
+                        workspace_root=execution_context.workspace_root,
+                        verification_root=store.verification_root(session.id),
+                        session_id=execution_binding.session_id,
+                        request_id=execution_binding.request_id,
+                        execution_id=execution_binding.execution_id,
+                        execution_run_id=execution_binding.run_id,
+                        projection_key=execution_binding.projection_key,
+                        decision_id=execution_binding.decision_id,
+                        decision_version=execution_binding.decision_version,
+                        decision_content_digest=execution_binding.decision_content_digest,
+                        approval_record_digest=execution_binding.approval_record_digest,
+                        commit_receipt_digest=execution_binding.commit_receipt_digest,
+                        execution_scope_digest=execution_context.scope.scope_digest,
+                        repository_snapshot_digest=execution_binding.snapshot_digest,
+                        workspace_id=execution_binding.workspace_id,
+                        expected_target_states=expected_targets,
+                        relevant_non_target_states=relevant_states,
+                    )
+                ).manifest
+            except asyncio.CancelledError as exc:
+                cancelled_error = exc
+                context.mark_failed("cancelled")
+                _LOGGER.warning(
+                    "approved execution snapshot capture cancelled run_id=%s",
+                    run_id,
+                )
+            except SnapshotCaptureError:
+                _LOGGER.warning(
+                    "approved execution snapshot unavailable run_id=%s",
+                    run_id,
+                    exc_info=True,
+                )
+            except Exception:
+                _LOGGER.warning(
+                    "approved execution snapshot unavailable run_id=%s",
+                    run_id,
+                    exc_info=True,
+                )
+
         if context.status == "success":
             execution_status: ExecutionStatus = "completed_unverified"
         elif context.reason == "scope_denied":
@@ -837,10 +911,16 @@ class AgentRunner:
         if cancelled_error is not None:
             execution_status = "cancelled"
             reason = "cancelled"
-        await self._journal.publish_required_durable(
+        finished_outcome = await self._journal.publish_required_durable(
             RunFinishedEvent(
                 run_id=run_id,
-                status="success" if execution_status == "completed_unverified" else "failed",
+                status=(
+                    "success"
+                    if execution_status == "completed_unverified"
+                    else "cancelled"
+                    if execution_status == "cancelled"
+                    else "failed"
+                ),
                 reason=reason,
                 steps=context.step,
                 ts=_now(),
@@ -848,6 +928,28 @@ class AgentRunner:
                 execution_status=execution_status,
             )
         )
+        if (
+            execution_status == "completed_unverified"
+            and snapshot_manifest is not None
+            and execution_binding is not None
+        ):
+            try:
+                receipt = ExecutionCompletionReceipt.create(
+                    session_id=execution_binding.session_id,
+                    request_id=execution_binding.request_id,
+                    execution_id=execution_binding.execution_id,
+                    execution_run_id=execution_binding.run_id,
+                    projection_key=execution_binding.projection_key,
+                    snapshot_manifest_digest=snapshot_manifest.manifest_digest,
+                    run_finished_event_id=finished_outcome.event_id,
+                )
+                store.write_execution_completion_receipt(receipt)
+            except Exception:
+                _LOGGER.warning(
+                    "approved execution completion receipt unavailable run_id=%s",
+                    run_id,
+                    exc_info=True,
+                )
         if cancelled_error is not None:
             raise cancelled_error
         return RunOutcome(

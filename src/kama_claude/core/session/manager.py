@@ -152,7 +152,16 @@ class SessionManager:
     # 重启后加载持久化 session，校验 mode 并依据 terminal journal 收敛 active_run_id
     async def reconcile_persisted_sessions(self) -> None:
         for sid in self._store.list_session_ids():
-            session = self._store.read_meta(sid)
+            try:
+                session = self._store.read_meta(sid)
+            except KeyError as exc:
+                if exc.args != ("workspace_root",):
+                    raise
+                logger.warning(
+                    "legacy session skipped: missing workspace_root sid=%s",
+                    sid,
+                )
+                continue
             if session.agent_mode not in ("direct", "plan"):
                 raise HandlerError(SESSION_INVALID_MODE, "invalid persisted agent_mode")
             if session.mode not in ("chat", "one_shot"):
@@ -873,6 +882,7 @@ class SessionManager:
                 session=self._get_session(sid),
                 store=self._store,
                 execution_context=context,
+                execution_binding=binding,
             )
             outcome_status = getattr(outcome, "status", None)
             if outcome_status in ("success", "completed_unverified"):

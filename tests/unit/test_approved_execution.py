@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
 
+import kama_claude.core.runner as runner_module
 import kama_claude.core.tools.invocation as invocation_module
 from kama_claude.core.config import KamaConfig
 from kama_claude.core.context import ExecutionContext
@@ -33,6 +35,7 @@ from kama_claude.core.tools.builtin import (
     WriteFileTool,
 )
 from kama_claude.core.tools.invocation import ApprovedScopedToolInvoker
+from kama_claude.core.verification import materialize_execution_completion_receipt
 from kama_claude.core.workspace.policy import WorkspaceAccessPolicy
 from kama_claude.core.workspace.resolver import WorkspacePathResolver
 
@@ -571,6 +574,21 @@ async def test_agent_runner_approved_path_is_bounded_and_unverified(
         provider=provider,  # type: ignore[arg-type]
         journal=journal,
     )
+    binding = ApprovedExecutionBinding.create(
+        session_id=session.id,
+        request_id="request-approved",
+        execution_id=context.execution_id,
+        run_id="run-approved",
+        projection_key=scope.projection_key,
+        decision_id=scope.decision_id,
+        decision_version=scope.decision_version,
+        decision_content_digest=scope.decision_content_digest,
+        approval_record_digest="approval-digest",
+        commit_receipt_digest=scope.commit_receipt_digest,
+        snapshot_digest=scope.snapshot_digest,
+        workspace_id=scope.workspace_id,
+    )
+    session_store.write_approved_execution_binding(binding)
 
     outcome = await runner.run_approved(
         summary='{"planner_decision":{"decision_id":"decision"}}',
@@ -578,6 +596,7 @@ async def test_agent_runner_approved_path_is_bounded_and_unverified(
         session=session,
         store=session_store,
         execution_context=context,
+        execution_binding=binding,
     )
 
     assert outcome.status == "completed_unverified"
@@ -590,4 +609,144 @@ async def test_agent_runner_approved_path_is_bounded_and_unverified(
     assert replay.records[0].event["type"] == "run.started"
     assert replay.records[-1].event["type"] == "run.finished"
     assert replay.records[-1].event["execution_status"] == "completed_unverified"
+    completion = session_store.read_execution_completion_receipt(
+        session.id,
+        binding.request_id,
+    )
+    assert completion is not None
+    assert completion.run_finished_event_id == replay.records[-1].event_id
+    artifact = session_store.read_execution_output_snapshot(
+        session.id,
+        completion.snapshot_manifest_digest,
+    )
+    assert artifact.manifest.manifest_digest == completion.snapshot_manifest_digest
+    assert artifact.artifact_dir.parent == session_store.verification_snapshot_root(session.id)
+    session_store.execution_completion_receipt_path(
+        session.id,
+        binding.request_id,
+    ).write_text("corrupt\n", encoding="utf-8")
+    await journal.close()
+    reopened = EventJournalCoordinator()
+    await reopened.register_session(session.id, session_store.session_dir(session.id))
+    await reopened.register_run(
+        "run-approved",
+        session_store.runs_dir(session.id) / "run-approved",
+        session_id=session.id,
+    )
+    reopened_store = SessionStore(session_store.session_dir(session.id).parent)
+    restored = await materialize_execution_completion_receipt(
+        store=reopened_store,
+        journal=reopened,
+        session_id=session.id,
+        request_id=binding.request_id,
+    )
+    assert restored.snapshot_manifest_digest == artifact.manifest.manifest_digest
+    assert (
+        reopened_store.read_execution_completion_receipt(
+            session.id,
+            binding.request_id,
+        )
+        == restored
+    )
+    await reopened.close()
+
+
+# 功能：验证 snapshot 阶段取消会写 durable cancelled terminal、无 receipt 并传播原始取消
+# 设计：有限 provider 先 end_turn，再用受控 snapshot await 精确制造取消窗口
+@pytest.mark.asyncio
+async def test_agent_runner_snapshot_cancellation_is_terminal_and_primary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session_store = SessionStore(tmp_path / "sessions")
+    session = Session(
+        id="sess-cancel",
+        mode="chat",
+        status="active",
+        title="cancel",
+        created_at="t",
+        updated_at="t",
+        workspace_root=workspace,
+    )
+    session_store.write_meta(session)
+    snapshot = SnapshotBuilder(workspace).capture()
+    _, workspace_id = workspace_identity(workspace)
+    scope = ExecutionScope._create(
+        session_id=session.id,
+        workspace_id=workspace_id,
+        projection_key="pv1:run-cancel:decision:v1",
+        decision_id="decision",
+        decision_version=1,
+        decision_content_digest="decision-digest",
+        commit_receipt_digest="receipt-digest",
+        snapshot_digest=snapshot.snapshot_digest,
+        capabilities=("read_file",),
+    )
+    execution_context = ScopedExecutionContext.from_verified_scope(
+        scope=scope,
+        snapshot=snapshot,
+        workspace_root=workspace,
+        execution_id="exec-cancel",
+    )
+    journal = EventJournalCoordinator()
+    await journal.register_session(session.id, session_store.session_dir(session.id))
+    await journal.register_run(
+        "run-cancel",
+        session_store.runs_dir(session.id) / "run-cancel",
+        session_id=session.id,
+    )
+    runner = AgentRunner(
+        KamaConfig(),
+        workspace_root=workspace,
+        provider=_FiniteApprovedProvider(),  # type: ignore[arg-type]
+        journal=journal,
+    )
+    binding = ApprovedExecutionBinding.create(
+        session_id=session.id,
+        request_id="request-cancel",
+        execution_id=execution_context.execution_id,
+        run_id="run-cancel",
+        projection_key=scope.projection_key,
+        decision_id=scope.decision_id,
+        decision_version=scope.decision_version,
+        decision_content_digest=scope.decision_content_digest,
+        approval_record_digest="approval-digest",
+        commit_receipt_digest=scope.commit_receipt_digest,
+        snapshot_digest=scope.snapshot_digest,
+        workspace_id=scope.workspace_id,
+    )
+    session_store.write_approved_execution_binding(binding)
+    snapshot_started = asyncio.Event()
+
+    async def blocked_snapshot(**_kwargs: object) -> object:
+        snapshot_started.set()
+        await asyncio.Event().wait()
+        return object()
+
+    monkeypatch.setattr(runner_module, "capture_execution_output_snapshot_async", blocked_snapshot)
+    task = asyncio.create_task(
+        runner.run_approved(
+            summary='{"planner_decision":{"decision_id":"decision"}}',
+            run_id="run-cancel",
+            session=session,
+            store=session_store,
+            execution_context=execution_context,
+            execution_binding=binding,
+        )
+    )
+    await asyncio.wait_for(snapshot_started.wait(), timeout=1.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    replay = await journal.read_replay(
+        "run:run-cancel",
+        after_seq=0,
+        high_watermark=journal.high_watermark("run:run-cancel"),
+    )
+    assert replay.records[-1].event["status"] == "cancelled"
+    assert replay.records[-1].event["execution_status"] == "cancelled"
+    assert session_store.read_execution_completion_receipt(session.id, binding.request_id) is None
     await journal.close()
