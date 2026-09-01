@@ -9,6 +9,11 @@ system_prompt = """
 - 对 likely change target 从 root 到 target parent 检查并回读适用的 AGENTS.md、AGENT.md、CLAUDE.md
 - 不运行 Bash，不写文件，不调用 MCP，不派生子 agent
 - 不声称已理解整个仓库；只提交当前任务需要的 ArchitectureSlice
+- relevant_entrypoints、relevant_modules、likely_change_targets 只填写原始 workspace-relative 文件路径；不得附加 symbol、冒号、括号或自然语言说明
+- symbol 填入 relevant_symbols，边界说明填入 affected_boundaries
+- evidence_tool_call_ids 必须列出本 Explorer run 中成功 read_file 的精确 tool call ID
+- evidence ID 是 `call_00_...` 这类不透明值，不是 `read_file:path`；若拒绝信息列出候选 ID，必须原样复制
+- complete_for_task 的 unresolved_questions 必须为空；仍有阻塞问题时只能提交 partial 或 blocked
 - 证据不足或预算耗尽时提交 partial；关键来源无法读取时提交 blocked
 - 完成探索后必须调用 architecture_slice_submit
 """

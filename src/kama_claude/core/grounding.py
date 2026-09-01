@@ -99,8 +99,20 @@ class ArchitectureSliceDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     slice_id: str | None = None
-    relevant_entrypoints: tuple[str, ...] = ()
-    relevant_modules: tuple[str, ...] = ()
+    relevant_entrypoints: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Confirmed exact workspace-relative file paths only, without symbols or "
+            "descriptions; put symbol names in relevant_symbols."
+        ),
+    )
+    relevant_modules: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Confirmed exact workspace-relative file paths only, without symbols or "
+            "descriptions; every path must exist and have read_file evidence."
+        ),
+    )
     relevant_symbols: tuple[str, ...] = ()
     confirmed_call_paths: tuple[tuple[str, ...], ...] = ()
     state_or_data_flow_summary: str = ""
@@ -108,11 +120,31 @@ class ArchitectureSliceDraft(BaseModel):
     extension_points: tuple[str, ...] = ()
     related_tests: tuple[str, ...] = ()
     relevant_invariants: tuple[str, ...] = ()
-    likely_change_targets: tuple[str, ...] = ()
+    likely_change_targets: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Exact workspace-relative file paths only, without symbols or descriptions; "
+            "existing paths require read_file evidence and absent paths are treated as "
+            "planned new files."
+        ),
+    )
     affected_boundaries: tuple[str, ...] = ()
     non_goals: tuple[str, ...] = ()
-    unresolved_questions: tuple[str, ...] = ()
-    evidence_tool_call_ids: tuple[str, ...] = ()
+    unresolved_questions: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Questions that still block authoritative grounding; complete_for_task "
+            "requires this field to be empty, otherwise submit partial/blocked."
+        ),
+    )
+    evidence_tool_call_ids: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Exact successful read_file tool call IDs from this Explorer run. "
+            "They are opaque IDs such as call_00_...; do not use read_file:path labels. "
+            "complete_for_task requires at least one ID."
+        ),
+    )
     completeness: Literal["complete_for_task", "partial", "blocked"]
     confidence: float = Field(ge=0.0, le=1.0)
 
@@ -142,6 +174,26 @@ class ArchitectureSlice(BaseModel):
     completeness: Literal["complete_for_task", "partial", "blocked"]
     confidence: float
     content_digest: str
+
+
+# 生成 Explorer 子进程返回给父 Planner 的有界 provenance identity
+def architecture_slice_result_payload(
+    architecture_slice: ArchitectureSlice,
+) -> dict[str, object]:
+    return {
+        "slice_id": architecture_slice.slice_id,
+        "version": architecture_slice.version,
+        "snapshot_digest": architecture_slice.snapshot_digest,
+        "content_digest": architecture_slice.content_digest,
+        "completeness": architecture_slice.completeness,
+        "evidence_refs": [
+            {
+                "tool_call_id": evidence.tool_call_id,
+                "logical_path": evidence.logical_path,
+            }
+            for evidence in architecture_slice.evidence_refs
+        ],
+    }
 
 
 # 返回 snapshot stale equality 使用的 canonical payload，明确排除 git_head
@@ -400,6 +452,12 @@ class ToolObservationCollector:
             seen.add(tool_call_id)
         return tuple(resolved)
 
+    # 返回已成功 read_file 的 provenance，供提交失败时给出精确恢复候选
+    def successful_read_file_refs(self) -> tuple[EvidenceRef, ...]:
+        return tuple(
+            ref for ref in self._evidence.values() if ref.tool_name == "read_file"
+        )
+
 
 class ArchitectureSliceService:
     # 绑定单个 explorer run 的 workspace、goal、collector 与可选 session store
@@ -429,24 +487,36 @@ class ArchitectureSliceService:
     def submitted(self) -> ArchitectureSlice | None:
         return self._submitted
 
+    # 返回当前 Explorer run 可用的 read_file evidence，排除其他 run 污染提示
+    def available_read_file_evidence(self) -> tuple[EvidenceRef, ...]:
+        return tuple(
+            ref
+            for ref in self._collector.successful_read_file_refs()
+            if ref.run_id == self._run_id
+        )
+
     # 校验 evidence 与相关路径，分配 immutable slice identity 并持久化
     def submit(self, draft: ArchitectureSliceDraft) -> ArchitectureSlice:
+        if draft.completeness == "complete_for_task" and draft.unresolved_questions:
+            raise ValueError(
+                "complete_for_task requires unresolved_questions to be empty; "
+                "resolve them or submit partial/blocked"
+            )
         evidence_refs = self._collector.resolve(draft.evidence_tool_call_ids)
         for ref in evidence_refs:
             if ref.run_id != self._run_id:
                 raise ValueError("evidence belongs to another run")
         if draft.completeness == "complete_for_task" and not evidence_refs:
             raise ValueError("complete_for_task requires recorded evidence")
-        targets = tuple(
-            dict.fromkeys(
-                (
-                    *draft.relevant_entrypoints,
-                    *draft.relevant_modules,
-                    *draft.likely_change_targets,
-                )
-            )
+        confirmed_targets = tuple(
+            dict.fromkeys((*draft.relevant_entrypoints, *draft.relevant_modules))
         )
-        normalized_targets = tuple(self._normalize_target(path) for path in targets)
+        normalized_confirmed = tuple(
+            self._normalize_target(path) for path in confirmed_targets
+        )
+        normalized_likely = tuple(
+            self._normalize_target(path) for path in draft.likely_change_targets
+        )
         read_paths = {
             self._normalize_target(ref.logical_path)
             for ref in evidence_refs
@@ -455,7 +525,16 @@ class ArchitectureSliceService:
         for ref in evidence_refs:
             if ref.tool_name == "read_file":
                 self._validate_read_evidence(ref)
-        for path in normalized_targets:
+        for path in normalized_confirmed:
+            candidate = self._root / path
+            if not candidate.is_file():
+                raise ValueError(
+                    f"confirmed repository path does not exist: {path}; use exact "
+                    "workspace-relative file paths without symbols or descriptions"
+                )
+            if path not in read_paths:
+                raise ValueError(f"read_file evidence required for confirmed path: {path}")
+        for path in normalized_likely:
             candidate = self._root / path
             if candidate.exists() and path not in read_paths:
                 raise ValueError(f"read_file evidence required for confirmed path: {path}")
@@ -639,19 +718,55 @@ class ArchitectureSliceSubmitTool(BaseTool):
     def __init__(self, service: ArchitectureSliceService) -> None:
         self._service = service
 
+    # 将有界的真实 evidence ID 与路径写入模型可见修正提示
+    def _evidence_recovery_hint(self) -> str:
+        refs = self._service.available_read_file_evidence()
+        if not refs:
+            return "No successful read_file evidence is available yet."
+        limit = 32
+        options = ", ".join(
+            f"{ref.tool_call_id}={ref.logical_path or '<unknown>'}"
+            for ref in refs[:limit]
+        )
+        suffix = "" if len(refs) <= limit else f", ... ({len(refs) - limit} more)"
+        return (
+            "Available successful read_file evidence IDs (copy the opaque ID before '='): "
+            f"{options}{suffix}."
+        )
+
     # 校验 draft 并返回 runtime 分配的 immutable slice identity
     async def invoke(self, params: dict[str, object]) -> ToolResult:
         draft = ArchitectureSliceDraft.model_validate(params)
-        architecture_slice = self._service.submit(draft)
+        if draft.completeness == "complete_for_task" and not draft.evidence_tool_call_ids:
+            return ToolResult(
+                content=(
+                    "architecture_slice_submit rejected: complete_for_task requires "
+                    "recorded evidence; set evidence_tool_call_ids to exact successful "
+                    "read_file tool call IDs from this Explorer run, or submit partial/blocked. "
+                    f"{self._evidence_recovery_hint()}"
+                ),
+                is_error=True,
+                error_type="invalid_input",
+            )
+        try:
+            architecture_slice = self._service.submit(draft)
+        except ValueError as exc:
+            recovery = ""
+            if str(exc).startswith("unknown evidence tool call:") or "evidence" in str(
+                exc
+            ):
+                recovery = f" {self._evidence_recovery_hint()}"
+            return ToolResult(
+                content=(
+                    f"architecture_slice_submit rejected: {exc}."
+                    f"{recovery}"
+                ),
+                is_error=True,
+                error_type="invalid_input",
+            )
         return ToolResult(
             content=json.dumps(
-                {
-                    "slice_id": architecture_slice.slice_id,
-                    "version": architecture_slice.version,
-                    "snapshot_digest": architecture_slice.snapshot_digest,
-                    "content_digest": architecture_slice.content_digest,
-                    "completeness": architecture_slice.completeness,
-                },
+                architecture_slice_result_payload(architecture_slice),
                 sort_keys=True,
             )
         )

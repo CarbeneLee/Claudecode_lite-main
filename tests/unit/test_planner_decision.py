@@ -809,6 +809,38 @@ async def test_planner_submit_tool_returns_stable_validation_error(tmp_path: Pat
     assert result.is_error is True
     assert result.error_type == "invalid_input"
     assert "reference-invalid" in result.content
+    assert "intended change C1 references unknown evidence" in result.content
+
+
+# 功能：验证缺少 grounding 时 submit 给出 Explorer 修复指引并在重复提交后锁存硬失败
+# 设计：复用合法 draft 但切换到空 session store，精确执行两次以覆盖一次纠正窗口和第二次终止
+async def test_planner_submit_missing_grounding_fails_fast_after_one_retry(
+    tmp_path: Path,
+) -> None:
+    workspace, _grounded_store, architecture_slice = await _ground_complete_slice(tmp_path)
+    planning = _planning()
+    service = planning.PlannerDecisionService(
+        workspace_root=workspace,
+        session_id="sess-missing-grounding",
+        store=SessionStore(tmp_path / "missing-sessions"),
+        goal="Change target behavior",
+        run_id="planner-run-missing-grounding",
+    )
+    tool = planning.PlannerDecisionSubmitTool(service)
+    params = _valid_draft(architecture_slice).model_dump(mode="json")
+
+    first = await tool.invoke(params)
+
+    assert first.is_error is True
+    assert first.error_type == "invalid_input"
+    assert "grounding artifact does not exist" in first.content
+    assert "subagent_type='explorer'" in first.content
+    assert service.terminal_failure_reason() == "missing-terminal-decision"
+
+    second = await tool.invoke(params)
+
+    assert second.is_error is True
+    assert service.terminal_failure_reason() == "planning-grounding-missing"
 
 
 # 功能：验证第一次有效提交后相同 draft 重试只返回原 decision identity

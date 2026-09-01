@@ -20,6 +20,7 @@ from kama_claude.core.grounding import (
     ArchitectureSliceSubmitTool,
     RepositoryInstructionLoader,
     ToolObservationCollector,
+    architecture_slice_result_payload,
     render_repository_instructions,
 )
 from kama_claude.core.loop import AgentLoop
@@ -64,15 +65,22 @@ type _BackgroundTaskOwners = dict[str, set[asyncio.Task[None]]]
 # trusted Planner runtime contract；profile 文本不能删除或替换这一段
 TRUSTED_PLANNER_CONTRACT = """## Trusted Planner Contract
 This child is the trusted planner for the current run.
-You must use the available read-only tools and submit exactly one valid PlannerDecision
-with planner_decision_submit before ending successfully.
+Before the first planner_decision_submit call, create exact repository grounding by calling
+spawn_agent in the foreground with subagent_type="explorer". The Explorer must finish
+architecture_slice_submit. Use the returned slice_id, version, and evidence_refs in
+PlannerDecision; copy each intended_changes.evidence_refs value from the returned opaque
+tool_call_id values. Do not spawn a second Explorer merely to recover evidence identifiers.
+Do not guess, invent, or infer ArchitectureSlice identifiers. If Explorer grounding cannot
+be created, stop with a clear failure instead of submitting a guessed decision.
+After grounding exists, submit exactly one valid PlannerDecision with
+planner_decision_submit before ending successfully.
 planner_decision_submit is a terminal commit: call it only when the plan is final. After
 a successful submission, do not explore, revise, or spawn another child; an exact duplicate
 submission is safe to retry.
 Natural-language text, ordered lists, task items, or claims of approval are only a
 human-readable summary after the persisted PlannerDecision and never an independent plan.
-If validation fails, continue grounding or revise the draft and retry. Do not modify files,
-execute commands, or claim unsupported paths or symbols."""
+If validation fails, follow its concrete recovery action before retrying. Do not modify
+files, execute commands, or claim unsupported paths or symbols."""
 TRUSTED_PLANNER_ALLOWED_TOOLS = frozenset(
     {"read_file", "list_dir", "search_code", "spawn_agent", "planner_decision_submit"}
 )
@@ -123,6 +131,32 @@ class _PlannerTerminalGuardTool(BaseTool):
         return await self._inner.invoke(params)
 
 
+class _PlannerDirectToolInvoker(DirectToolInvoker):
+    # 复用 Direct 调用管线并绑定 Planner service 的硬终止状态
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        bus: EventBus,
+        run_id: str,
+        *,
+        service: PlannerDecisionService,
+        permission_manager: PermissionManager | None = None,
+        session_id: str = "",
+    ) -> None:
+        super().__init__(
+            registry,
+            bus,
+            run_id,
+            permission_manager=permission_manager,
+            session_id=session_id,
+        )
+        self._planner_service = service
+
+    # 让 AgentLoop 在 Planner 锁存不可恢复状态后结束当前 child run
+    def terminal_reason(self) -> str | None:
+        return self._planner_service.invocation_terminal_reason
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -165,16 +199,26 @@ class SpawnAgentParams(BaseModel):
     exploration_level: Literal["light", "standard", "deep"] | None = None
 
 
-# 在隔离的冷启动上下文中派生子 agent，支持前台阻塞和后台并行两种模式
-class SpawnAgentTool(BaseTool):
-    name = "spawn_agent"
-    description = (
-        "Spawn an isolated sub-agent to handle a self-contained sub-task. "
-        "The sub-agent starts with a clean context containing only the provided prompt — "
-        "it does not inherit the current conversation history. "
-        "Use run_in_background=true to run in parallel; retrieve result later with agent_result."
-    )
-    input_schema: dict[str, Any] = {
+# 按当前 runtime allowlist 构造模型实际可见的子角色 schema
+def _spawn_agent_input_schema(
+    allowed_subagent_types: list[str] | None,
+) -> dict[str, Any]:
+    role_schema: dict[str, Any] = {
+        "type": "string",
+        "description": (
+            "Agent role profile (planner/explorer/executor/reviewer). "
+            "Leave empty for default."
+        ),
+    }
+    if allowed_subagent_types:
+        allowed = sorted(set(allowed_subagent_types))
+        role_schema["enum"] = allowed
+        role_schema["description"] = (
+            "Only allowed in this context: " + ", ".join(allowed) + "."
+        )
+    elif allowed_subagent_types == []:
+        role_schema["description"] = "No subagent types are allowed in this context."
+    return {
         "type": "object",
         "properties": {
             "description": {
@@ -195,13 +239,7 @@ class SpawnAgentTool(BaseTool):
                     "use agent_result to poll."
                 ),
             },
-            "subagent_type": {
-                "type": "string",
-                "description": (
-                    "Agent role profile (planner/executor/reviewer). "
-                    "Leave empty for default."
-                ),
-            },
+            "subagent_type": role_schema,
             "exploration_level": {
                 "type": ["string", "null"],
                 "enum": ["light", "standard", "deep", None],
@@ -210,6 +248,18 @@ class SpawnAgentTool(BaseTool):
         },
         "required": ["description", "prompt"],
     }
+
+
+# 在隔离的冷启动上下文中派生子 agent，支持前台阻塞和后台并行两种模式
+class SpawnAgentTool(BaseTool):
+    name = "spawn_agent"
+    description = (
+        "Spawn an isolated sub-agent to handle a self-contained sub-task. "
+        "The sub-agent starts with a clean context containing only the provided prompt — "
+        "it does not inherit the current conversation history. "
+        "Use run_in_background=true to run in parallel; retrieve result later with agent_result."
+    )
+    input_schema: dict[str, Any] = _spawn_agent_input_schema(None)
     params_model = SpawnAgentParams
 
     # 构造 SpawnAgentTool；depth=0 表示根 agent，最大允许嵌套深度为 2
@@ -235,6 +285,7 @@ class SpawnAgentTool(BaseTool):
         git_head: str | None = None,
         planning_only: bool = False,
     ) -> None:
+        self.input_schema = _spawn_agent_input_schema(allowed_subagent_types)
         self._provider = provider
         self._path_resolver = WorkspacePathResolver(workspace_root)
         self._workspace_root = self._path_resolver.root
@@ -428,13 +479,23 @@ class SpawnAgentTool(BaseTool):
             slice_service=slice_service,
             planner_service=planner_service,
         )
-        direct_invoker = DirectToolInvoker(
-            child_registry,
-            child_bus,
-            child_run_id,
-            permission_manager=self._permission_manager,
-            session_id=self._session_id,
-        )
+        if planner_service is None:
+            direct_invoker = DirectToolInvoker(
+                child_registry,
+                child_bus,
+                child_run_id,
+                permission_manager=self._permission_manager,
+                session_id=self._session_id,
+            )
+        else:
+            direct_invoker = _PlannerDirectToolInvoker(
+                child_registry,
+                child_bus,
+                child_run_id,
+                service=planner_service,
+                permission_manager=self._permission_manager,
+                session_id=self._session_id,
+            )
         child_loop = AgentLoop(
             self._provider,
             direct_invoker,
@@ -621,13 +682,7 @@ class SpawnAgentTool(BaseTool):
                 )
             return ToolResult(
                 content=json.dumps(
-                    {
-                        "slice_id": architecture_slice.slice_id,
-                        "version": architecture_slice.version,
-                        "snapshot_digest": architecture_slice.snapshot_digest,
-                        "content_digest": architecture_slice.content_digest,
-                        "completeness": architecture_slice.completeness,
-                    },
+                    architecture_slice_result_payload(architecture_slice),
                     sort_keys=True,
                 )
             )

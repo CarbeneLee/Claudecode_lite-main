@@ -45,6 +45,7 @@ _MANIFEST_NAMES = {
 _PLANNER_FAILURE_REASONS = frozenset(
     {
         "missing-terminal-decision",
+        "planning-grounding-missing",
         "planning-input-incomplete",
         "artifact-corrupt",
         "snapshot-stale",
@@ -225,10 +226,18 @@ def _exact_content_digest(payload: dict[str, Any]) -> str:
 
 class PlannerValidationError(ValueError):
     # 构造带稳定 validation category 的拒绝异常
-    def __init__(self, category: str, message: str, *, incomplete: bool = False) -> None:
+    def __init__(
+        self,
+        category: str,
+        message: str,
+        *,
+        incomplete: bool = False,
+        code: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.category = category
         self.incomplete = incomplete
+        self.code = code or category
 
 
 @dataclass(frozen=True)
@@ -263,6 +272,8 @@ class PlannerDecisionService:
         self._last_submit_category: str | None = None
         self._terminal_decision: SubmittedDecisionIdentity | None = None
         self._terminal_draft_digest: str | None = None
+        self._missing_grounding_submit_count = 0
+        self._invocation_terminal_reason: str | None = None
 
     # 返回本次 Planner run 是否已经提交 terminal decision
     @property
@@ -295,6 +306,11 @@ class PlannerDecisionService:
     def last_incomplete_reason(self) -> str | None:
         return self._last_incomplete_reason
 
+    # 返回 Planner tool invoker 应锁存的硬终止原因
+    @property
+    def invocation_terminal_reason(self) -> str | None:
+        return self._invocation_terminal_reason
+
     # 记录未能解析为 draft 的最后一次 submit，避免复用旧 incomplete 状态
     def note_invalid_submit(self, category: str = "structure-invalid") -> None:
         self.last_validation = None
@@ -316,10 +332,18 @@ class PlannerDecisionService:
             decision = self._submit_validated(draft)
         except PlannerValidationError as exc:
             self._last_submit_category = exc.category
+            if exc.code == "grounding-missing":
+                self._missing_grounding_submit_count += 1
+                if self._missing_grounding_submit_count >= 2:
+                    self._invocation_terminal_reason = "planning-grounding-missing"
+            else:
+                self._missing_grounding_submit_count = 0
             if exc.incomplete:
                 self._last_submit_outcome = "incomplete"
                 self._last_incomplete_reason = exc.category
             raise
+        self._missing_grounding_submit_count = 0
+        self._invocation_terminal_reason = None
         self._last_submit_outcome = "accepted"
         self._last_submit_category = None
         return decision
@@ -426,6 +450,8 @@ class PlannerDecisionService:
 
     # 在 child finished event 前验证本次 run 的 exact decision、grounding 和相关 snapshot
     def terminal_failure_reason(self) -> str | None:
+        if self._invocation_terminal_reason is not None:
+            return self._invocation_terminal_reason
         identity = self._terminal_decision
         if identity is None:
             if self._last_submit_outcome == "incomplete":
@@ -589,6 +615,7 @@ class PlannerDecisionService:
             raise PlannerValidationError(
                 "reference-invalid",
                 "grounding artifact does not exist",
+                code="grounding-missing",
             )
         raw_slices = grounding.get("architecture_slices")
         raw_snapshots = grounding.get("snapshots")
@@ -910,10 +937,18 @@ class PlannerDecisionSubmitTool(BaseTool):
                 exc.category,
                 self._service._run_id,
             )
+            if exc.code == "grounding-missing":
+                guidance = (
+                    "grounding artifact does not exist; call spawn_agent in foreground "
+                    "with subagent_type='explorer', then retry with the returned "
+                    "slice_id and version; do not guess identifiers"
+                )
+            else:
+                guidance = "revise the draft or grounding and retry"
             return ToolResult(
                 content=(
                     "planner_decision_submit rejected: "
-                    f"{exc.category}; revise the draft or grounding and retry"
+                    f"{exc.category}; validation detail: {exc}; {guidance}"
                 ),
                 is_error=True,
                 error_type="invalid_input",

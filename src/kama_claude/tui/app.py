@@ -244,6 +244,9 @@ def _preview(s: str, n: int) -> str:
     return s[:n] + "…" if len(s) > n else s
 
 
+# 转义插入 Textual markup 的动态文本，确保截断方括号只按字面显示
+def _markup_text(value: object) -> str:
+    return str(value).replace("\\", "\\\\").replace("[", "\\[")
 
 
 def _params_str(params: dict[str, Any]) -> str:
@@ -1465,8 +1468,9 @@ class KamaTuiApp(App[None]):
             payload = plan.model_dump(mode="json")
             lines = [
                 "[bold cyan]Plan generated[/bold cyan]",
-                f"[dim]goal[/dim]  {_preview(str(payload.get('goal', '')), 120)}",
-                f"[dim]approach[/dim]  {_preview(str(payload.get('selected_approach', '')), 120)}",
+                f"[dim]goal[/dim]  {_markup_text(_preview(str(payload.get('goal', '')), 120))}",
+                "[dim]approach[/dim]  "
+                f"{_markup_text(_preview(str(payload.get('selected_approach', '')), 120))}",
             ]
             for key, label in (
                 ("intended_changes", "intended changes"),
@@ -1480,9 +1484,11 @@ class KamaTuiApp(App[None]):
             ):
                 values = payload.get(key) or []
                 if values:
-                    lines.append(f"[dim]{label}[/dim]  {_preview(str(values), 180)}")
+                    lines.append(
+                        f"[dim]{label}[/dim]  {_markup_text(_preview(str(values), 180))}"
+                    )
             lines.append(
-                f"[dim]decision[/dim]  {payload.get('decision_key', '')}"
+                f"[dim]decision[/dim]  {_markup_text(payload.get('decision_key', ''))}"
             )
             self._append(Static("\n".join(lines), classes="log-line"))
 

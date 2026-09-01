@@ -360,6 +360,185 @@ class _OrchestrateRuntimeProvider:
         raise AssertionError(f"unexpected child tool schema for run_id={run_id}")
 
 
+class _MissingGroundingPlannerProvider:
+    MAX_TOTAL_PROVIDER_CALLS = 2
+
+    # 绑定两次固定 Planner submit，并在任何额外调用时立即失败
+    def __init__(self, draft: dict[str, object]) -> None:
+        self._draft = draft
+        self.total_provider_calls = 0
+
+    # 第一次制造缺失 grounding，第二次确认可操作反馈后重试并等待 runtime 终止
+    async def chat(
+        self,
+        messages: list[dict[str, object]],
+        tool_schemas: list[dict[str, object]],
+        bus: EventBus,
+        run_id: str,
+        *,
+        step: int = 0,
+        system: str | None = None,
+    ) -> LlmResponse:
+        del bus, run_id, step, system
+        names = {str(schema.get("name")) for schema in tool_schemas}
+        if "planner_decision_submit" not in names:
+            raise AssertionError("missing-grounding provider reached a non-planner role")
+        self.total_provider_calls += 1
+        if self.total_provider_calls > self.MAX_TOTAL_PROVIDER_CALLS:
+            raise AssertionError(
+                "missing-grounding provider-call budget exceeded: "
+                f"{self.total_provider_calls}>{self.MAX_TOTAL_PROVIDER_CALLS}"
+            )
+        if self.total_provider_calls == 2:
+            transcript = json.dumps(messages, ensure_ascii=False, default=str)
+            if "grounding artifact does not exist" not in transcript:
+                raise AssertionError("planner did not receive the missing-grounding detail")
+            if "subagent_type='explorer'" not in transcript:
+                raise AssertionError("planner did not receive the Explorer recovery action")
+        return LlmResponse(
+            stop_reason="tool_use",
+            tool_calls=[
+                ToolCallBlock(
+                    id=f"missing-grounding-{self.total_provider_calls}",
+                    name="planner_decision_submit",
+                    input=self._draft,
+                )
+            ],
+        )
+
+
+class _PlannerExplorerGroundingProvider:
+    MAX_TOTAL_PROVIDER_CALLS = 6
+    MAX_PLANNER_CALLS = 3
+    MAX_EXPLORER_CALLS = 3
+
+    # 保存 exact decision draft 与每个角色的有限状态计数
+    def __init__(self, draft: dict[str, object]) -> None:
+        self._draft = draft
+        self.total_provider_calls = 0
+        self.planner_calls = 0
+        self.explorer_calls = 0
+
+    # 驱动 Planner→Explorer→grounding→decision 的唯一合法状态序列
+    async def chat(
+        self,
+        messages: list[dict[str, object]],
+        tool_schemas: list[dict[str, object]],
+        bus: EventBus,
+        run_id: str,
+        *,
+        step: int = 0,
+        system: str | None = None,
+    ) -> LlmResponse:
+        del bus, run_id, step
+        self.total_provider_calls += 1
+        if self.total_provider_calls > self.MAX_TOTAL_PROVIDER_CALLS:
+            raise AssertionError(
+                "planner-explorer provider-call budget exceeded: "
+                f"{self.total_provider_calls}>{self.MAX_TOTAL_PROVIDER_CALLS}"
+            )
+        names = {str(schema.get("name")) for schema in tool_schemas}
+        if "planner_decision_submit" in names:
+            self.planner_calls += 1
+            if self.planner_calls > self.MAX_PLANNER_CALLS:
+                raise AssertionError("unexpected extra Planner provider call")
+            if self.planner_calls == 1:
+                contract = system or ""
+                if 'subagent_type="explorer"' not in contract:
+                    raise AssertionError("Planner contract omits the exact Explorer role")
+                if "architecture_slice_submit" not in contract:
+                    raise AssertionError("Planner contract omits the grounding commit")
+                if "Do not guess" not in contract:
+                    raise AssertionError("Planner contract does not forbid guessed identities")
+                spawn_schema = next(
+                    schema for schema in tool_schemas if schema.get("name") == "spawn_agent"
+                )
+                role_schema = spawn_schema["input_schema"]["properties"]["subagent_type"]
+                if role_schema.get("enum") != ["explorer"]:
+                    raise AssertionError("Planner spawn schema is not Explorer-only")
+                return LlmResponse(
+                    stop_reason="tool_use",
+                    tool_calls=[
+                        ToolCallBlock(
+                            id="planner-spawn-explorer",
+                            name="spawn_agent",
+                            input={
+                                "description": "Ground repository",
+                                "prompt": "Change target behavior",
+                                "subagent_type": "explorer",
+                                "exploration_level": "standard",
+                            },
+                        )
+                    ],
+                )
+            if self.planner_calls == 2:
+                tool_results = [
+                    str(block.get("content"))
+                    for message in messages
+                    for block in message.get("content", [])
+                    if isinstance(block, dict) and block.get("type") == "tool_result"
+                ]
+                try:
+                    slice_identity = next(
+                        payload
+                        for content in tool_results
+                        for payload in [json.loads(content)]
+                        if isinstance(payload, dict) and "slice_id" in payload
+                    )
+                except (json.JSONDecodeError, StopIteration) as exc:
+                    raise AssertionError(
+                        "Planner did not receive Explorer slice identity"
+                    ) from exc
+                self._draft["architecture_slice_id"] = slice_identity["slice_id"]
+                self._draft["architecture_slice_version"] = slice_identity["version"]
+                return LlmResponse(
+                    stop_reason="tool_use",
+                    tool_calls=[
+                        ToolCallBlock(
+                            id="planner-submit-decision",
+                            name="planner_decision_submit",
+                            input=self._draft,
+                        )
+                    ],
+                )
+            return LlmResponse(stop_reason="end_turn", text="plan committed")
+        if "architecture_slice_submit" in names:
+            self.explorer_calls += 1
+            if self.explorer_calls > self.MAX_EXPLORER_CALLS:
+                raise AssertionError("unexpected extra Explorer provider call")
+            if self.explorer_calls == 1:
+                return LlmResponse(
+                    stop_reason="tool_use",
+                    tool_calls=[
+                        ToolCallBlock(
+                            id="explorer-read",
+                            name="read_file",
+                            input={"path": "src/target.py"},
+                        )
+                    ],
+                )
+            if self.explorer_calls == 2:
+                return LlmResponse(
+                    stop_reason="tool_use",
+                    tool_calls=[
+                        ToolCallBlock(
+                            id="explorer-submit-slice",
+                            name="architecture_slice_submit",
+                            input={
+                                "relevant_modules": ["src/target.py"],
+                                "existing_patterns": ["single module edit"],
+                                "likely_change_targets": ["src/target.py"],
+                                "evidence_tool_call_ids": ["explorer-read"],
+                                "completeness": "complete_for_task",
+                                "confidence": 0.9,
+                            },
+                        )
+                    ],
+                )
+            return LlmResponse(stop_reason="end_turn", text="grounding committed")
+        raise AssertionError("provider reached an unexpected runtime role")
+
+
 # 功能：验证 child run stream 注册严格早于 SubagentStartedEvent 发布
 # 设计：fake journal 与真实 parent bus 共享顺序列表，执行最短前台 child lifecycle 比较边界顺序
 async def test_child_stream_registers_before_subagent_started(tmp_path: Path) -> None:
@@ -712,6 +891,90 @@ async def test_custom_planner_cannot_remove_trusted_contract(tmp_path: Path) -> 
     assert "custom planner prompt" in system
     assert "planner_decision_submit" in system
     assert "terminal" in system.lower()
+    assert 'subagent_type="explorer"' in system
+    assert "architecture_slice_submit" in system
+    assert "Do not guess" in system
+
+
+# 功能：验证 trusted Planner 第二次无 grounding 提交后由既有 terminal_reason 边界立即停止
+# 设计：两状态 provider 禁止第三次调用，并用真实 SpawnAgentTool/AgentLoop 断言单 child 有限失败
+async def test_trusted_planner_repeated_missing_grounding_stops_after_two_calls(
+    tmp_path: Path,
+) -> None:
+    workspace, store, draft = await _prepare_orchestrate_grounding(
+        tmp_path,
+        selected_approach="Keep the existing target module.",
+    )
+    provider = _MissingGroundingPlannerProvider(draft)
+    tool, _, bus = _make_tool(
+        workspace,
+        provider,
+        store=store,
+        planning_only=True,
+    )
+    started_runs: list[str] = []
+
+    # 记录真实 lifecycle 中创建的 child 数量，防止隐藏派生
+    async def collect(event: object) -> None:
+        if isinstance(event, SubagentStartedEvent):
+            started_runs.append(event.run_id)
+
+    bus.subscribe(collect)
+
+    result = await tool.run_trusted_planner_foreground(goal="Change target behavior")
+
+    assert result.status == "failed"
+    assert result.failure_reason == "planning-grounding-missing"
+    assert provider.total_provider_calls == provider.MAX_TOTAL_PROVIDER_CALLS
+    assert len(started_runs) == 1
+
+
+# 功能：验证 trusted Planner 依契约派生 Explorer 后能提交真实 grounding 与 terminal decision
+# 设计：六状态 provider 驱动两个真实 child loop，并检查 store 产物与精确调用/派生预算
+async def test_trusted_planner_grounds_with_explorer_before_terminal_submit(
+    tmp_path: Path,
+) -> None:
+    workspace, store, draft = await _prepare_orchestrate_grounding(
+        tmp_path,
+        selected_approach="Keep the existing target module.",
+    )
+    runtime_draft = dict(draft)
+    runtime_draft["intended_changes"] = [
+        {
+            "change_id": "C1",
+            "description": "Update the existing target.",
+            "requirement_ids": ["R1"],
+            "target_paths": ["src/target.py"],
+            "evidence_refs": ["explorer-read"],
+        }
+    ]
+    provider = _PlannerExplorerGroundingProvider(runtime_draft)
+    tool, _, bus = _make_tool(
+        workspace,
+        provider,
+        store=store,
+        planning_only=True,
+    )
+    started_runs: list[str] = []
+
+    # 记录 Planner 与 Explorer 两层 child lifecycle，任何隐藏派生都会破坏精确计数
+    async def collect(event: object) -> None:
+        if isinstance(event, SubagentStartedEvent):
+            started_runs.append(event.run_id)
+
+    bus.subscribe(collect)
+
+    result = await tool.run_trusted_planner_foreground(goal="Change target behavior")
+
+    assert result.status == "success"
+    assert provider.total_provider_calls == provider.MAX_TOTAL_PROVIDER_CALLS
+    assert provider.planner_calls == provider.MAX_PLANNER_CALLS
+    assert provider.explorer_calls == provider.MAX_EXPLORER_CALLS
+    assert len(started_runs) == 2
+    grounding = store.read_grounding("sess-test")
+    assert grounding is not None
+    assert len(grounding["architecture_slices"]) == 1
+    assert len(store.list_decisions("sess-test")) == 1
 
 
 @pytest.mark.parametrize(
@@ -858,6 +1121,39 @@ def test_trusted_planner_registry_excludes_task_and_mutation_tools(
     assert registry.get("task_update") is None
     assert registry.get("bash") is None
     assert registry.get("write_file") is None
+
+
+# 功能：验证 trusted Planner 看到的 spawn schema 只公开当前获准的 Explorer 角色
+# 设计：构造真实 Planner child registry 并检查消费侧 schema，避免只测试 invoke 后的兜底拒绝
+def test_trusted_planner_spawn_schema_exposes_only_explorer(tmp_path: Path) -> None:
+    from kama_claude.core.planning import PlannerDecisionService
+
+    tool, _, _ = _make_tool(
+        tmp_path,
+        store=SessionStore(tmp_path / "sessions"),
+    )
+    profile = tool._profile_loader.load("planner")
+    assert profile is not None
+    service = PlannerDecisionService(
+        workspace_root=tmp_path,
+        session_id="sess-test",
+        store=tool._store,
+        goal="inspect",
+        run_id="planner-run",
+    )
+    registry = tool._build_child_registry(
+        EventBus(),
+        "planner-run",
+        profile,
+        planner_service=service,
+    )
+    spawn = registry.get("spawn_agent")
+    assert spawn is not None
+
+    role_schema = spawn.input_schema["properties"]["subagent_type"]
+
+    assert role_schema["enum"] == ["explorer"]
+    assert "Only allowed in this context: explorer" in role_schema["description"]
 
 
 # 功能：验证 custom Planner 空工具集合不会扩张，且无法提交时只返回安全失败摘要

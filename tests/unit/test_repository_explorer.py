@@ -7,9 +7,14 @@ import pytest
 
 import kama_claude.core.grounding as grounding
 from kama_claude.core.agents.loader import AgentProfileLoader
-from kama_claude.core.bus.events import ToolCallFinishedEvent, ToolCallStartedEvent
+from kama_claude.core.bus.events import (
+    SubagentStartedEvent,
+    ToolCallFinishedEvent,
+    ToolCallStartedEvent,
+)
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, ToolCallBlock
+from kama_claude.core.permissions.manager import PermissionManager
 from kama_claude.core.session.store import SessionStore
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.subagent.tool import SpawnAgentTool
@@ -38,19 +43,103 @@ class _ExplorerProvider:
         return next(self._responses)
 
 
+class _EvidenceRecoveryExplorerProvider:
+    MAX_TOTAL_PROVIDER_CALLS = 4
+
+    # 初始化固定四状态 Explorer 与显式调用计数
+    def __init__(self) -> None:
+        self.total_provider_calls = 0
+
+    # 驱动 read→fabricated evidence submit→corrected submit→end_turn 的唯一有限路径
+    async def chat(
+        self,
+        messages: list[dict[str, object]],
+        tool_schemas: list[dict[str, object]],
+        bus: EventBus,
+        run_id: str,
+        *,
+        step: int = 0,
+        system: str | None = None,
+    ) -> LlmResponse:
+        del bus, run_id, step, system
+        names = {str(schema.get("name")) for schema in tool_schemas}
+        if "architecture_slice_submit" not in names:
+            raise AssertionError("evidence-recovery provider reached a non-Explorer role")
+        self.total_provider_calls += 1
+        if self.total_provider_calls > self.MAX_TOTAL_PROVIDER_CALLS:
+            raise AssertionError(
+                "evidence-recovery provider-call budget exceeded: "
+                f"{self.total_provider_calls}>{self.MAX_TOTAL_PROVIDER_CALLS}"
+            )
+        if self.total_provider_calls == 1:
+            return LlmResponse(
+                stop_reason="tool_use",
+                tool_calls=[
+                    ToolCallBlock(
+                        id="read-entry",
+                        name="read_file",
+                        input={"path": "entry.py"},
+                    )
+                ],
+            )
+        if self.total_provider_calls == 2:
+            return LlmResponse(
+                stop_reason="tool_use",
+                tool_calls=[
+                    ToolCallBlock(
+                        id="submit-without-evidence",
+                        name="architecture_slice_submit",
+                        input={
+                            "relevant_modules": ["entry.py"],
+                            "likely_change_targets": ["entry.py"],
+                            "evidence_tool_call_ids": ["read_file:entry.py"],
+                            "completeness": "complete_for_task",
+                            "confidence": 0.9,
+                        },
+                    )
+                ],
+            )
+        if self.total_provider_calls == 3:
+            transcript = json.dumps(messages, ensure_ascii=False, default=str)
+            if "unknown evidence tool call" not in transcript:
+                raise AssertionError("Explorer did not receive the provenance rejection detail")
+            if "read-entry" not in transcript:
+                raise AssertionError("Explorer did not receive the exact available evidence ID")
+            return LlmResponse(
+                stop_reason="tool_use",
+                tool_calls=[
+                    ToolCallBlock(
+                        id="submit-with-evidence",
+                        name="architecture_slice_submit",
+                        input={
+                            "relevant_modules": ["entry.py"],
+                            "likely_change_targets": ["entry.py"],
+                            "evidence_tool_call_ids": ["read-entry"],
+                            "completeness": "complete_for_task",
+                            "confidence": 0.9,
+                        },
+                    )
+                ],
+            )
+        return LlmResponse(stop_reason="end_turn", text="grounding committed")
+
+
 # 构造带 session store 的 root SpawnAgentTool
 def _spawn_tool(
     workspace: Path,
-    provider: _ExplorerProvider,
+    provider: object,
     *,
     max_steps: int = 5,
+    permission_manager: PermissionManager | None = None,
+    parent_bus: EventBus | None = None,
 ) -> SpawnAgentTool:
+    bus = parent_bus or EventBus()
     return SpawnAgentTool(
         provider=provider,
         workspace_root=workspace,
-        parent_bus=EventBus(),
+        parent_bus=bus,
         parent_run_id="parent-run",
-        permission_manager=None,
+        permission_manager=permission_manager,
         max_steps=max_steps,
         task_registry=BackgroundTaskRegistry(),
         runs_dir=workspace / "runs",
@@ -731,3 +820,282 @@ async def test_architecture_slice_submit_tool_returns_identity(tmp_path: Path) -
     assert identity["slice_id"].startswith("slice_")
     assert identity["version"] == 1
     assert identity["content_digest"]
+
+
+# 功能：验证 complete slice 缺少 evidence 时统一 invocation 返回可操作 invalid_input
+# 设计：经真实 registry/invoke_tool 边界触发 service 拒绝，排除泛化 execution_error
+async def test_architecture_slice_submit_reports_actionable_missing_evidence(
+    tmp_path: Path,
+) -> None:
+    from kama_claude.core.tools.registry import ToolRegistry
+
+    service = grounding.ArchitectureSliceService(
+        workspace_root=tmp_path,
+        run_id="explorer-run",
+        goal="Inspect entry",
+        collector=grounding.ToolObservationCollector(),
+    )
+    registry = ToolRegistry()
+    registry.register(grounding.ArchitectureSliceSubmitTool(service))
+
+    result = await invoke_tool(
+        registry,
+        ToolCallBlock(
+            id="submit-empty",
+            name="architecture_slice_submit",
+            input={
+                "evidence_tool_call_ids": [],
+                "completeness": "complete_for_task",
+                "confidence": 0.9,
+            },
+        ),
+        EventBus(),
+        "explorer-run",
+    )
+
+    assert result.is_error is True
+    assert result.error_type == "invalid_input"
+    assert "complete_for_task requires recorded evidence" in result.content
+    assert "evidence_tool_call_ids" in result.content
+
+
+# 功能：验证 fabricated evidence ID 在工具边界返回可恢复错误和真实候选 ID
+# 设计：先经真实 read_file 记录 provenance，再提交人类可读伪 ID 锁定模型修正所需信息
+async def test_architecture_slice_submit_reports_available_id_for_unknown_evidence(
+    tmp_path: Path,
+) -> None:
+    from kama_claude.core.tools.builtin.read_file import ReadFileTool
+    from kama_claude.core.tools.registry import ToolRegistry
+    from kama_claude.core.workspace.policy import WorkspaceAccessPolicy
+    from kama_claude.core.workspace.resolver import WorkspacePathResolver
+
+    source = tmp_path / "entry.py"
+    source.write_text("ENTRY = True\n", encoding="utf-8")
+    collector = grounding.ToolObservationCollector()
+    bus = EventBus()
+    bus.subscribe(collector.handle)
+    service = grounding.ArchitectureSliceService(
+        workspace_root=tmp_path,
+        run_id="explorer-run",
+        goal="Inspect entry",
+        collector=collector,
+    )
+    resolver = WorkspacePathResolver(tmp_path)
+    registry = ToolRegistry()
+    registry.register(ReadFileTool(resolver, WorkspaceAccessPolicy(resolver.root)))
+    registry.register(grounding.ArchitectureSliceSubmitTool(service))
+    await invoke_tool(
+        registry,
+        ToolCallBlock(id="read-entry", name="read_file", input={"path": "entry.py"}),
+        bus,
+        "explorer-run",
+    )
+
+    result = await invoke_tool(
+        registry,
+        ToolCallBlock(
+            id="submit-fabricated",
+            name="architecture_slice_submit",
+            input={
+                "relevant_modules": ["entry.py"],
+                "likely_change_targets": ["entry.py"],
+                "evidence_tool_call_ids": ["read_file:entry.py"],
+                "completeness": "complete_for_task",
+                "confidence": 0.9,
+            },
+        ),
+        bus,
+        "explorer-run",
+    )
+
+    assert result.is_error is True
+    assert result.error_type == "invalid_input"
+    assert "unknown evidence tool call: read_file:entry.py" in result.content
+    assert "read-entry=entry.py" in result.content
+
+
+# 功能：验证 complete slice 不能把 unresolved questions 带入父 Planner 后才失败
+# 设计：先记录真实 read evidence，再经 submit tool 边界断言原 Explorer 内即可得到可恢复 invalid_input
+async def test_architecture_slice_submit_rejects_complete_with_unresolved_questions(
+    tmp_path: Path,
+) -> None:
+    from kama_claude.core.tools.builtin.read_file import ReadFileTool
+    from kama_claude.core.tools.registry import ToolRegistry
+    from kama_claude.core.workspace.policy import WorkspaceAccessPolicy
+    from kama_claude.core.workspace.resolver import WorkspacePathResolver
+
+    source = tmp_path / "entry.py"
+    source.write_text("ENTRY = True\n", encoding="utf-8")
+    collector = grounding.ToolObservationCollector()
+    bus = EventBus()
+    bus.subscribe(collector.handle)
+    resolver = WorkspacePathResolver(tmp_path)
+    registry = ToolRegistry()
+    registry.register(ReadFileTool(resolver, WorkspaceAccessPolicy(resolver.root)))
+    registry.register(
+        grounding.ArchitectureSliceSubmitTool(
+            grounding.ArchitectureSliceService(
+                workspace_root=tmp_path,
+                run_id="explorer-run",
+                goal="Inspect entry",
+                collector=collector,
+            )
+        )
+    )
+    await invoke_tool(
+        registry,
+        ToolCallBlock(id="read-entry", name="read_file", input={"path": "entry.py"}),
+        bus,
+        "explorer-run",
+    )
+
+    result = await invoke_tool(
+        registry,
+        ToolCallBlock(
+            id="submit-unresolved",
+            name="architecture_slice_submit",
+            input={
+                "relevant_modules": ["entry.py"],
+                "likely_change_targets": ["entry.py"],
+                "unresolved_questions": ["Which behavior is authoritative?"],
+                "evidence_tool_call_ids": ["read-entry"],
+                "completeness": "complete_for_task",
+                "confidence": 0.9,
+            },
+        ),
+        bus,
+        "explorer-run",
+    )
+
+    assert result.is_error is True
+    assert result.error_type == "invalid_input"
+    assert "requires unresolved_questions to be empty" in result.content
+    assert "partial/blocked" in result.content
+
+
+# 功能：验证 confirmed path 不能夹带 symbol 或描述并伪装为不存在的新文件
+# 设计：真实读取 entry.py 后提交带冒号说明的 relevant_entrypoints，锁定 Explorer 内部 path 契约
+async def test_architecture_slice_submit_rejects_nonexistent_confirmed_path(
+    tmp_path: Path,
+) -> None:
+    from kama_claude.core.tools.builtin.read_file import ReadFileTool
+    from kama_claude.core.tools.registry import ToolRegistry
+    from kama_claude.core.workspace.policy import WorkspaceAccessPolicy
+    from kama_claude.core.workspace.resolver import WorkspacePathResolver
+
+    source = tmp_path / "entry.py"
+    source.write_text("def main():\n    return 0\n", encoding="utf-8")
+    collector = grounding.ToolObservationCollector()
+    bus = EventBus()
+    bus.subscribe(collector.handle)
+    resolver = WorkspacePathResolver(tmp_path)
+    registry = ToolRegistry()
+    registry.register(ReadFileTool(resolver, WorkspaceAccessPolicy(resolver.root)))
+    registry.register(
+        grounding.ArchitectureSliceSubmitTool(
+            grounding.ArchitectureSliceService(
+                workspace_root=tmp_path,
+                run_id="explorer-run",
+                goal="Inspect entry",
+                collector=collector,
+            )
+        )
+    )
+    await invoke_tool(
+        registry,
+        ToolCallBlock(id="read-entry", name="read_file", input={"path": "entry.py"}),
+        bus,
+        "explorer-run",
+    )
+
+    result = await invoke_tool(
+        registry,
+        ToolCallBlock(
+            id="submit-described-path",
+            name="architecture_slice_submit",
+            input={
+                "relevant_entrypoints": ["entry.py:main"],
+                "relevant_modules": ["entry.py"],
+                "likely_change_targets": ["entry.py"],
+                "evidence_tool_call_ids": ["read-entry"],
+                "completeness": "complete_for_task",
+                "confidence": 0.9,
+            },
+        ),
+        bus,
+        "explorer-run",
+    )
+
+    assert result.is_error is True
+    assert result.error_type == "invalid_input"
+    assert "confirmed repository path does not exist: entry.py:main" in result.content
+    assert "without symbols or descriptions" in result.content
+
+
+# 功能：验证 Explorer 收到缺 evidence 反馈后能有限修正并提交 complete slice
+# 设计：四状态 provider 经真实 AgentLoop/PermissionManager 执行，精确断言调用与 child 预算
+async def test_explorer_recovers_missing_evidence_without_permission_prompt(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "entry.py"
+    source.write_text("ENTRY = True\n", encoding="utf-8")
+    provider = _EvidenceRecoveryExplorerProvider()
+    bus = EventBus()
+    started_runs: list[str] = []
+
+    # 记录真实 child lifecycle，隐藏派生会破坏精确计数
+    async def collect(event: object) -> None:
+        if isinstance(event, SubagentStartedEvent):
+            started_runs.append(event.run_id)
+
+    bus.subscribe(collect)
+    tool = _spawn_tool(
+        tmp_path,
+        provider,
+        permission_manager=PermissionManager(timeout_s=0.01),
+        parent_bus=bus,
+    )
+
+    result = await tool.invoke(
+        {
+            "description": "inspect entry",
+            "prompt": "Inspect entry",
+            "subagent_type": "explorer",
+        }
+    )
+
+    payload = json.loads(result.content)
+    assert result.is_error is False
+    assert payload["completeness"] == "complete_for_task"
+    assert payload["evidence_refs"] == [
+        {"logical_path": "entry.py", "tool_call_id": "read-entry"}
+    ]
+    assert provider.total_provider_calls == provider.MAX_TOTAL_PROVIDER_CALLS
+    assert len(started_runs) == 1
+
+
+# 功能：验证 Explorer 实际消费的 tool schema 说明 evidence ID 必须来自成功 read_file
+# 设计：检查注册工具的对外 schema 而非私有常量，锁定模型可见合同
+def test_architecture_slice_schema_explains_evidence_tool_call_ids(
+    tmp_path: Path,
+) -> None:
+    service = grounding.ArchitectureSliceService(
+        workspace_root=tmp_path,
+        run_id="explorer-run",
+        goal="Inspect entry",
+        collector=grounding.ToolObservationCollector(),
+    )
+    tool = grounding.ArchitectureSliceSubmitTool(service)
+
+    field = tool.input_schema["properties"]["evidence_tool_call_ids"]
+
+    assert "successful read_file tool call IDs" in field["description"]
+    for name in ("relevant_entrypoints", "relevant_modules", "likely_change_targets"):
+        path_field = tool.input_schema["properties"][name]
+        description = path_field["description"].casefold()
+        assert "exact workspace-relative file paths" in description
+        assert "without symbols or descriptions" in description
+    unresolved = tool.input_schema["properties"]["unresolved_questions"]
+    assert "complete_for_task requires this field to be empty" in unresolved[
+        "description"
+    ]

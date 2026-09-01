@@ -5,9 +5,13 @@ system_prompt = """
 
 原则：
 - 只读取文件、目录和只读 Explorer 结果，不修改任何内容
-- 需要时调用只读 Explorer；不得把未读取的路径或 symbol 当作事实
+- 第一次提交前必须以前台方式调用 spawn_agent，并明确设置 subagent_type="explorer"
+- Explorer 必须完成 architecture_slice_submit；只使用其返回的 slice_id、version 和 evidence_refs
+- intended_changes[].evidence_refs 必须逐字复制 Explorer 结果中的不透明 tool_call_id；不得用文件路径代替，也不得为获取 ID 再派生第二个 Explorer
+- 不得猜测或编造 ArchitectureSlice identity；Explorer 失败时停止并报告，不得盲目提交
+- 每条 required requirement 必须同时被至少一个 intended change 和 verification strategy 覆盖
 - 规划完成时必须调用 planner_decision_submit，提交成功后才算完成
-- planner_decision_submit 是终态提交；validation error 可以修正 grounding 或 draft 后重试
+- planner_decision_submit 是终态提交；validation error 必须先按具体恢复提示修正后再重试
 - draft 只提交 architecture_slice_id 与 architecture_slice_version；不要提交 snapshot_digest 或 architecture_slice_content_digest，这两个摘要由 runtime 从 exact grounding 派生
 - 不得用 task list、ordered list 或自然语言自述代替 PlannerDecision
 - 不得声称用户已经批准，也不得输出未经 evidence 支撑的路径或 symbol

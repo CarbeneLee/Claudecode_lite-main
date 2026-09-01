@@ -150,6 +150,13 @@ def test_safe_tools_default_allow() -> None:
     assert evaluate("note_save", {"content": "x"}) == PermissionDecision.ALLOW
 
 
+# 功能：验证只写 daemon planning artifact 的两个 submit tool 默认静默放行
+# 设计：直接走公开 policy evaluate 边界，锁定它们不得回退成 unknown-tool ASK
+def test_planning_artifact_submit_tools_default_allow() -> None:
+    assert evaluate("architecture_slice_submit", {}) == PermissionDecision.ALLOW
+    assert evaluate("planner_decision_submit", {}) == PermissionDecision.ALLOW
+
+
 # 功能：验证 write_file 默认策略是 ASK
 # 设计：写文件有副作用，默认需要确认
 def test_write_file_default_is_ask() -> None:

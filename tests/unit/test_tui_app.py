@@ -183,6 +183,37 @@ def test_note_save_tool_block_shows_remembered() -> None:
     assert "remembered" in block._summary()  # type: ignore[attr-defined]
 
 
+# 功能：验证计划卡片截断列表预览后仍能作为 Textual markup 安全渲染
+# 设计：构造以未闭合方括号结尾的长 intended_changes，复现真实长任务退出时的 MarkupError
+def test_committed_plan_escapes_truncated_dynamic_preview() -> None:
+    class _FakePlan:
+        # 返回会让旧实现把前导方括号误解析成 markup 标签的长计划
+        def model_dump(self, *, mode: str) -> dict[str, Any]:
+            assert mode == "json"
+            return {
+                "goal": "grounded plan",
+                "selected_approach": "preserve public API",
+                "intended_changes": [{"description": "x" * 220}],
+                "decision_key": "decision-test:v1",
+            }
+
+    class _FakeReducer:
+        # 绕过持久化 reducer，仅隔离验证最终展示字符串
+        def ingest(self, event: dict[str, Any]) -> list[_FakePlan]:
+            assert event["type"] == "planner.decision_ready"
+            return [_FakePlan()]
+
+    app = KamaTuiApp("127.0.0.1", 9999)
+    appended: list[Widget] = []
+    app._plan_reducer = _FakeReducer()  # type: ignore[assignment]
+    app._append = lambda widget: appended.append(widget)  # type: ignore[method-assign]
+
+    app._render_committed_plan_event({"type": "planner.decision_ready"})
+
+    assert len(appended) == 1
+    appended[0].render()
+
+
 # 功能：验证提交用户输入时会追加 user turn，并进入 busy 状态
 # 设计：用 fake client 替代 SocketClient，直接调用 on_chat_text_area_submitted，
 #       覆盖 TextArea 清空内容 + 设置 busy 占位符的核心状态迁移

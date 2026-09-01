@@ -49,6 +49,9 @@ DEFAULT_POLICIES: dict[str, ToolPolicy] = {
     "search_code": ToolPolicy(default=PermissionDecision.ALLOW),
     "search_semantic": ToolPolicy(default=PermissionDecision.ALLOW),
     "note_save": ToolPolicy(default=PermissionDecision.ALLOW),
+    # planning submit 只写 daemon-owned session artifact，不修改 Agent workspace
+    "architecture_slice_submit": ToolPolicy(default=PermissionDecision.ALLOW),
+    "planner_decision_submit": ToolPolicy(default=PermissionDecision.ALLOW),
     # git 工具：只读 auto_allow，写操作 ASK（设计 §7.1）
     "git_status": ToolPolicy(default=PermissionDecision.ALLOW),
     "git_diff": ToolPolicy(default=PermissionDecision.ALLOW),
