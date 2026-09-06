@@ -23,6 +23,7 @@ from kama_claude.core.grounding import (
     architecture_slice_result_payload,
     render_repository_instructions,
 )
+from kama_claude.core.llm.gateway import ContextAdmissionError
 from kama_claude.core.loop import AgentLoop
 from kama_claude.core.memory.loader import load_context_file
 from kama_claude.core.planning import (
@@ -36,6 +37,7 @@ from kama_claude.core.runs import new_run_id
 from kama_claude.core.sandbox.executors import build_executor
 from kama_claude.core.sandbox.manager import SandboxManager
 from kama_claude.core.semantic.tools import SearchSemanticTool
+from kama_claude.core.subagent.protocol import SubagentOutcome
 from kama_claude.core.subagent.registry import BackgroundTaskRegistry
 from kama_claude.core.tools.base import BaseTool, ToolResult
 from kama_claude.core.tools.builtin.bash import BashTool
@@ -159,6 +161,16 @@ class _PlannerDirectToolInvoker(DirectToolInvoker):
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+# 从 provider capability 提取 bounded child outcome 的 route/model identity
+def _provider_identity(provider: object) -> tuple[str, str]:
+    route = getattr(provider, "route_identity", "")
+    model = getattr(provider, "model", getattr(provider, "_model", ""))
+    return (
+        route if isinstance(route, str) else "",
+        model if isinstance(model, str) else "",
+    )
 
 
 # 取消并等待同一 parent 拥有的后台 children，重复 cancellation 后仍先完成清理
@@ -330,6 +342,15 @@ class SpawnAgentTool(BaseTool):
                 content=planner_failure_message(reason),
                 is_error=True,
                 error_type="command_failed",
+                terminal_outcome=SubagentOutcome(
+                    status="failed",
+                    error_code=reason,
+                    child_run_id="",
+                    provider=_provider_identity(self._provider)[0],
+                    model=_provider_identity(self._provider)[1],
+                    short_message=reason,
+                ),
+                terminal_receipt=True,
             )
         assert isinstance(result, ToolResult)
         return result
@@ -439,6 +460,9 @@ class SpawnAgentTool(BaseTool):
             ),
             system_prompt_override=effective_profile_prompt,
         )
+        child_context.provider_name, child_context.provider_model = _provider_identity(
+            self._provider
+        )
 
         child_bus = EventBus()
 
@@ -541,6 +565,15 @@ class SpawnAgentTool(BaseTool):
                 content=planner_failure_message(reason),
                 is_error=True,
                 error_type="command_failed",
+                terminal_outcome=SubagentOutcome(
+                    status="failed",
+                    error_code=reason,
+                    child_run_id=child_run_id,
+                    provider=_provider_identity(self._provider)[0],
+                    model=_provider_identity(self._provider)[1],
+                    short_message=reason,
+                ),
+                terminal_receipt=True,
             )
 
         if p.run_in_background:
@@ -590,6 +623,19 @@ class SpawnAgentTool(BaseTool):
             )
         except asyncio.CancelledError:
             raise
+        except ContextAdmissionError:
+            outcome = SubagentOutcome.from_context(
+                child_context,
+                child_run_id=child_run_id,
+                error_code="CONTEXT_WINDOW_EXCEEDED",
+            )
+            return ToolResult(
+                content=outcome.to_parent_receipt(),
+                is_error=True,
+                error_type="context_window_exceeded",
+                terminal_outcome=outcome,
+                terminal_receipt=True,
+            )
         except Exception as exc:
             if return_internal and trusted_planner:
                 reason = (
@@ -612,6 +658,15 @@ class SpawnAgentTool(BaseTool):
                     content=planner_failure_message(reason),
                     is_error=True,
                     error_type="command_failed",
+                    terminal_outcome=SubagentOutcome(
+                        status="failed",
+                        error_code=reason,
+                        child_run_id=child_run_id,
+                        provider=_provider_identity(self._provider)[0],
+                        model=_provider_identity(self._provider)[1],
+                        short_message=reason,
+                    ),
+                    terminal_receipt=True,
                 )
             raise
 
@@ -641,6 +696,11 @@ class SpawnAgentTool(BaseTool):
                     content=planner_failure_message(reason),
                     is_error=True,
                     error_type="command_failed",
+                    terminal_outcome=SubagentOutcome.from_context(
+                        child_context,
+                        child_run_id=child_run_id,
+                        error_code=reason,
+                    ),
                 )
             try:
                 # /orchestrate 读取完整 immutable V2 decision，而不是 bounded PlanView 或 child 原文
@@ -653,19 +713,40 @@ class SpawnAgentTool(BaseTool):
                         content=planner_failure_message("planner-result-too-large"),
                         is_error=True,
                         error_type="command_failed",
+                        terminal_outcome=SubagentOutcome.from_context(
+                            child_context,
+                            child_run_id=child_run_id,
+                            error_code="planner-result-too-large",
+                        ),
                     )
                 return ToolResult(
                     content=planner_failure_message("artifact-corrupt"),
                     is_error=True,
                     error_type="command_failed",
+                    terminal_outcome=SubagentOutcome.from_context(
+                        child_context,
+                        child_run_id=child_run_id,
+                        error_code="artifact-corrupt",
+                    ),
                 )
             except Exception:
                 return ToolResult(
                     content=planner_failure_message("artifact-corrupt"),
                     is_error=True,
                     error_type="command_failed",
+                    terminal_outcome=SubagentOutcome.from_context(
+                        child_context,
+                        child_run_id=child_run_id,
+                        error_code="artifact-corrupt",
+                    ),
                 )
-            return ToolResult(content=summary)
+            return ToolResult(
+                content=summary,
+                terminal_outcome=SubagentOutcome.from_context(
+                    child_context,
+                    child_run_id=child_run_id,
+                ),
+            )
 
         if slice_service is not None:
             architecture_slice = slice_service.submitted
@@ -680,21 +761,62 @@ class SpawnAgentTool(BaseTool):
                     completeness,
                     reason,
                 )
+            outcome = SubagentOutcome.from_context(
+                child_context,
+                child_run_id=child_run_id,
+                error_code=(
+                    None
+                    if child_context.status == "success"
+                    else (child_context.reason or "SUBAGENT_FAILED")
+                ),
+            )
             return ToolResult(
                 content=json.dumps(
                     architecture_slice_result_payload(architecture_slice),
                     sort_keys=True,
-                )
+                ),
+                terminal_outcome=outcome,
             )
 
         if child_context.status == "success":
-            return ToolResult(
-                content=child_context.result or "Subagent completed with no text output."
+            outcome = SubagentOutcome.from_context(
+                child_context,
+                child_run_id=child_run_id,
             )
+            return ToolResult(
+                # 保持普通成功 child 的现有 human-readable bounded preview contract
+                content=(child_context.result or "Subagent completed with no text output.")[:4_000],
+                terminal_outcome=outcome,
+                terminal_receipt=True,
+            )
+        if child_context.reason == "CONTEXT_WINDOW_EXCEEDED":
+            outcome = SubagentOutcome.from_context(
+                child_context,
+                child_run_id=child_run_id,
+                error_code="CONTEXT_WINDOW_EXCEEDED",
+            )
+            return ToolResult(
+                content=outcome.to_parent_receipt(),
+                is_error=True,
+                error_type="context_window_exceeded",
+                terminal_outcome=outcome,
+                terminal_receipt=True,
+            )
+        outcome = SubagentOutcome.from_context(
+            child_context,
+            child_run_id=child_run_id,
+            error_code=child_context.reason or "SUBAGENT_FAILED",
+        )
         return ToolResult(
-            content=(child_context.result or "Subagent failed to complete the delegated task."),
+            # 普通失败保持稳定摘要；overflow 分支在上面使用结构化 receipt
+            content=(
+                child_context.result
+                or "Subagent failed to complete the delegated task."
+            )[:4_000],
             is_error=True,
             error_type="command_failed",
+            terminal_outcome=outcome,
+            terminal_receipt=True,
         )
 
     # 运行 child 并在所有 started 后终态发布一次 finished，再恢复原异常控制流
@@ -719,7 +841,11 @@ class SpawnAgentTool(BaseTool):
             primary_failure = exc
         except Exception as exc:
             _LOGGER.exception("subagent execution failed run_id=%s", run_id)
-            context.mark_failed("subagent_error")
+            context.mark_failed(
+                "CONTEXT_WINDOW_EXCEEDED"
+                if isinstance(exc, ContextAdmissionError)
+                else "subagent_error"
+            )
             primary_failure = exc
 
         if (
@@ -962,25 +1088,68 @@ class AgentResultTool(BaseTool):
         if not task.done():
             return ToolResult(content="still running")
         if task.cancelled():
+            outcome = SubagentOutcome.from_context(
+                context,
+                child_run_id=p.run_id,
+                error_code="CANCELLED",
+            )
             return ToolResult(
+                # 取消是现有 agent_result 的稳定 human-readable terminal contract
                 content="Subagent was cancelled.",
                 is_error=True,
                 error_type="command_failed",
+                terminal_outcome=outcome,
+                terminal_receipt=True,
             )
         exc = task.exception()
         if exc is not None:
+            outcome = SubagentOutcome.from_context(
+                context,
+                child_run_id=p.run_id,
+                error_code="SUBAGENT_EXECUTION_FAILED",
+            )
             return ToolResult(
                 content="Subagent execution failed.",
                 is_error=True,
                 error_type="execution_error",
+                terminal_outcome=outcome,
+                terminal_receipt=True,
             )
         if context.status == "failed":
+            if context.reason == "CONTEXT_WINDOW_EXCEEDED":
+                outcome = SubagentOutcome.from_context(
+                    context,
+                    child_run_id=p.run_id,
+                    error_code="CONTEXT_WINDOW_EXCEEDED",
+                )
+                return ToolResult(
+                    content=outcome.to_parent_receipt(),
+                    is_error=True,
+                    error_type="context_window_exceeded",
+                    terminal_outcome=outcome,
+                    terminal_receipt=True,
+                )
+            outcome = SubagentOutcome.from_context(
+                context,
+                child_run_id=p.run_id,
+                error_code=context.reason or "SUBAGENT_FAILED",
+            )
             return ToolResult(
                 content=(
                     context.result
                     or "Subagent failed to complete the delegated task."
-                ),
+                )[:4_000],
                 is_error=True,
                 error_type="command_failed",
+                terminal_outcome=outcome,
+                terminal_receipt=True,
             )
-        return ToolResult(content=context.result or "Subagent completed with no text result.")
+        outcome = SubagentOutcome.from_context(
+            context,
+            child_run_id=p.run_id,
+        )
+        return ToolResult(
+            content=(context.result or "Subagent completed with no text result.")[:4_000],
+            terminal_outcome=outcome,
+            terminal_receipt=True,
+        )

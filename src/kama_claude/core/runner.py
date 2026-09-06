@@ -73,6 +73,7 @@ from kama_claude.core.subagent.tool import (
     _cancel_background_tasks,
 )
 from kama_claude.core.task.manager import TaskManager
+from kama_claude.core.task_contract import PendingDirectiveSet
 from kama_claude.core.tools.builtin import (
     BashTool,
     ListDirTool,
@@ -303,12 +304,45 @@ class AgentRunner:
         run_id = run_id or new_run_id()
         if session is not None and store is not None:
             run_path = store.runs_dir(session.id) / run_id
-            history = store.read_messages(session.id)
+            history = store.read_messages_with_metadata(session.id)
             notes = store.read_notes(session.id)
         else:
             run_path = self._runs_dir / run_id
             history = [{"role": "user", "content": goal}]
             notes = ""
+        pending_directives = (
+            store.read_pending_directive_set(session.id)
+            if session is not None and store is not None
+            else None
+        )
+        task_contract = (
+            store.read_latest_task_contract(session.id)
+            if session is not None and store is not None
+            else None
+        )
+        checkpoint_projection = (
+            store.read_checkpoint_projection(
+                session.id,
+                current_contract_digest=(task_contract.digest if task_contract is not None else ""),
+                pending_unresolved=bool(
+                    pending_directives is not None and pending_directives.unresolved()
+                ),
+            )
+            if session is not None and store is not None
+            else None
+        )
+        checkpoint_envelope = (
+            store.read_latest_checkpoint_envelope(session.id)
+            if session is not None and store is not None
+            else None
+        )
+        checkpoint_contract_digest = ""
+        if session is not None and store is not None:
+            checkpoint_records = store.read_committed_checkpoints(session.id)
+            if checkpoint_records:
+                checkpoint_contract_digest = str(
+                    checkpoint_records[-1].get("contract_digest", "")
+                )
         run_path.mkdir(parents=True, exist_ok=True)
 
         global_ctx = load_context_file(Path("~/.kama/context.md").expanduser())
@@ -350,7 +384,48 @@ class AgentRunner:
                 root_instructions.root_sources
             ),
             system_prompt_override=system_prompt_override,
+            pending_directives=pending_directives or PendingDirectiveSet(),
+            task_contract=task_contract,
+            checkpoint_projection=checkpoint_projection,
+            checkpoint_envelope=checkpoint_envelope,
+            checkpoint_contract_digest=checkpoint_contract_digest,
+            directive_coverage=(
+                store.read_directive_coverage_state(session.id)
+                if session is not None and store is not None
+                else {}
+            ),
+            tool_result_limit=self._config.compaction.tool_result_limit,
+            tool_result_keep=self._config.compaction.tool_result_keep,
         )
+        if session is not None and store is not None:
+            # 恢复上一提交的 surface 身份，再把本次已追加的 user/contract mutation 计入 revision
+            persisted_surface = store.read_surface_state(session.id)
+            context.surface_state.surface_revision = store.read_surface_revision(session.id)
+            if persisted_surface is not None:
+                context.surface_state.active_head_id = persisted_surface.get("active_head_id")
+                context.surface_state.contract_version = int(
+                    persisted_surface.get("contract_version", 0) or 0
+                )
+                context.surface_state.contract_digest = str(
+                    persisted_surface.get("contract_digest", "")
+                )
+                context.surface_state.pending_reconciliation_watermark = str(
+                    persisted_surface.get("pending_watermark", "")
+                )
+                context.surface_state.pending_digest = str(
+                    persisted_surface.get("pending_digest", "")
+                )
+                context.surface_state.active_checkpoint_id = persisted_surface.get(
+                    "active_checkpoint_id"
+                )
+                context.surface_state.active_checkpoint_status = str(
+                    persisted_surface.get("active_checkpoint_status", "NONE")
+                )
+            else:
+                context.surface_state.active_head_id = None
+                context.surface_state.contract_digest = ""
+                context.surface_state.pending_digest = ""
+            context.refresh_surface_state(increment=True)
         prefill_len = len(history)  # 避免重复存储历史消息
 
         await bus.publish(RunStartedEvent(run_id=run_id, goal=goal, ts=_now()))
@@ -466,7 +541,16 @@ class AgentRunner:
                 if session is not None and store is not None
                 else run_path
             )
-            compactor = Compactor(bus, session_dir, session_id_str)
+            compactor = Compactor(
+                bus,
+                session_dir,
+                session_id_str,
+                summary_max_tokens=self._config.compaction.summary_max_tokens,
+                tool_result_limit=self._config.compaction.tool_result_limit,
+                tool_result_keep=self._config.compaction.tool_result_keep,
+                recent_tail_ratio=self._config.compaction.recent_tail_ratio,
+                recent_tail_max_tokens=self._config.compaction.recent_tail_max_tokens,
+            )
             direct_invoker = DirectToolInvoker(
                 registry,
                 bus,
@@ -479,7 +563,10 @@ class AgentRunner:
                 direct_invoker,
                 bus,
                 compactor=compactor,
-                compact_threshold=self._config.compaction.auto_threshold,  # 触发压缩上下文的阈值
+                # 触发 proactive compaction 的 threshold
+                compact_threshold=(1.0 if self._config.compaction.proactive_enabled else 0.0),
+                soft_trigger_ratio=self._config.compaction.effective_soft_trigger_ratio,
+                target_ratio=self._config.compaction.target_ratio,
             )
             await loop.run(context)
         # CancelledError 单独处理，并保存对象供 terminal barrier 后原样恢复
@@ -515,6 +602,71 @@ class AgentRunner:
         if git_enabled and git_manager is not None:
             await self._git_run_end(bus, run_id, git_manager, context, cancelled_error)
 
+        if session is not None and store is not None:
+            # Durable thread/surface state is the source of truth observed by
+            # run.finished subscribers, so commit it before publishing the
+            # terminal event.
+            if context.compacted:
+                base_surface_revision = store.read_surface_revision(session.id)
+                target_surface_revision = context.surface_state.surface_revision
+                if target_surface_revision <= base_surface_revision:
+                    target_surface_revision = base_surface_revision + 1
+                # Auto compaction may shadow assistant/tool units that only
+                # lived in this run's in-memory active surface.  Persist those
+                # raw facts before the checkpoint and replacement transaction.
+                if context.raw_run_messages:
+                    store.append_messages(
+                        session.id,
+                        context.raw_run_messages,
+                        run_id=run_id,
+                    )
+                if context.checkpoint_envelope is not None:
+                    store.append_checkpoint(
+                        session.id,
+                        context.checkpoint_envelope.to_record(),
+                        atomic_surface_replace=True,
+                    )
+                store.write_compacted(
+                    session.id,
+                    context.messages,
+                    contract_digest=(
+                        context.checkpoint_envelope.contract_digest
+                        if context.checkpoint_envelope is not None
+                        else (context.task_contract.digest if context.task_contract else "")
+                    ),
+                    base_surface_revision=base_surface_revision,
+                    surface_revision=target_surface_revision,
+                    checkpoint_id=(
+                        context.checkpoint_envelope.transaction_id
+                        if context.checkpoint_envelope is not None
+                        else None
+                    ),
+                )
+                store.append_surface_state(
+                    session.id,
+                    surface_revision=target_surface_revision,
+                    active_head_id=context.surface_state.active_head_id,
+                    contract_version=context.surface_state.contract_version,
+                    contract_digest=context.surface_state.contract_digest,
+                    pending_watermark=context.surface_state.pending_reconciliation_watermark,
+                    pending_digest=context.surface_state.pending_digest,
+                    active_checkpoint_id=context.surface_state.active_checkpoint_id,
+                    active_checkpoint_status=context.surface_state.active_checkpoint_status,
+                )
+            else:
+                store.append_messages(session.id, context.messages[prefill_len:], run_id=run_id)
+                store.append_surface_state(
+                    session.id,
+                    surface_revision=context.surface_state.surface_revision,
+                    active_head_id=context.surface_state.active_head_id,
+                    contract_version=context.surface_state.contract_version,
+                    contract_digest=context.surface_state.contract_digest,
+                    pending_digest=context.surface_state.pending_digest,
+                    pending_watermark=context.surface_state.pending_reconciliation_watermark,
+                    active_checkpoint_id=context.surface_state.active_checkpoint_id,
+                    active_checkpoint_status=context.surface_state.active_checkpoint_status,
+                )
+
         terminal_failure: asyncio.CancelledError | Exception | None = None
         try:
             await bus.publish(
@@ -530,9 +682,6 @@ class AgentRunner:
             terminal_failure = exc
         except Exception as exc:
             terminal_failure = exc
-
-        if session is not None and store is not None:
-            store.append_messages(session.id, context.messages[prefill_len:], run_id=run_id)
 
         if cancelled_error is not None:
             if terminal_failure is not None:

@@ -27,6 +27,8 @@ from kama_claude.core.bus.events import (
     SessionWaitingForInputEvent,
     SkillInvokedEvent,
 )
+from kama_claude.core.compact.budget import truncate_tool_results
+from kama_claude.core.compact.protocol import selected_span_digest
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.execution import (
     ApprovedExecutionBinding,
@@ -44,6 +46,12 @@ from kama_claude.core.session.model import (
 )
 from kama_claude.core.session.store import SessionStore
 from kama_claude.core.skills.loader import SkillLoader
+from kama_claude.core.task_contract import (
+    DirectiveCoverageRecord,
+    PendingDirectiveOverlay,
+    apply_directive_to_contract,
+    is_semantic_noop_directive,
+)
 
 if TYPE_CHECKING:
     from kama_claude.core.bus.commands import (
@@ -52,6 +60,7 @@ if TYPE_CHECKING:
         PlanGetApprovalResult,
         PlanGetExecutionResult,
     )
+    from kama_claude.core.config import CompactionConfig
     from kama_claude.core.events.journal import EventJournalCoordinator
     from kama_claude.core.llm.base import LLMProvider
     from kama_claude.core.planning import ExactPlannerDecisionV2
@@ -77,6 +86,18 @@ def _looks_like_absolute_path_goal(content: str) -> bool:
     return token.startswith("/") and token.count("/") >= 2
 
 
+# 对用户消息做轻量分类，供 coverage 与 pending directive 保护使用
+def _classify_directive(content: str) -> str:
+    normalized = content.strip().lower()
+    if is_semantic_noop_directive(normalized):
+        return "steering"
+    if normalized.startswith(("do not ", "don't ", "不要", "禁止")):
+        return "prohibition"
+    if normalized.startswith(("must ", "需要", "必须", "要求")):
+        return "requirement"
+    return "task_shaping"
+
+
 class SessionManager:
     # 初始化会话管理器，接入文件存储、runner 工厂、事件总线和可选的 LLM provider（用于手动压缩）
     def __init__(
@@ -86,12 +107,18 @@ class SessionManager:
         bus: EventBus,
         provider: LLMProvider | None = None,
         journal: EventJournalCoordinator | None = None,
+        compaction_config: CompactionConfig | None = None,
     ) -> None:
         self._store = store
         self._runner_factory = runner_factory
         self._bus = bus
         self._provider = provider
         self._journal = journal
+        if compaction_config is None:
+            from kama_claude.core.config import CompactionConfig
+
+            compaction_config = CompactionConfig()
+        self._compaction_config = compaction_config
         self._approval = ApprovalService(store, journal, bus)
         if journal is not None:
             journal_handler = getattr(journal, "handle", None)
@@ -101,6 +128,8 @@ class SessionManager:
         self._locks: dict[str, asyncio.Lock] = {}
         # 每个 session 至多一个后台 run task；send_message 注册后立即返回
         self._running_runs: dict[str, asyncio.Task[None]] = {}
+        # 手动 compaction 在 provider await 期间释放 session lock，但仍阻止新 run
+        self._compacting_sessions: set[str] = set()
         # 重启后没有 terminal journal 的 session 进入显式 interrupted 状态
         self._interrupted_sessions: set[str] = set()
         # approved execution task map is lifecycle tracking only, not admission authority
@@ -240,7 +269,7 @@ class SessionManager:
     ) -> str:
         session = self._get_session(sid)
         lock = self._locks[sid]
-        if lock.locked():
+        if lock.locked() or sid in self._compacting_sessions:
             raise HandlerError(SESSION_BUSY, "session busy")
         if session.active_run_id is not None:
             if sid in self._interrupted_sessions:
@@ -248,6 +277,8 @@ class SessionManager:
             raise HandlerError(SESSION_BUSY, "session busy")
 
         async with lock:
+            if sid in self._compacting_sessions:
+                raise HandlerError(SESSION_BUSY, "session busy")
             if session.active_run_id is not None:
                 if sid in self._interrupted_sessions:
                     raise HandlerError(SESSION_INTERRUPTED, "session has an interrupted run")
@@ -267,7 +298,71 @@ class SessionManager:
             if session.status == "waiting_for_input":
                 await self._bus.publish(SessionResumedEvent(session_id=sid, ts=_now()))
 
-            self._store.append_message(sid, "user", content)
+            message_id = self._store.append_message(sid, "user", content)
+            classification = _classify_directive(content)
+            current_contract = self._store.read_latest_task_contract(sid)
+            updater_failed = False
+            try:
+                candidate_contract = apply_directive_to_contract(
+                    current_contract,
+                    message_id=message_id,
+                    raw_text=content,
+                    classification=classification,  # type: ignore[arg-type]
+                )
+            except Exception:
+                # Contract reconciliation is best-effort; preserve this correction
+                # verbatim and leave the prior contract action fields below it.
+                updater_failed = True
+                candidate_contract = current_contract
+            if (
+                candidate_contract is not None
+                and (
+                    current_contract is None
+                    or candidate_contract.digest != current_contract.digest
+                )
+            ):
+                self._store.append_task_contract(sid, candidate_contract)
+            covered_digest = (
+                candidate_contract.digest
+                if candidate_contract is not None
+                else (current_contract.digest if current_contract is not None else "")
+            )
+            coverage = (
+                DirectiveCoverageRecord.covered(
+                    message_id=message_id,
+                    semantic_contract_digest=covered_digest,
+                    classification=classification,  # type: ignore[arg-type]
+                    exact_text=content,
+                )
+                if not updater_failed and (
+                    candidate_contract is not None or classification == "steering"
+                )
+                else DirectiveCoverageRecord.unresolved(
+                    message_id=message_id,
+                    semantic_contract_digest=covered_digest,
+                    classification=classification,  # type: ignore[arg-type]
+                    exact_text=content,
+                )
+            )
+            # Any unresolved contract/coverage outcome remains an ordered
+            # verbatim overlay, including updater results that deliberately
+            # decline to produce a candidate (for example unknown directives).
+            # Protecting only exception paths would let such a message become
+            # compactable without a corresponding authority projection.
+            if coverage.coverage_status == "unresolved":
+                self._store.append_pending_directive(
+                    sid,
+                    PendingDirectiveOverlay(
+                        message_id=message_id,
+                        original_order=self._store.next_pending_order(sid),
+                        raw_text=content,
+                        classification=classification,  # type: ignore[arg-type]
+                    ),
+                )
+            # Persist the authority overlay before its coverage marker.  A
+            # crash between the two writes therefore fails closed: the raw
+            # directive remains protected even if coverage is not yet visible.
+            self._store.append_directive_coverage(sid, coverage)
             await self._bus.publish(
                 SessionMessageReceivedEvent(session_id=sid, content=content, ts=_now())
             )
@@ -408,9 +503,11 @@ class SessionManager:
     async def close(self, sid: str) -> None:
         session = self._get_session(sid)
         lock = self._locks[sid]
-        if lock.locked():
+        if lock.locked() or sid in self._compacting_sessions:
             raise HandlerError(SESSION_BUSY, "session busy")
         async with lock:
+            if sid in self._compacting_sessions:
+                raise HandlerError(SESSION_BUSY, "session busy")
             session.status = "closed"
             session.active_run_id = None
             self._interrupted_sessions.discard(sid)
@@ -436,29 +533,165 @@ class SessionManager:
 
     # 手动压缩指定 session 的 thread，将摘要持久化写入 thread.jsonl
     async def compact(self, sid: str, focus: str = "") -> Any:
-        self._get_session(sid)
+        session = self._get_session(sid)
         lock = self._locks[sid]
-        if lock.locked():
+        if lock.locked() or sid in self._compacting_sessions or session.active_run_id is not None:
             raise HandlerError(SESSION_BUSY, "session busy")
         if self._provider is None:
             raise HandlerError(-32020, "provider not available for compaction")
+        from kama_claude.core.llm.gateway import ensure_gateway
+
+        compact_gateway = ensure_gateway(self._provider)
         async with lock:
-            from kama_claude.core.bus.commands import SessionCompactResult
-            from kama_claude.core.compact.compactor import Compactor
-            messages = self._store.read_messages(sid)
+            if (
+                session.active_run_id is not None
+                or sid in self._compacting_sessions
+            ):
+                raise HandlerError(SESSION_BUSY, "session busy")
+            self._compacting_sessions.add(sid)
+            messages = self._store.read_messages_with_metadata(sid)
+            pending_directives = self._store.read_pending_directive_set(sid)
+            base_surface_revision = self._store.read_surface_revision(sid)
+            base_surface_head = self._store.surface_head_id(sid)
+            base_contract = self._store.read_latest_task_contract(sid)
+            base_contract_digest = base_contract.digest if base_contract is not None else ""
+            base_pending_digest = pending_directives.digest()
+            base_pending_watermark = pending_directives.reconciliation_watermark
+
+        from kama_claude.core.bus.commands import SessionCompactResult
+        from kama_claude.core.compact.compactor import Compactor
+        from kama_claude.core.compact.protocol import render_checkpoint_surface_text
+        try:
             session_dir = self._store.session_dir(sid)
-            compactor = Compactor(self._bus, session_dir, sid)
-            result = await compactor.compact_messages(messages, self._provider, focus=focus)
+            compactor = Compactor(
+                self._bus,
+                session_dir,
+                sid,
+                summary_max_tokens=self._compaction_config.summary_max_tokens,
+                tool_result_limit=self._compaction_config.tool_result_limit,
+                tool_result_keep=self._compaction_config.tool_result_keep,
+                recent_tail_ratio=self._compaction_config.recent_tail_ratio,
+                recent_tail_max_tokens=self._compaction_config.recent_tail_max_tokens,
+            )
+            # Expensive provider work runs outside the session mutation lock;
+            # the compacting marker keeps user/run writers out of this window.
+            result = await compactor.compact_messages(
+                messages,
+                compact_gateway,
+                focus=focus,
+                protected_message_ids=(
+                    pending_directives.protected_message_ids()
+                    | self._store.read_uncovered_directive_message_ids(sid)
+                ),
+                surface_revision=base_surface_revision,
+                task_contract=base_contract,
+            )
             if result is None:
                 raise HandlerError(-32021, "compaction failed or not beneficial")
-            self._store.write_compacted(sid, [
-                {"role": "user", "content": result.summary_text},
-                {"role": "assistant", "content": "Understood, I'll continue from this summary."},
-            ])
-            return SessionCompactResult(
-                summary_tokens=result.summary_tokens,
-                saved_tokens=max(0, result.original_token_estimate - result.summary_tokens),
-            )
+            async with lock:
+                if session.active_run_id is not None:
+                    raise HandlerError(SESSION_BUSY, "session busy")
+                current_contract = self._store.read_latest_task_contract(sid)
+                existing_checkpoints = self._store.read_committed_checkpoints(sid)
+                previous_checkpoint = existing_checkpoints[-1] if existing_checkpoints else None
+                checkpoint = compactor.build_checkpoint_envelope(
+                    result,
+                    contract_digest=(current_contract.digest if current_contract else "legacy"),
+                    generation=int(previous_checkpoint.get("generation", 0) or 0) + 1
+                    if previous_checkpoint
+                    else 1,
+                    base_checkpoint_id=(
+                        str(previous_checkpoint.get("transaction_id"))
+                        if previous_checkpoint and previous_checkpoint.get("transaction_id")
+                        else None
+                    ),
+                )
+                current_surface_revision = self._store.read_surface_revision(sid)
+                current_pending = self._store.read_pending_directive_set(sid)
+                current_contract = self._store.read_latest_task_contract(sid)
+                current_contract_digest = (
+                    current_contract.digest if current_contract is not None else ""
+                )
+                current_messages = self._store.read_messages_with_metadata(sid)
+                selected_count = len(messages) - len(result.retained_messages)
+                current_compactable = truncate_tool_results(
+                    current_messages,
+                    limit=self._compaction_config.tool_result_limit,
+                    keep=self._compaction_config.tool_result_keep,
+                )
+                current_span_digest = selected_span_digest(
+                    current_compactable[:selected_count]
+                )
+                current_surface_head = self._store.surface_head_id(sid)
+                if (
+                    current_surface_revision != base_surface_revision
+                    or current_surface_head != base_surface_head
+                    or current_contract_digest != base_contract_digest
+                    or current_pending.digest() != base_pending_digest
+                    or current_pending.reconciliation_watermark
+                    != base_pending_watermark
+                    or current_span_digest != result.selected_span_digest
+                ):
+                    raise HandlerError(SESSION_BUSY, "session surface changed during compaction")
+                if (
+                    compact_gateway.route_epoch != result.route_epoch
+                    or compact_gateway.prefix_epoch != result.prefix_epoch
+                ):
+                    raise HandlerError(
+                        SESSION_BUSY,
+                        "route or prompt prefix changed during compaction",
+                    )
+                target_surface_revision = base_surface_revision + 1
+                # Persist the envelope first: a crash before replacement leaves
+                # raw history plus a re-runnable checkpoint, never a replacement
+                # whose semantic payload is missing.
+                self._store.append_checkpoint(
+                    sid,
+                    checkpoint.to_record(),
+                    atomic_surface_replace=True,
+                )
+                self._store.write_compacted(
+                    sid,
+                    [
+                        {
+                            "role": "user",
+                            "content": render_checkpoint_surface_text(result.summary_text),
+                            "_checkpoint_id": checkpoint.transaction_id,
+                        },
+                        {
+                            "role": "assistant",
+                            "content": "Understood, I'll continue from this summary.",
+                            "_checkpoint_id": checkpoint.transaction_id,
+                        },
+                        *result.retained_messages,
+                    ],
+                    contract_digest=(current_contract.digest if current_contract else ""),
+                    base_surface_revision=base_surface_revision,
+                    surface_revision=target_surface_revision,
+                    checkpoint_id=checkpoint.transaction_id,
+                )
+                self._store.append_surface_state(
+                    sid,
+                    surface_revision=target_surface_revision,
+                    active_head_id=self._store.surface_head_id(sid),
+                    contract_version=(current_contract.version if current_contract else 0),
+                    contract_digest=current_contract_digest,
+                    pending_watermark=current_pending.reconciliation_watermark,
+                    pending_digest=current_pending.digest(),
+                    active_checkpoint_id=checkpoint.transaction_id,
+                    active_checkpoint_status=(
+                        "HISTORICAL_BACKGROUND"
+                        if current_pending.unresolved()
+                        else "ACTIVE_CHECKPOINT"
+                    ),
+                )
+                return SessionCompactResult(
+                    summary_tokens=result.summary_tokens,
+                    saved_tokens=max(0, result.original_token_estimate - result.summary_tokens),
+                )
+        finally:
+            async with lock:
+                self._compacting_sessions.discard(sid)
 
     # 读取指定 session 的完整 thread 历史
     async def get_history(
@@ -476,14 +709,14 @@ class SessionManager:
     async def set_agent_mode(self, sid: str, agent_mode: AgentMode) -> AgentModeSnapshot:
         session = self._get_session(sid)
         lock = self._locks[sid]
-        if lock.locked() or session.active_run_id is not None:
+        if lock.locked() or sid in self._compacting_sessions or session.active_run_id is not None:
             raise HandlerError(SESSION_BUSY, "session busy")
         if session.status == "closed":
             raise HandlerError(SESSION_CLOSED, "session already closed")
         if agent_mode not in ("direct", "plan"):
             raise HandlerError(SESSION_INVALID_MODE, "invalid agent_mode")
         async with lock:
-            if session.active_run_id is not None:
+            if sid in self._compacting_sessions or session.active_run_id is not None:
                 raise HandlerError(SESSION_BUSY, "session busy")
             if str(session.status) == "closed":
                 raise HandlerError(SESSION_CLOSED, "session already closed")
@@ -564,7 +797,11 @@ class SessionManager:
 
         self._get_session(sid)
         lock = self._locks[sid]
+        if sid in self._compacting_sessions:
+            raise HandlerError(SESSION_BUSY, "session busy")
         async with lock:
+            if sid in self._compacting_sessions:
+                raise HandlerError(SESSION_BUSY, "session busy")
             snapshot = await self._approval.resolve(
                 session_id=sid,
                 projection_key=projection_key,
@@ -608,9 +845,11 @@ class SessionManager:
 
         session = self._get_session(sid)
         lock = self._locks[sid]
-        if lock.locked():
+        if lock.locked() or sid in self._compacting_sessions:
             raise HandlerError(SESSION_BUSY, "session busy")
         async with lock:
+            if sid in self._compacting_sessions:
+                raise HandlerError(SESSION_BUSY, "session busy")
             existing = self._store.read_approved_execution_binding(sid, request_id)
             if existing is not None:
                 if existing.projection_key != projection_key:

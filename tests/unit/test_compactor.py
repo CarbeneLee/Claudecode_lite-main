@@ -9,8 +9,17 @@ from kama_claude.core.context import ExecutionContext
 from kama_claude.core.events.bus import EventBus
 from kama_claude.core.llm.types import LlmResponse, UsageStats
 
+_VALID_SUMMARY = (
+    "## 1. Original Goal\nTest\n"
+    "## 2. Completed Steps\n- done\n"
+    "## 3. Key Constraints & Discoveries\n- none\n"
+    "## 4. Current File State\n- unchanged\n"
+    "## 5. Remaining TODOs\n- none\n"
+    "## 6. Critical Data\n- none"
+)
 
-def _stub_provider(summary: str = "## 1. Original Goal\nTest\n## 2. Completed Steps\n- done") -> Any:
+
+def _stub_provider(summary: str = _VALID_SUMMARY) -> Any:
     provider = MagicMock()
     provider.chat = AsyncMock(return_value=LlmResponse(
         stop_reason="end_turn",
@@ -47,7 +56,7 @@ async def test_compact_messages_calls_provider(tmp_path: Path) -> None:
 # 功能：验证 compact_messages 返回的摘要文本来自 provider 响应
 # 设计：stub provider 返回固定摘要字符串，断言 result.summary_text 等于该字符串
 async def test_compact_messages_returns_summary(tmp_path: Path) -> None:
-    expected = "## 1. Original Goal\nDo X\n## 2. Completed\n- step one"
+    expected = _VALID_SUMMARY
     provider = _stub_provider(summary=expected)
     bus = EventBus()
     compactor = Compactor(bus, tmp_path, "sess-1")

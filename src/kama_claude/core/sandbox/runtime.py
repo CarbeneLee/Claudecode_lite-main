@@ -14,7 +14,10 @@ from kama_claude.core.sandbox.errors import (
     SandboxUnavailableError,
     classify_cli_error,
 )
-from kama_claude.core.sandbox.executors import ExecResult
+from kama_claude.core.sandbox.executors import (
+    ExecResult,
+    _drain_process_output,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,7 +35,8 @@ async def _kill_and_reap_group(proc: asyncio.subprocess.Process) -> None:
         except (Exception, asyncio.CancelledError):
             _LOGGER.exception("failed to kill docker subprocess group during cleanup")
     try:
-        await proc.communicate()
+        await _drain_process_output(proc, max_bytes=1 * 1024 * 1024)
+        await proc.wait()
     except (Exception, asyncio.CancelledError):
         _LOGGER.exception("failed to reap docker subprocess during cleanup")
 
@@ -156,7 +160,11 @@ class DockerCliRuntime(ContainerRuntime):
             start_new_session=True,
         )
         try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            out, original_size, raw_truncated = await asyncio.wait_for(
+                _drain_process_output(proc, max_bytes=1 * 1024 * 1024),
+                timeout=timeout,
+            )
+            await proc.wait()
         except TimeoutError:
             await _kill_and_reap_group(proc)
             raise SandboxTimeoutError("sandbox exec timed out") from None
@@ -165,8 +173,11 @@ class DockerCliRuntime(ContainerRuntime):
             raise
         return ExecResult(
             output=out,
-            returncode=proc.returncode or 0,
+            returncode=proc.returncode if proc.returncode is not None else 0,
             timed_out=False,
+            raw_truncated=raw_truncated,
+            original_size=original_size,
+            captured_size=len(out),
         )
 
     # 幂等关闭：删除容器；容器已删或从未创建时直接返回

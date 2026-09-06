@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -17,10 +18,20 @@ from kama_claude.core.execution import (
     ExecutionStatusProjection,
 )
 from kama_claude.core.session.model import Session
+from kama_claude.core.task_contract import directive_text_digest
 
 logger = logging.getLogger(__name__)
 
 MessageContent = str | list[dict[str, Any]]
+_CONTINUATION_BLOCK_TYPES = frozenset(
+    {
+        "thinking",
+        "redacted_thinking",
+        "reasoning",
+        "reasoning_content",
+        "reasoning_item",
+    }
+)
 
 
 # 使用稳定 JSON 编码计算 planning payload 摘要
@@ -102,16 +113,379 @@ class SessionStore:
         content: MessageContent,
         run_id: str | None = None,
         projection_metadata: dict[str, Any] | None = None,
-    ) -> None:
-        row: dict[str, Any] = {"ts": _now(), "role": role, "content": content}
+        *,
+        message_id: str | None = None,
+        unit_id: str | None = None,
+        continuation_state: dict[str, Any] | None = None,
+        record_type: str = "message",
+    ) -> str:
+        row: dict[str, Any] = {
+            "ts": _now(),
+            "record_type": record_type,
+            "role": role,
+            "content": content,
+            "message_id": message_id or f"msg-{uuid.uuid4().hex}",
+        }
         if run_id is not None:
             row["run_id"] = run_id
+        if unit_id is not None:
+            row["unit_id"] = unit_id
+        if continuation_state is not None:
+            row["continuation_state"] = copy.deepcopy(continuation_state)
         if projection_metadata:
             row["projection_metadata"] = dict(projection_metadata)
+        self._append_row(sid, row)
+        return str(row["message_id"])
+
+    # 将任意 typed append-only record fsync 到 session thread
+    def append_record(self, sid: str, record_type: str, payload: dict[str, Any]) -> None:
+        row = {"ts": _now(), "record_type": record_type, **dict(payload)}
+        self._append_row(sid, row)
+
+    # 将单条 row 追加到 thread.jsonl 并刷新到磁盘
+    def _append_row(self, sid: str, row: dict[str, Any]) -> None:
         path = self.session_dir(sid)
         path.mkdir(parents=True, exist_ok=True)
         with (path / "thread.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    # 追加 durable provider continuation state，不把 reasoning 当作普通用户文本
+    def append_continuation_message(
+        self,
+        sid: str,
+        *,
+        role: str,
+        content: MessageContent,
+        continuation_state: dict[str, Any],
+        run_id: str | None = None,
+        unit_id: str | None = None,
+        message_id: str | None = None,
+    ) -> None:
+        self.append_message(
+            sid,
+            role,
+            content,
+            run_id=run_id,
+            message_id=message_id,
+            unit_id=unit_id,
+            continuation_state=continuation_state,
+            record_type="step_commit",
+        )
+
+    # 追加独立 directive coverage record
+    def append_directive_coverage(self, sid: str, record: Any) -> None:
+        payload = {
+            "message_id": record.message_id,
+            "semantic_contract_digest": record.semantic_contract_digest,
+            "classification": record.classification,
+            "exact_text_digest": record.exact_text_digest,
+            "coverage_status": record.coverage_status,
+            "covered_at": record.covered_at,
+        }
+        self.append_record(sid, "directive_coverage", payload)
+
+    # 读取当前 session 的全部 directive coverage records
+    def read_directive_coverage(self, sid: str) -> list[dict[str, Any]]:
+        return [
+            {key: row.get(key) for key in (
+                "message_id",
+                "semantic_contract_digest",
+                "classification",
+                "exact_text_digest",
+                "coverage_status",
+                "covered_at",
+            )}
+            for row in self._read_thread_rows(sid)
+            if row.get("record_type") == "directive_coverage"
+        ]
+
+    # 按 message_id 折叠 coverage 更新，供 compaction 判断消息是否已安全覆盖
+    def read_directive_coverage_state(self, sid: str) -> dict[str, dict[str, Any]]:
+        latest: dict[str, dict[str, Any]] = {}
+        for row in self.read_directive_coverage(sid):
+            message_id = str(row.get("message_id", ""))
+            if message_id:
+                latest[message_id] = row
+        return latest
+
+    # 返回 active surface 中尚未 durable 覆盖的 task-shaping user message IDs
+    def read_uncovered_directive_message_ids(self, sid: str) -> frozenset[str]:
+        coverage = self.read_directive_coverage_state(sid)
+        result: set[str] = set()
+        # Reduce the append-only log to the active projection first.  Looking
+        # only at raw message rows would miss user messages retained inside a
+        # surface_replace replacement and would incorrectly treat them as
+        # covered on the next compaction.
+        for message in self.read_messages_with_metadata(sid):
+            if message.get("role") != "user":
+                continue
+            message_id = str(message.get("_message_id", ""))
+            if not message_id:
+                continue
+            content = message.get("content")
+            if isinstance(content, list) and all(
+                isinstance(block, dict) and block.get("type") == "tool_result"
+                for block in content
+            ):
+                continue
+            record = coverage.get(message_id)
+            raw_text = (
+                content
+                if isinstance(content, str)
+                else json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            )
+            coverage_matches = (
+                isinstance(record, dict)
+                and record.get("exact_text_digest") == directive_text_digest(raw_text)
+            )
+            if (
+                record is None
+                or record.get("coverage_status") == "unresolved"
+                or not coverage_matches
+            ):
+                result.add(message_id)
+        return frozenset(result)
+
+    # 追加 ordered pending directive overlay record
+    def append_pending_directive(self, sid: str, overlay: Any) -> None:
+        self.append_record(
+            sid,
+            "pending_directive",
+            {
+                "message_id": overlay.message_id,
+                "original_order": overlay.original_order,
+                "raw_text": overlay.raw_text,
+                "classification": overlay.classification,
+                "status": overlay.status,
+            },
+        )
+
+    # 追加 pending directive 的 covered/superseded 状态更新，不改写旧记录
+    def resolve_pending_directive(
+        self,
+        sid: str,
+        message_id: str,
+        *,
+        status: str = "covered",
+        watermark: str = "",
+    ) -> None:
+        self.append_record(
+            sid,
+            "pending_directive",
+            {
+                "message_id": message_id,
+                "status": status,
+                "reconciliation_watermark": watermark,
+            },
+        )
+
+    # 读取仍处于 unresolved 状态的 ordered pending directive overlays
+    def read_pending_directives(self, sid: str) -> list[dict[str, Any]]:
+        latest: dict[str, dict[str, Any]] = {}
+        watermark = ""
+        for row in self._read_thread_rows(sid):
+            if row.get("record_type") != "pending_directive":
+                continue
+            if row.get("reconciliation_watermark") not in (None, ""):
+                watermark = str(row["reconciliation_watermark"])
+            message_id = str(row.get("message_id", ""))
+            if message_id:
+                previous = latest.get(message_id, {"message_id": message_id})
+                for key in (
+                    "original_order",
+                    "raw_text",
+                    "classification",
+                    "status",
+                ):
+                    value = row.get(key)
+                    if value not in (None, ""):
+                        previous[key] = value
+                latest[message_id] = previous
+        result = sorted(
+            (item for item in latest.values() if item.get("status", "unresolved") == "unresolved"),
+            key=lambda item: int(item.get("original_order") or 0),
+        )
+        if watermark:
+            for item in result:
+                item["reconciliation_watermark"] = watermark
+        return result
+
+    # 返回当前 session 已分配过的最大 pending 顺序，解析已覆盖项以保持全局用户顺序单调
+    def next_pending_order(self, sid: str) -> int:
+        maximum = -1
+        for row in self._read_thread_rows(sid):
+            if row.get("record_type") != "pending_directive":
+                continue
+            value = row.get("original_order")
+            try:
+                if isinstance(value, (int, str)):
+                    maximum = max(maximum, int(value))
+            except (TypeError, ValueError):
+                continue
+        return maximum + 1
+
+    # 将 durable pending rows 恢复为 ordered PendingDirectiveSet
+    def read_pending_directive_set(self, sid: str) -> Any:
+        from kama_claude.core.task_contract import PendingDirectiveSet
+
+        pending = PendingDirectiveSet()
+        items = self.read_pending_directives(sid)
+        for item in items:
+            pending.add(
+                str(item.get("message_id", "")),
+                str(item.get("raw_text", "")),
+                str(item.get("classification", "unknown")),  # type: ignore[arg-type]
+                original_order=int(item.get("original_order") or 0),
+            )
+        watermark = ""
+        for row in self._read_thread_rows(sid):
+            if row.get("record_type") != "pending_directive":
+                continue
+            value = row.get("reconciliation_watermark")
+            if value not in (None, ""):
+                watermark = str(value)
+        pending.reconciliation_watermark = watermark
+        return pending
+
+    # 追加 checkpoint envelope；metadata 与 semantic payload 分开持久化
+    def append_checkpoint(
+        self,
+        sid: str,
+        envelope: dict[str, Any],
+        *,
+        atomic_surface_replace: bool = False,
+    ) -> None:
+        from kama_claude.core.compact.protocol import CompactionCheckpointEnvelope
+
+        # Validate runtime-owned metadata before it becomes durable; legacy
+        # records are accepted through the envelope compatibility defaults.
+        CompactionCheckpointEnvelope.from_record(envelope)
+        payload = dict(envelope)
+        if atomic_surface_replace:
+            if not envelope.get("transaction_id"):
+                raise ValueError("atomic checkpoint requires transaction_id")
+            # Mark new two-record compactions so a crash after this envelope
+            # but before surface_replace cannot make an orphan checkpoint look
+            # active.  Legacy callers keep the historical standalone behavior.
+            payload["atomic_surface_replace"] = True
+        self.append_record(sid, "checkpoint", payload)
+
+    # 追加 durable TaskContractRecord 的 persistence metadata 与语义字段
+    def append_task_contract(self, sid: str, record: Any) -> None:
+        self.append_record(
+            sid,
+            "task_contract",
+            {
+                "version": record.version,
+                "digest": record.digest,
+                "goal": record.goal,
+                "requirements": list(record.requirements),
+                "constraints": list(record.constraints),
+                "prohibitions": list(record.prohibitions),
+                "acceptance_criteria": list(record.acceptance_criteria),
+                "authorization": list(record.authorization),
+                "source_message_ids": list(record.source_message_ids),
+                "created_at": record.created_at,
+                "transaction_id": record.transaction_id,
+            },
+        )
+
+    # 读取按 version 排序的 TaskContract persistence records
+    def read_task_contracts(self, sid: str) -> list[dict[str, Any]]:
+        records = [
+            dict(row)
+            for row in self._read_thread_rows(sid)
+            if row.get("record_type") == "task_contract"
+        ]
+        return sorted(records, key=lambda row: int(row.get("version") or 0))
+
+    # 读取当前最高版本 TaskContractRecord，缺失时返回 None
+    def read_latest_task_contract(self, sid: str) -> Any:
+        records = self.read_task_contracts(sid)
+        if not records:
+            return None
+        from kama_claude.core.task_contract import TaskContractRecord
+
+        return TaskContractRecord.from_dict(records[-1])
+
+    # 读取 durable checkpoint envelopes，保留 deterministic metadata 与 semantic payload
+    def read_checkpoints(self, sid: str) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in self._read_thread_rows(sid)
+            if row.get("record_type") == "checkpoint"
+        ]
+
+    # 读取当前原子 surface 已提交的 checkpoint，忽略 crash 后未被 replacement 引用的孤儿 envelope
+    def read_committed_checkpoints(self, sid: str) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in self._committed_checkpoint_rows(self._read_thread_rows(sid))
+        ]
+
+    # 根据当前 contract digest 将最新 checkpoint 恢复为 active 或 factual projection
+    def read_checkpoint_projection(
+        self,
+        sid: str,
+        *,
+        current_contract_digest: str = "",
+        pending_unresolved: bool = False,
+    ) -> Any:
+        checkpoints = self._committed_checkpoint_rows(self._read_thread_rows(sid))
+        if not checkpoints:
+            return None
+        latest = checkpoints[-1]
+        payload = self._checkpoint_payload(latest)
+        from kama_claude.core.task_contract import project_checkpoint, project_stale_checkpoint
+
+        normalized_current_digest = current_contract_digest or "legacy"
+        normalized_checkpoint_digest = str(latest.get("contract_digest", "") or "legacy")
+        if pending_unresolved:
+            return project_stale_checkpoint(payload, reason="unresolved user directive")
+
+        return project_checkpoint(
+            payload,
+            checkpoint_contract_digest=normalized_checkpoint_digest,
+            current_contract_digest=normalized_current_digest,
+        )
+
+    # 读取最新 checkpoint envelope，供 runner 重建 active/stale projection 与 CAS identity
+    def read_latest_checkpoint_envelope(self, sid: str) -> Any | None:
+        checkpoints = self._committed_checkpoint_rows(self._read_thread_rows(sid))
+        if not checkpoints:
+            return None
+        from kama_claude.core.compact.protocol import CompactionCheckpointEnvelope
+
+        return CompactionCheckpointEnvelope.from_record(checkpoints[-1])
+
+    # 追加 surface replacement transaction，旧 message 只被 shadow 而非删除
+    def append_surface_replace(
+        self,
+        sid: str,
+        *,
+        shadowed_message_ids: list[str],
+        replacement_messages: list[dict[str, Any]],
+        replacement_contract_digest: str = "",
+        base_surface_revision: int,
+        surface_revision: int,
+        transaction_id: str,
+        checkpoint_required: bool = False,
+    ) -> None:
+        self.append_record(
+            sid,
+            "surface_replace",
+            {
+                "shadowed_message_ids": list(shadowed_message_ids),
+                "replacement_messages": replacement_messages,
+                "replacement_contract_digest": replacement_contract_digest,
+                "base_surface_revision": base_surface_revision,
+                "surface_revision": surface_revision,
+                "transaction_id": transaction_id,
+                "checkpoint_required": checkpoint_required,
+            },
+        )
 
     # 以 projection_key+projection_digest 幂等追加已 committed PlanView thread projection
     def append_plan_projection(
@@ -162,29 +536,357 @@ class SessionStore:
         run_id: str,
     ) -> None:
         for msg in messages:
+            continuation_state = msg.get("continuation_state", msg.get("_continuation_state"))
+            if continuation_state is None:
+                content = msg.get("content")
+                if str(msg.get("role")) == "assistant" and isinstance(content, list):
+                    continuation_blocks = [
+                        block
+                        for block in content
+                        if isinstance(block, dict)
+                        and block.get("type") in _CONTINUATION_BLOCK_TYPES
+                    ]
+                    if continuation_blocks:
+                        from kama_claude.core.llm.types import (
+                            NATIVE_ANTHROPIC_CONTINUATION_POLICY,
+                            ProviderContinuationState,
+                        )
+
+                        continuation_state = ProviderContinuationState.from_thinking_blocks(
+                            continuation_blocks,
+                            policy=NATIVE_ANTHROPIC_CONTINUATION_POLICY,
+                            protocol="anthropic",
+                        ).to_dict()
             self.append_message(
                 sid,
                 role=str(msg["role"]),
                 content=msg["content"],
                 run_id=run_id,
+                message_id=(str(msg["message_id"]) if msg.get("message_id") else None),
+                unit_id=(
+                    str(msg.get("unit_id", msg.get("_unit_id")))
+                    if msg.get("unit_id", msg.get("_unit_id"))
+                    else None
+                ),
+                continuation_state=(
+                    dict(continuation_state)
+                    if isinstance(continuation_state, dict)
+                    else None
+                ),
+                record_type="step_commit",
             )
 
     # 读取完整 thread 并返回可直接传给 Anthropic 的 messages
-    def read_messages(self, sid: str) -> list[dict[str, Any]]:
-        messages = [
-            {"role": row["role"], "content": row.get("content", "")}
-            for row in self._read_thread_rows(sid)
+    def read_messages(
+        self,
+        sid: str,
+        *,
+        include_internal_metadata: bool = False,
+        tool_result_limit: int | None = 8_000,
+        tool_result_keep: int = 4_000,
+    ) -> list[dict[str, Any]]:
+        rows = self._read_thread_rows(sid)
+        contract_rows = [
+            row for row in rows if row.get("record_type") == "task_contract"
         ]
+        current_contract_digest = (
+            str(contract_rows[-1].get("digest", "")) if contract_rows else ""
+        )
+        pending_unresolved = bool(self.read_pending_directives(sid))
+        stale_background: list[dict[str, Any]] = []
+        checkpoint_rows = self._committed_checkpoint_rows(rows)
+        if checkpoint_rows:
+            row = checkpoint_rows[-1]
+            checkpoint_digest = str(row.get("contract_digest", ""))
+            payload = self._checkpoint_payload(row)
+            stale = pending_unresolved or (
+                (checkpoint_digest or "legacy") != (current_contract_digest or "legacy")
+            )
+            if isinstance(payload, dict) and stale:
+                from kama_claude.core.task_contract import project_stale_checkpoint
+
+                projection = project_stale_checkpoint(
+                    payload,
+                    reason=(
+                        "unresolved user directive"
+                        if pending_unresolved
+                        else "contract digest changed"
+                    ),
+                )
+                stale_background.append(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            projection.framing
+                            + "\n"
+                            + json.dumps(projection.facts, ensure_ascii=False, sort_keys=True)
+                        ),
+                    }
+                )
+        ordered: list[tuple[str, dict[str, Any]]] = []
+        available_checkpoint_ids: set[str] = set()
+        for row in rows:
+            record_type = row.get("record_type")
+            if record_type == "checkpoint":
+                transaction_id = row.get("transaction_id")
+                if transaction_id:
+                    available_checkpoint_ids.add(str(transaction_id))
+                continue
+            if record_type in {
+                "directive_coverage",
+                "pending_directive",
+                "task_contract",
+                "checkpoint",
+                "surface_state",
+            }:
+                continue
+            if record_type == "surface_replace":
+                replacement_messages = row.get("replacement_messages", [])
+                # A checkpoint-marked replacement is a two-record commit.  If
+                # the process crashed after the replacement row but before its
+                # envelope, leave the raw surface active and let the next run
+                # retry compaction instead of replaying a partial replacement.
+                if not self._replacement_is_committed(
+                    row,
+                    available_checkpoint_ids,
+                ):
+                    continue
+                shadowed = {str(item) for item in row.get("shadowed_message_ids", [])}
+                first_index = next(
+                    (
+                        index
+                        for index, (message_id, _) in enumerate(ordered)
+                        if message_id in shadowed
+                    ),
+                    len(ordered),
+                )
+                ordered = [
+                    item for item in ordered if item[0] not in shadowed
+                ]
+                replacements = replacement_messages
+                # Any stale background (contract mismatch or unresolved user directive)
+                # suppresses the replacement's action-oriented summary. Facts are
+                # projected separately above, so old next_step/pending text cannot
+                # remain active merely because its digest matches the current contract.
+                replacement_is_stale = bool(stale_background)
+                if isinstance(replacements, list):
+                    replacement_rows: list[tuple[str, dict[str, Any]]] = []
+                    for replacement_index, message in enumerate(replacements):
+                        if not isinstance(message, dict) or message.get("role") not in {
+                            "user",
+                            "assistant",
+                        }:
+                            continue
+                        if replacement_is_stale and (
+                            message.get("checkpoint_id")
+                            or message.get("checkpoint_message")
+                            or str(message.get("message_id", "")).startswith(
+                                "checkpoint-"
+                            )
+                        ):
+                            continue
+                        # Legacy replacement rows may lack message_id.  Derive a
+                        # deterministic fallback from their transaction/index so
+                        # replay does not change active_head identity on every read.
+                        raw_replacement_id = message.get("message_id")
+                        replacement_id = (
+                            str(raw_replacement_id)
+                            if raw_replacement_id
+                            else "replacement-"
+                            f"{row.get('transaction_id', 'legacy')}-"
+                            f"{replacement_index}"
+                        )
+                        replacement_rows.append(
+                            (
+                                replacement_id,
+                                self._provider_message_from_row(
+                                    message,
+                                    include_internal_metadata=include_internal_metadata,
+                                ),
+                            )
+                        )
+                    ordered[first_index:first_index] = replacement_rows
+                continue
+            message_id = str(row.get("message_id", f"legacy-{len(ordered)}"))
+            ordered.append(
+                (
+                    message_id,
+                    self._provider_message_from_row(
+                        row,
+                        include_internal_metadata=include_internal_metadata,
+                    ),
+                )
+            )
+        # 历史 facts 放在当前 raw surface 之前，避免它看起来像最新用户指令
+        messages = stale_background + [message for _, message in ordered]
 
         messages = self._trim_orphan_tool_use(messages)
+        if tool_result_limit is None:
+            return messages
         from kama_claude.core.compact.budget import truncate_tool_results
-        return truncate_tool_results(messages)
+        return truncate_tool_results(
+            messages,
+            limit=max(1, tool_result_limit),
+            keep=max(1, min(tool_result_keep, tool_result_limit)),
+        )
+
+    # 为 runner 提供带 continuation/unit metadata 的内部回放消息，公共 history 默认不暴露这些字段
+    def read_messages_with_metadata(self, sid: str) -> list[dict[str, Any]]:
+        # Runner owns the model ingress budget; preserve durable raw receipts here.
+        return self.read_messages(
+            sid,
+            include_internal_metadata=True,
+            tool_result_limit=None,
+        )
+
+    # 将 durable message row 投影为 provider 消息，并按需携带内部 continuation metadata
+    @staticmethod
+    def _provider_message_from_row(
+        row: dict[str, Any],
+        *,
+        include_internal_metadata: bool,
+    ) -> dict[str, Any]:
+        message: dict[str, Any] = {
+            "role": row["role"],
+            "content": row.get("content", ""),
+        }
+        if include_internal_metadata:
+            if row.get("message_id"):
+                message["_message_id"] = str(row["message_id"])
+            if row.get("unit_id"):
+                message["_unit_id"] = str(row["unit_id"])
+            continuation_state = row.get("continuation_state")
+            if isinstance(continuation_state, dict):
+                message["_continuation_state"] = copy.deepcopy(continuation_state)
+            if row.get("checkpoint_id"):
+                message["_checkpoint_id"] = str(row["checkpoint_id"])
+        return message
 
     # 读取供 TUI 使用的 projection metadata；不作为 provider message 输入
     def read_history_projection(self, sid: str) -> list[dict[str, Any]]:
-        projected: list[dict[str, Any]] = []
-        for row in self._read_thread_rows(sid):
+        rows = self._read_thread_rows(sid)
+        contract_rows = [row for row in rows if row.get("record_type") == "task_contract"]
+        current_contract_digest = (
+            str(contract_rows[-1].get("digest", "")) if contract_rows else ""
+        )
+        pending_unresolved = bool(self.read_pending_directives(sid))
+        stale_checkpoint = False
+        historical_projection: list[dict[str, Any]] = []
+        if rows:
+            checkpoint_rows = self._committed_checkpoint_rows(rows)
+            if checkpoint_rows:
+                latest_checkpoint = checkpoint_rows[-1]
+                stale_checkpoint = pending_unresolved or (
+                    (
+                        str(latest_checkpoint.get("contract_digest", ""))
+                        or "legacy"
+                    )
+                    != (current_contract_digest or "legacy")
+                )
+                payload = self._checkpoint_payload(latest_checkpoint)
+                if stale_checkpoint and isinstance(payload, dict):
+                    from kama_claude.core.task_contract import project_stale_checkpoint
+
+                    projection = project_stale_checkpoint(
+                        payload,
+                        reason=(
+                            "unresolved user directive"
+                            if pending_unresolved
+                            else "contract digest changed"
+                        ),
+                    )
+                    historical_projection.append(
+                        {
+                            "role": "assistant",
+                            "content": (
+                                projection.framing
+                                + "\n"
+                                + json.dumps(projection.facts, ensure_ascii=False, sort_keys=True)
+                            ),
+                            "projection_metadata": {"projection_kind": "historical_checkpoint"},
+                        }
+                    )
+        ordered: list[tuple[str, dict[str, Any]]] = []
+        available_checkpoint_ids: set[str] = set()
+        for row in rows:
+            record_type = row.get("record_type")
+            if record_type == "checkpoint":
+                transaction_id = row.get("transaction_id")
+                if transaction_id:
+                    available_checkpoint_ids.add(str(transaction_id))
+                continue
+            if record_type in {
+                "directive_coverage",
+                "pending_directive",
+                "task_contract",
+                "checkpoint",
+                "surface_state",
+            }:
+                continue
+            if record_type == "surface_replace":
+                replacement_messages = row.get("replacement_messages", [])
+                if not self._replacement_is_committed(
+                    row,
+                    available_checkpoint_ids,
+                ):
+                    continue
+                shadowed = {str(item) for item in row.get("shadowed_message_ids", [])}
+                first_index = next(
+                    (
+                        index
+                        for index, (message_id, _) in enumerate(ordered)
+                        if message_id in shadowed
+                    ),
+                    len(ordered),
+                )
+                ordered = [item for item in ordered if item[0] not in shadowed]
+                replacements = replacement_messages
+                if isinstance(replacements, list):
+                    replacement_rows: list[tuple[str, dict[str, Any]]] = []
+                    for replacement_index, message in enumerate(replacements):
+                        if not isinstance(message, dict) or message.get("role") not in {
+                            "user",
+                            "assistant",
+                        }:
+                            continue
+                        if stale_checkpoint and (
+                            message.get("checkpoint_id")
+                            or message.get("checkpoint_message")
+                            or str(message.get("message_id", "")).startswith(
+                                "checkpoint-"
+                            )
+                        ):
+                            continue
+                        raw_replacement_id = message.get("message_id")
+                        replacement_id = (
+                            str(raw_replacement_id)
+                            if raw_replacement_id
+                            else "replacement-"
+                            f"{row.get('transaction_id', 'legacy')}-"
+                            f"{replacement_index}"
+                        )
+                        replacement_rows.append(
+                            (
+                                replacement_id,
+                                {
+                                    "role": message["role"],
+                                    "content": self._visible_history_content(
+                                        message.get("role", ""),
+                                        message.get("content", ""),
+                                    ),
+                                },
+                            )
+                        )
+                    ordered[first_index:first_index] = replacement_rows
+                continue
             message = {"role": row["role"], "content": row.get("content", "")}
+            if message["role"] == "assistant" and isinstance(message["content"], list):
+                message["content"] = [
+                    block
+                    for block in message["content"]
+                    if isinstance(block, dict)
+                    and block.get("type") not in _CONTINUATION_BLOCK_TYPES
+                ]
             metadata = row.get("projection_metadata")
             if isinstance(metadata, dict):
                 message["projection_metadata"] = {
@@ -204,8 +906,20 @@ class SessionStore:
                     )
                     if key in metadata
                 }
-            projected.append(message)
-        return projected
+            ordered.append((str(row.get("message_id", f"legacy-{len(ordered)}")), message))
+        return historical_projection + [message for _, message in ordered]
+
+    # 从 assistant history projection 隐去 provider reasoning，保留 user/tool 可见块
+    @staticmethod
+    def _visible_history_content(role: object, content: object) -> object:
+        if role != "assistant" or not isinstance(content, list):
+            return copy.deepcopy(content)
+        return [
+            copy.deepcopy(block)
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") not in _CONTINUATION_BLOCK_TYPES
+        ]
 
     # 读取并校验 thread 原始行，统一过滤损坏行和未知 role
     def _read_thread_rows(self, sid: str) -> list[dict[str, Any]]:
@@ -222,6 +936,17 @@ class SessionStore:
                 logger.warning("skip broken thread row sid=%s line=%s", sid, line_no)
                 continue
             role = row.get("role")
+            record_type = row.get("record_type", "message")
+            if record_type in {
+                "directive_coverage",
+                "pending_directive",
+                "task_contract",
+                "checkpoint",
+                "surface_replace",
+                "surface_state",
+            }:
+                rows.append(row)
+                continue
             if role not in ("user", "assistant"):
                 logger.warning(
                     "skip unknown thread role sid=%s line=%s role=%s",
@@ -230,8 +955,101 @@ class SessionStore:
                     role,
                 )
                 continue
+            if not row.get("message_id"):
+                row["message_id"] = f"legacy-{sid}-{line_no}"
             rows.append(row)
         return rows
+
+    # 返回 replacement row 中引用的 checkpoint transaction IDs
+    @staticmethod
+    def _replacement_checkpoint_ids(row: dict[str, Any]) -> frozenset[str]:
+        replacements = row.get("replacement_messages", [])
+        if not isinstance(replacements, list):
+            return frozenset()
+        return frozenset(
+            str(message.get("checkpoint_id"))
+            for message in replacements
+            if isinstance(message, dict) and message.get("checkpoint_id")
+        )
+
+    # 从 envelope 或 legacy 顶层字段提取 checkpoint semantic payload
+    @staticmethod
+    def _checkpoint_payload(row: dict[str, Any]) -> dict[str, Any]:
+        payload = row.get("payload")
+        if isinstance(payload, dict):
+            return dict(payload)
+        return {
+            key: row.get(key)
+            for key in (
+                "progress",
+                "current_work",
+                "decisions",
+                "files_or_code",
+                "errors_or_evidence",
+                "pending",
+                "next_step",
+                "critical_context",
+            )
+            if key in row
+        }
+
+    # 只接受已经看到 checkpoint envelope 的原子 replacement，崩溃半提交时 fail closed
+    @classmethod
+    def _replacement_is_committed(
+        cls,
+        row: dict[str, Any],
+        available_checkpoint_ids: set[str],
+    ) -> bool:
+        if row.get("checkpoint_required") is not True:
+            return True
+        checkpoint_ids = cls._replacement_checkpoint_ids(row)
+        return bool(checkpoint_ids) and checkpoint_ids <= available_checkpoint_ids
+
+    # 过滤尚未被原子 surface replacement 引用的 checkpoint；无 atomic 标记时兼容 legacy rows
+    @classmethod
+    def _committed_checkpoint_rows(
+        cls,
+        rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        checkpoint_rows = [
+            row for row in rows if row.get("record_type") == "checkpoint"
+        ]
+        if not checkpoint_rows:
+            return []
+        has_atomic_replacement = any(
+            (
+                row.get("record_type") == "surface_replace"
+                and row.get("checkpoint_required") is True
+            )
+            or (
+                row.get("record_type") == "checkpoint"
+                and row.get("atomic_surface_replace") is True
+            )
+            for row in rows
+        )
+        if not has_atomic_replacement:
+            # Old sessions wrote checkpoint metadata without a two-record commit.
+            # Preserve that replay behavior until a new atomic replacement exists.
+            return checkpoint_rows
+        available_checkpoint_ids: set[str] = set()
+        committed_ids: set[str] = set()
+        for row in rows:
+            record_type = row.get("record_type")
+            if record_type == "checkpoint":
+                transaction_id = row.get("transaction_id")
+                if transaction_id:
+                    available_checkpoint_ids.add(str(transaction_id))
+            elif record_type == "surface_replace" and cls._replacement_is_committed(
+                row,
+                available_checkpoint_ids,
+            ):
+                committed_ids.update(cls._replacement_checkpoint_ids(row))
+        return [
+            row
+            for row in checkpoint_rows
+            if str(row.get("transaction_id", "")) in committed_ids
+            or row.get("atomic_surface_replace") is not True
+        ]
 
     # 裁掉尾部未配对 tool_use 以及其后的消息，避免 Anthropic messages.invalid
     def _trim_orphan_tool_use(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -255,17 +1073,233 @@ class SessionStore:
             return messages[:last_balanced]
         return messages
 
-    # 将压缩后的消息对覆盖写入 thread.jsonl，原文件备份为 thread_<ts>.jsonl.bak
-    def write_compacted(self, sid: str, messages: list[dict[str, Any]]) -> None:
-        path = self.session_dir(sid) / "thread.jsonl"
-        ts_str = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-        bak = self.session_dir(sid) / f"thread_{ts_str}.jsonl.bak"
-        if path.exists():
-            path.rename(bak)
-        with path.open("w", encoding="utf-8") as f:
-            for msg in messages:
-                row: dict[str, Any] = {"ts": _now(), "role": msg["role"], "content": msg["content"]}
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    # 读取 append-only surface replacement 的最高 revision，缺失时从零开始
+    def read_surface_revision(self, sid: str) -> int:
+        rows = self._read_thread_rows(sid)
+        revisions: list[int] = []
+        available_checkpoint_ids: set[str] = set()
+        for row in rows:
+            record_type = row.get("record_type")
+            if record_type == "checkpoint":
+                transaction_id = row.get("transaction_id")
+                if transaction_id:
+                    available_checkpoint_ids.add(str(transaction_id))
+                continue
+            if record_type == "surface_replace" and not self._replacement_is_committed(
+                row,
+                available_checkpoint_ids,
+            ):
+                continue
+            if record_type not in {"surface_replace", "surface_state"}:
+                continue
+            value = row.get("surface_revision")
+            if isinstance(value, (int, str)):
+                try:
+                    revisions.append(int(value))
+                except ValueError:
+                    continue
+        return max(revisions, default=0)
+
+    # 追加当前 semantic surface revision，供 daemon 重启后恢复 CAS 身份
+    def append_surface_state(
+        self,
+        sid: str,
+        *,
+        surface_revision: int,
+        active_head_id: str | None,
+        contract_version: int = 0,
+        contract_digest: str = "",
+        pending_watermark: str = "",
+        pending_digest: str = "",
+        active_checkpoint_id: str | None = None,
+        active_checkpoint_status: str = "NONE",
+    ) -> None:
+        self.append_record(
+            sid,
+            "surface_state",
+            {
+                "surface_revision": surface_revision,
+                "active_head_id": active_head_id,
+                "contract_version": contract_version,
+                "contract_digest": contract_digest,
+                "pending_watermark": pending_watermark,
+                "pending_digest": pending_digest,
+                "active_checkpoint_id": active_checkpoint_id,
+                "active_checkpoint_status": active_checkpoint_status,
+            },
+        )
+
+    # 读取最近一次 durable surface metadata；不存在时返回空值
+    def read_surface_state(self, sid: str) -> dict[str, Any] | None:
+        latest: dict[str, Any] | None = None
+        for row in self._read_thread_rows(sid):
+            if row.get("record_type") == "surface_state":
+                latest = dict(row)
+        return latest
+
+    # 计算当前 provider message surface 的稳定 head，排除内部身份元数据
+    def surface_head_id(self, sid: str) -> str | None:
+        messages = self.read_messages_with_metadata(sid)
+        if not messages:
+            return None
+        canonical: list[dict[str, Any]] = []
+        for message in messages:
+            item = copy.deepcopy(message)
+            raw_continuation = item.get("_continuation_state")
+            if (
+                item.get("role") == "assistant"
+                and isinstance(raw_continuation, dict)
+                and not isinstance(item.get("content"), list)
+            ):
+                # Match ExecutionContext's restart canonicalization: a legacy
+                # text row plus durable continuation blocks is one provider
+                # assistant content sequence for surface identity purposes.
+                from kama_claude.core.llm.types import ProviderContinuationState
+
+                state = ProviderContinuationState.from_dict(raw_continuation)
+                item["content"] = [
+                    *state.as_blocks(),
+                    {"type": "text", "text": str(item.get("content", ""))},
+                ]
+            elif item.get("role") == "assistant" and isinstance(raw_continuation, dict):
+                # A durable state is authoritative over any legacy visible
+                # thinking blocks embedded in the content list.
+                from kama_claude.core.llm.types import ProviderContinuationState
+
+                state = ProviderContinuationState.from_dict(raw_continuation)
+                blocks = item["content"]
+                if isinstance(blocks, list):
+                    item["content"] = [
+                        *state.as_blocks(),
+                        *[
+                            block
+                            for block in blocks
+                            if not (
+                                isinstance(block, dict)
+                                and block.get("type") in _CONTINUATION_BLOCK_TYPES
+                            )
+                        ],
+                    ]
+            for key in ("_message_id", "_unit_id", "_checkpoint_id"):
+                item.pop(key, None)
+            item.pop("_continuation_state", None)
+            canonical.append(item)
+        encoded = json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    # 以 append-only surface_replace 记录覆盖当前 provider surface，不删除旧 transcript
+    def write_compacted(
+        self,
+        sid: str,
+        messages: list[dict[str, Any]],
+        *,
+        contract_digest: str = "",
+        base_surface_revision: int | None = None,
+        surface_revision: int | None = None,
+        checkpoint_id: str | None = None,
+    ) -> None:
+        rows = self._read_thread_rows(sid)
+        current_surface_revision = self.read_surface_revision(sid)
+        expected_base = (
+            current_surface_revision
+            if base_surface_revision is None
+            else base_surface_revision
+        )
+        if expected_base != current_surface_revision:
+            raise ValueError("surface revision conflict")
+        next_surface_revision = (
+            expected_base + 1 if surface_revision is None else surface_revision
+        )
+        if next_surface_revision <= expected_base:
+            raise ValueError("surface revision must advance")
+        existing_ids = [
+            str(row.get("message_id"))
+            for row in rows
+            if row.get("role") in {"user", "assistant"} and row.get("message_id")
+        ]
+        for row in rows:
+            if row.get("record_type") != "surface_replace":
+                continue
+            replacements = row.get("replacement_messages", [])
+            if isinstance(replacements, list):
+                existing_ids.extend(
+                    str(message["message_id"])
+                    for message in replacements
+                    if isinstance(message, dict) and message.get("message_id")
+                )
+        replacement: list[dict[str, Any]] = []
+        transaction_id = f"compact-{uuid.uuid4().hex}"
+        for msg in messages:
+            # Retained raw units keep their durable IDs; only newly-created
+            # checkpoint summary/ack rows receive synthetic checkpoint IDs.
+            retained_id = msg.get("message_id", msg.get("_message_id"))
+            message_id = (
+                str(retained_id)
+                if retained_id not in (None, "")
+                else f"checkpoint-{uuid.uuid4().hex}"
+            )
+            checkpoint_marker = (
+                str(msg["_checkpoint_id"])
+                if msg.get("_checkpoint_id")
+                else (
+                    checkpoint_id
+                    if checkpoint_id is not None and retained_id in (None, "")
+                    else None
+                )
+            )
+            replacement.append(
+                {
+                    "message_id": message_id,
+                    "role": msg["role"],
+                    "content": msg["content"],
+                    **(
+                        {"checkpoint_message": True}
+                        if retained_id in (None, "")
+                        else {}
+                    ),
+                    **(
+                        {"checkpoint_id": checkpoint_marker}
+                        if checkpoint_marker is not None
+                        else {}
+                    ),
+                **(
+                    {"unit_id": str(msg["_unit_id"])}
+                    if msg.get("_unit_id")
+                    else ({"unit_id": str(msg["unit_id"])} if msg.get("unit_id") else {})
+                ),
+                **(
+                    {"continuation_state": copy.deepcopy(msg["_continuation_state"])}
+                    if isinstance(msg.get("_continuation_state"), dict)
+                    else (
+                        {"continuation_state": copy.deepcopy(msg["continuation_state"])}
+                        if isinstance(msg.get("continuation_state"), dict)
+                        else {}
+                    )
+                ),
+                }
+            )
+        self.append_surface_replace(
+            sid,
+            shadowed_message_ids=existing_ids,
+            replacement_messages=replacement,
+            replacement_contract_digest=contract_digest,
+            base_surface_revision=expected_base,
+            surface_revision=next_surface_revision,
+            transaction_id=transaction_id,
+            checkpoint_required=bool(
+                checkpoint_id
+                or any(
+                    isinstance(msg, dict) and msg.get("_checkpoint_id")
+                    for msg in messages
+                )
+            ),
+        )
 
     # 读取 notes.md 全文，文件不存在时返回空字符串
     def read_notes(self, sid: str) -> str:

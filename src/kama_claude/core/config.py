@@ -118,9 +118,32 @@ class PermissionConfig:
 
 @dataclass
 class CompactionConfig:
-    auto_threshold: float = 0.0    # 0 表示禁用自动压缩，推荐用手动 /compact
+    auto_threshold: float = 0.0    # legacy override；新配置默认使用 soft_trigger_ratio
+    auto_compact: bool = True      # 新配置默认启用 model-aware proactive compaction
+    soft_trigger_ratio: float = 0.80
+    target_ratio: float = 0.60
+    recent_tail_ratio: float = 0.10
+    recent_tail_max_tokens: int = 64 * 1024
+    summary_max_tokens: int = 4_096
     tool_result_limit: int = 8_000  # tool_result 截断触发字符数
     tool_result_keep: int = 4_000   # 截断后保留的前缀字符数
+
+    # 返回是否允许 AgentLoop 执行 proactive compaction
+    @property
+    def proactive_enabled(self) -> bool:
+        return self.auto_compact
+
+    # 解析 legacy threshold 与新 soft trigger 的统一运行时阈值
+    @property
+    def effective_soft_trigger_ratio(self) -> float:
+        if self.auto_threshold > 0:
+            return self.auto_threshold
+        return self.soft_trigger_ratio
+
+    # 兼容旧调用方，同时明确 auto_compact=false 只关闭 proactive compaction
+    @property
+    def effective_threshold(self) -> float:
+        return self.effective_soft_trigger_ratio if self.proactive_enabled else 0.0
 
 
 @dataclass
@@ -308,6 +331,12 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
             raise SystemExit("Config error: [compaction] must be a table")
         unknown_comp: set[str] = set(comp.keys()) - {
             "auto_threshold",
+            "auto_compact",
+            "soft_trigger_ratio",
+            "target_ratio",
+            "recent_tail_ratio",
+            "recent_tail_max_tokens",
+            "summary_max_tokens",
             "tool_result_limit",
             "tool_result_keep",
         }
@@ -318,6 +347,31 @@ def _apply_toml(config: KamaConfig, data: dict[str, Any]) -> None:
             if not isinstance(val, (int, float)) or not (0.0 <= val <= 1.0):
                 raise SystemExit("Config error: compaction.auto_threshold must be between 0 and 1")
             config.compaction.auto_threshold = float(val)
+            # Legacy config files used zero as an explicit opt-out; retain that
+            # meaning unless the file also opts back in with auto_compact=true.
+            if float(val) == 0.0 and "auto_compact" not in comp:
+                config.compaction.auto_compact = False
+        if "auto_compact" in comp:
+            val = comp["auto_compact"]
+            if not isinstance(val, bool):
+                raise SystemExit("Config error: compaction.auto_compact must be a boolean")
+            config.compaction.auto_compact = val
+        for key in ("soft_trigger_ratio", "target_ratio", "recent_tail_ratio"):
+            if key in comp:
+                val = comp[key]
+                if not isinstance(val, (int, float)) or not (0.0 < float(val) < 1.0):
+                    raise SystemExit(f"Config error: compaction.{key} must be between 0 and 1")
+                setattr(config.compaction, key, float(val))
+        if config.compaction.target_ratio >= config.compaction.effective_soft_trigger_ratio:
+            raise SystemExit(
+                "Config error: compaction.target_ratio must be below soft_trigger_ratio"
+            )
+        for key in ("recent_tail_max_tokens", "summary_max_tokens"):
+            if key in comp:
+                val = comp[key]
+                if not isinstance(val, int) or val <= 0:
+                    raise SystemExit(f"Config error: compaction.{key} must be positive")
+                setattr(config.compaction, key, val)
         if "tool_result_limit" in comp:
             val = comp["tool_result_limit"]
             if not isinstance(val, int) or val <= 0:
@@ -551,10 +605,102 @@ def _apply_env(config: KamaConfig) -> None:
                     f" got: {compact_threshold!r}"
                 )
             config.compaction.auto_threshold = compact_threshold_val
+            if compact_threshold_val == 0.0 and "KAMA_AUTO_COMPACT" not in os.environ:
+                config.compaction.auto_compact = False
         except ValueError:
             raise SystemExit(
                 f"Config error: KAMA_COMPACT_THRESHOLD must be a number, got: {compact_threshold!r}"
             )
+
+    compact_auto = os.environ.get("KAMA_AUTO_COMPACT")
+    if compact_auto is not None:
+        config.compaction.auto_compact = compact_auto.lower() not in ("0", "false", "no")
+
+    compact_soft = os.environ.get("KAMA_COMPACT_SOFT_TRIGGER_RATIO")
+    compact_soft_value: float | None = None
+    if compact_soft is not None:
+        try:
+            compact_soft_value = float(compact_soft)
+        except ValueError:
+            raise SystemExit(
+                "Config error: KAMA_COMPACT_SOFT_TRIGGER_RATIO must be a number,"
+                f" got: {compact_soft!r}"
+            )
+        if not 0.0 < compact_soft_value <= 1.0:
+            raise SystemExit(
+                "Config error: KAMA_COMPACT_SOFT_TRIGGER_RATIO must be between 0 and 1"
+            )
+    effective_soft = (
+        compact_soft_value
+        if compact_soft_value is not None
+        else config.compaction.effective_soft_trigger_ratio
+    )
+
+    compact_target = os.environ.get("KAMA_COMPACT_TARGET_RATIO")
+    if compact_target is not None:
+        try:
+            target = float(compact_target)
+        except ValueError:
+            raise SystemExit(
+                f"Config error: KAMA_COMPACT_TARGET_RATIO must be a number, got: {compact_target!r}"
+            )
+        if not 0.0 < target < effective_soft:
+            raise SystemExit(
+                "Config error: KAMA_COMPACT_TARGET_RATIO must be below soft trigger"
+            )
+        config.compaction.target_ratio = target
+
+    if compact_soft_value is not None:
+        if config.compaction.target_ratio >= compact_soft_value:
+            raise SystemExit(
+                "Config error: KAMA_COMPACT_SOFT_TRIGGER_RATIO must be above target"
+            )
+        config.compaction.soft_trigger_ratio = compact_soft_value
+
+    compact_tail_ratio = os.environ.get("KAMA_COMPACT_RECENT_TAIL_RATIO")
+    if compact_tail_ratio is not None:
+        try:
+            tail_ratio = float(compact_tail_ratio)
+        except ValueError:
+            raise SystemExit(
+                "Config error: KAMA_COMPACT_RECENT_TAIL_RATIO must be a number,"
+                f" got: {compact_tail_ratio!r}"
+            )
+        if not 0.0 < tail_ratio < 1.0:
+            raise SystemExit(
+                "Config error: KAMA_COMPACT_RECENT_TAIL_RATIO must be between 0 and 1"
+            )
+        config.compaction.recent_tail_ratio = tail_ratio
+
+    compact_tail_max = os.environ.get("KAMA_COMPACT_RECENT_TAIL_MAX_TOKENS")
+    if compact_tail_max is not None:
+        try:
+            tail_max = int(compact_tail_max)
+        except ValueError:
+            raise SystemExit(
+                "Config error: KAMA_COMPACT_RECENT_TAIL_MAX_TOKENS must be an integer,"
+                f" got: {compact_tail_max!r}"
+            )
+        if tail_max <= 0:
+            raise SystemExit(
+                "Config error: KAMA_COMPACT_RECENT_TAIL_MAX_TOKENS must be positive"
+            )
+        config.compaction.recent_tail_max_tokens = tail_max
+
+    compact_summary_max = os.environ.get("KAMA_COMPACT_SUMMARY_MAX_TOKENS")
+    if compact_summary_max is not None:
+        try:
+            summary_max = int(compact_summary_max)
+        except ValueError:
+            raise SystemExit(
+                "Config error: KAMA_COMPACT_SUMMARY_MAX_TOKENS must be an integer,"
+                f" got: {compact_summary_max!r}"
+            )
+        if summary_max <= 0:
+            raise SystemExit(
+                "Config error: KAMA_COMPACT_SUMMARY_MAX_TOKENS must be positive"
+            )
+        config.compaction.summary_max_tokens = summary_max
 
     compact_tool_limit = os.environ.get("KAMA_COMPACT_TOOL_LIMIT")
     if compact_tool_limit is not None:

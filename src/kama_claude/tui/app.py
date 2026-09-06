@@ -912,10 +912,15 @@ class KamaTuiApp(App[None]):
                     exclusive=False,
                 )
             return
-        if content == "/compact":
+        if content == "/compact" or content.startswith("/compact "):
             event.text_area.text = ""
             if self._client is not None and self._session_id is not None and not self._busy:
-                self.run_worker(self._do_compact(), name="compact", exclusive=False)
+                focus = content[len("/compact"):].strip()
+                self.run_worker(
+                    self._do_compact(focus),
+                    name="compact",
+                    exclusive=False,
+                )
             return
         if self._client is None or self._session_id is None or self._busy:
             self._append(Static("[yellow]agent busy or disconnected[/yellow]", classes="log-line"))
@@ -1027,21 +1032,27 @@ class KamaTuiApp(App[None]):
             self._append(Static("[red]mode command failed[/red]", classes="log-line"))
 
     # 在 worker 中执行手动压缩命令，完成后显示结果横幅
-    async def _do_compact(self) -> None:
+    async def _do_compact(self, focus: str = "") -> None:
         if self._client is None or self._session_id is None:
             return
         self._append(Static("[dim]⚡ compacting context...[/dim]", classes="log-line"))
         try:
             result = await self._client.send_command(
                 "session.compact",
-                {"session_id": self._session_id, "focus": ""},
+                {"session_id": self._session_id, "focus": focus},
             )
             summary_tokens = result.get("summary_tokens", 0)
             saved_tokens = result.get("saved_tokens", 0)
-            self._last_context_pct = 0.0
+            after_context_pct = result.get("after_context_pct")
+            if isinstance(after_context_pct, (int, float)):
+                self._last_context_pct = float(after_context_pct)
+                measurement = f"  context={self._last_context_pct:.0%}"
+            else:
+                measurement = ""
             self._append(Static(
                 f"[bold cyan]⚡ Context compacted[/bold cyan]"
-                f"  [dim]summary={summary_tokens} tokens  saved≈{saved_tokens} tokens[/dim]",
+                f"  [dim]summary={summary_tokens} tokens  saved≈{saved_tokens} tokens"
+                f"{measurement}[/dim]",
                 classes="log-line",
             ))
         except (IpcError, RuntimeError, OSError):
@@ -2041,7 +2052,9 @@ class KamaTuiApp(App[None]):
         elif t == "context.compacted":
             orig = event.get("original_tokens", 0)
             summary = event.get("summary_tokens", 0)
-            self._last_context_pct = 0.0
+            after_context_pct = event.get("after_context_pct")
+            if isinstance(after_context_pct, (int, float)):
+                self._last_context_pct = float(after_context_pct)
             self._append(Static(
                 f"[bold cyan]⚡ Context compacted[/bold cyan]"
                 f"  [dim]original≈{orig} tokens → summary={summary} tokens[/dim]",
