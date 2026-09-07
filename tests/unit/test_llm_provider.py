@@ -201,3 +201,28 @@ async def test_no_tokens_when_response_is_empty() -> None:
     tokens = [e for e in events if e.type == "llm.token"]  # type: ignore[attr-defined]
     assert tokens == []
     assert result.text == ""
+
+
+# 功能：验证 DeepSeek Anthropic 路由原样返回 thinking block 并关闭无效 cache_control
+# 设计：以 model 名称触发 route capability，检查 request kwargs 与 canonical continuation state，避免依赖真实 API
+async def test_deepseek_thinking_blocks_are_replayable_without_cache_control() -> None:
+    thinking = MagicMock()
+    thinking.type = "thinking"
+    thinking.thinking = "R1"
+    thinking.signature = "sig-r1"
+    final = _make_final(stop_reason="tool_use", content=[thinking])
+    client = MagicMock()
+    client.messages.stream.return_value = FakeStream([], final)
+    provider = AnthropicProvider(model="deepseek-v4-flash", client=client)
+
+    result, _ = await _chat(provider, tool_schemas=[{"name": "read_file"}])
+
+    kwargs = client.messages.stream.call_args.kwargs
+    assert "cache_control" not in kwargs["system"][0]
+    assert "cache_control" not in kwargs["tools"][0]
+    assert kwargs["thinking"]["type"] == "enabled"
+    assert result.continuation_state is not None
+    assert result.continuation_state.as_blocks() == [
+        {"type": "thinking", "thinking": "R1", "signature": "sig-r1"}
+    ]
+    assert result.continuation_state.policy.required_for_followup is True

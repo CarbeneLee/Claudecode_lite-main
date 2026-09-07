@@ -462,6 +462,55 @@ async def test_tui_command_errors_use_fixed_safe_messages() -> None:
     assert "send failed" in rendered
 
 
+# 功能：验证 /compact focus 透传并使用 authoritative after_context_pct
+# 设计：fake IPC 只记录一次命令参数，返回测量值后断言 TUI 不再把 context usage 清零
+async def test_tui_compact_focus_and_measurement() -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class _Client:
+        async def send_command(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            calls.append((method, params))
+            return {"summary_tokens": 10, "saved_tokens": 90, "after_context_pct": 0.42}
+
+    class _Prompt:
+        disabled = True
+        read_only = False
+        border_title = ""
+
+    app = KamaTuiApp("127.0.0.1", 9999)
+    app._client = _Client()  # type: ignore[assignment]
+    app._session_id = "sess-1"
+    app._last_context_pct = 0.88
+    app._prompt = lambda: _Prompt()  # type: ignore[method-assign]
+    rendered: list[str] = []
+    app._append = lambda widget: rendered.append(str(widget.content))  # type: ignore[method-assign]
+
+    await app._do_compact("focus on tests")
+
+    assert calls == [("session.compact", {"session_id": "sess-1", "focus": "focus on tests"})]
+    assert app._last_context_pct == pytest.approx(0.42)
+    assert "42%" in "\n".join(rendered)
+
+
+# 功能：验证 compaction response 没有 authoritative measurement 时保留已有 context usage
+# 设计：覆盖本地旧 daemon/异步事件兼容场景，避免 UI 用 0 伪造状态
+async def test_tui_compact_without_measurement_preserves_context_pct() -> None:
+    class _Client:
+        async def send_command(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            del method, params
+            return {"summary_tokens": 10, "saved_tokens": 90}
+
+    app = KamaTuiApp("127.0.0.1", 9999)
+    app._client = _Client()  # type: ignore[assignment]
+    app._session_id = "sess-1"
+    app._last_context_pct = 0.73
+    app._append = lambda _widget: None  # type: ignore[method-assign]
+
+    await app._do_compact()
+
+    assert app._last_context_pct == pytest.approx(0.73)
+
+
 # 功能：验证 TUI 的 session.create 发送当前进程的 canonical cwd
 # 设计：直接运行 socket loop 并替换 SocketClient/DOM 边界，捕获真实 send_command payload
 async def test_tui_session_create_sends_canonical_client_cwd(

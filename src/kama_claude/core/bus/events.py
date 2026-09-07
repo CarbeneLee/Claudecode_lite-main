@@ -179,6 +179,7 @@ class ContextCompactedEvent(BaseModel):
     run_id: str
     original_tokens: int
     summary_tokens: int
+    after_context_pct: float | None = None
     ts: str
 
 

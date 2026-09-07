@@ -167,6 +167,7 @@ async def _fail(
     elapsed_ms: int,
     *,
     attempt: int = 1,
+    source_result: ToolResult | None = None,
 ) -> ToolResult:
     await bus.publish(
         # 发布失败事件，让 TUI、日志和追踪系统知道工具调用失败
@@ -181,7 +182,21 @@ async def _fail(
             ts=_now(),
         )
     )
-    return ToolResult(content=error_message, is_error=True, error_type=error_class)
+    return ToolResult(
+        content=error_message,
+        is_error=True,
+        error_type=error_class,
+        raw_truncated=source_result.raw_truncated if source_result is not None else False,
+        original_size=(source_result.original_size if source_result is not None else None),
+        captured_size=(source_result.captured_size if source_result is not None else None),
+        evidence_ref=(source_result.evidence_ref if source_result is not None else None),
+        terminal_outcome=(
+            source_result.terminal_outcome if source_result is not None else None
+        ),
+        terminal_receipt=(
+            source_result.terminal_receipt if source_result is not None else False
+        ),
+    )
 
 
 # 复用 lookup、schema、permission、attempt audit、retry 与 event 生命周期
@@ -413,6 +428,7 @@ async def _invoke_with_authorization(
             bus, run_id, tool_call,
             error_class, error_message, ms,
             attempt=attempt,
+            source_result=result,
         )
 
     # 理论上不可达，但 mypy 需要看到所有路径都有返回值

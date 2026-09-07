@@ -70,6 +70,7 @@ from kama_claude.core.runs import new_run_id
 from kama_claude.core.sandbox.manager import SandboxManager
 from kama_claude.core.semantic.service import SemanticRetrievalService
 from kama_claude.core.session import SessionManager, SessionStore
+from kama_claude.core.session.lock import DaemonRootLock
 from kama_claude.core.trace.record import TraceRecord
 from kama_claude.core.trace.writer import TraceWriter
 from kama_claude.core.transport.ipc_broadcaster import IpcEventBroadcaster
@@ -122,6 +123,7 @@ class CoreApp:
         self._permission_manager: PermissionManager | None = None
         self._mcp_manager: McpServerManager | None = None
         self._contexts: dict[Path, WorkspaceContext] = {}
+        self._daemon_root_lock: DaemonRootLock | None = None
 
     # 处理 core.ping 请求，返回服务版本、运行时长和接收时间
     async def _ping_handler(self, params: dict[str, Any]) -> PongResult:
@@ -496,6 +498,15 @@ class CoreApp:
             await self._journal.close()
         if self._trace is not None:
             await self._trace.stop()
+        if self._daemon_root_lock is not None:
+            self._daemon_root_lock.release()
+            self._daemon_root_lock = None
+
+    # 在 startup 期间被取消或异常退出时兜底释放 daemon root lock
+    def _release_daemon_root_lock_on_task_done(self, _task: asyncio.Task[Any]) -> None:
+        if self._daemon_root_lock is not None:
+            self._daemon_root_lock.release()
+            self._daemon_root_lock = None
 
     # 启动守护进程：加载配置、初始化日志、启动 trace、启动 TCP 服务器，并等待退出信号
     async def run(self) -> None:
@@ -533,6 +544,13 @@ class CoreApp:
         )
         sessions_root = Path("~/.kama/sessions").expanduser()
         store = SessionStore(sessions_root)
+        # 真实 SessionStore 运行于 daemon 时持有 root lock；测试替身不触发外部文件锁
+        if getattr(store, "_root", None) == sessions_root:
+            self._daemon_root_lock = DaemonRootLock(sessions_root)
+            self._daemon_root_lock.acquire()
+            owner_task = asyncio.current_task()
+            if owner_task is not None:
+                owner_task.add_done_callback(self._release_daemon_root_lock_on_task_done)
         assert self._config is not None
         compact_provider = AnthropicProvider(self._config.llm.default_model)
 
@@ -555,6 +573,7 @@ class CoreApp:
             ),
             bus=self._bus,
             provider=compact_provider,
+            compaction_config=self._config.compaction,
         )
         self._sessions.attach_journal(self._journal)
         await self._sessions.reconcile_persisted_sessions()

@@ -28,9 +28,17 @@ def truncate_tool_results(
                 if len(text) > limit:
                     omitted = len(text) - keep
                     block = dict(block)
+                    if block.get("raw_truncated"):
+                        source = (
+                            "captured raw output is bounded; no full raw evidence was retained"
+                        )
+                    elif block.get("evidence_ref"):
+                        source = f"full output in evidence artifact {block['evidence_ref']}"
+                    else:
+                        source = "full output in run events"
                     block["content"] = (
                         text[:keep]
-                        + f"\n[... {omitted} chars omitted. Full output in run events.]"
+                        + f"\n[... {omitted} chars omitted. {source}.]"
                     )
             new_blocks.append(block)
         result.append({**msg, "content": new_blocks})

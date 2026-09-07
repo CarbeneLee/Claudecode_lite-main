@@ -155,6 +155,7 @@ class SessionCompactCommand(BaseModel):
 class SessionCompactResult(BaseModel):
     summary_tokens: int
     saved_tokens: int
+    after_context_pct: float | None = None
 
 
 class PlanGetApprovalCommand(BaseModel):

@@ -67,6 +67,7 @@ _STABLE_ERROR_TYPES: frozenset[str] = frozenset(
         "external_workspace_drift",
         "scope_mutation_inconclusive",
         "scope_audit_failed",
+        "context_window_exceeded",
     }
 )
 RETRYABLE_ERROR_TYPES: frozenset[str] = frozenset(

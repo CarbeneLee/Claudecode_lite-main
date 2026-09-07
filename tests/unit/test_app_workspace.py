@@ -230,6 +230,7 @@ async def test_core_app_runner_factory_passes_workspace_to_agent_runner(
             runner_factory: Callable[[Path], object],
             bus: object,
             provider: object,
+            **_: object,
         ) -> None:
             runner_factory(workspace)
             raise _StopAfterWiring
@@ -297,6 +298,7 @@ async def test_core_app_runner_factory_injects_sandbox_manager(
             runner_factory: Callable[[Path], object],
             bus: object,
             provider: object,
+            **_: object,
         ) -> None:
             runner_factory(workspace)
             runner_factory(workspace)
@@ -351,6 +353,7 @@ async def test_core_app_runner_factory_no_sandbox_when_disabled(
             runner_factory: Callable[[Path], object],
             bus: object,
             provider: object,
+            **_: object,
         ) -> None:
             runner_factory(workspace)
             raise _StopAfterWiring
@@ -439,6 +442,7 @@ async def test_core_app_runner_factory_injects_git_manager(
             runner_factory: Callable[[Path], object],
             bus: object,
             provider: object,
+            **_: object,
         ) -> None:
             runner_factory(workspace)
             runner_factory(workspace)
@@ -493,6 +497,7 @@ async def test_core_app_runner_factory_no_git_when_disabled(
             runner_factory: Callable[[Path], object],
             bus: object,
             provider: object,
+            **_: object,
         ) -> None:
             runner_factory(workspace)
             raise _StopAfterWiring
@@ -592,6 +597,7 @@ async def test_core_app_runner_factory_injects_semantic_service(
             runner_factory: Callable[[Path], object],
             bus: object,
             provider: object,
+            **_: object,
         ) -> None:
             runner_factory(workspace)
             runner_factory(workspace)
@@ -647,6 +653,7 @@ async def test_core_app_runner_factory_no_semantic_when_disabled(
             runner_factory: Callable[[Path], object],
             bus: object,
             provider: object,
+            **_: object,
         ) -> None:
             runner_factory(workspace)
             raise _StopAfterWiring

@@ -856,6 +856,8 @@ async def test_compaction_error_remains_primary_over_step_failure(
             )
         ]
     )
+    provider.context_window = 10_000
+    provider.max_output_tokens = 64
     loop = AgentLoop(
         provider,
         DirectToolInvoker(ToolRegistry(), bus, "r1"),
@@ -864,6 +866,7 @@ async def test_compaction_error_remains_primary_over_step_failure(
         compact_threshold=0.5,
     )
     ctx = _ctx()
+    ctx.messages[0]["content"] = "x" * 8_000
 
     with caplog.at_level("ERROR", logger="kama_claude.core.loop"):
         with pytest.raises(RuntimeError) as caught:
@@ -927,6 +930,8 @@ async def test_max_steps_closes_every_step_without_final_compaction() -> None:
             ),
         ]
     )
+    provider.context_window = 10_000
+    provider.max_output_tokens = 64
     compactor = _CountingCompactor()
     bus = EventBus()
     events = await _events(bus)
@@ -938,6 +943,7 @@ async def test_max_steps_closes_every_step_without_final_compaction() -> None:
         compact_threshold=0.5,
     )
     ctx = _ctx(max_steps=2)
+    ctx.messages[0]["content"] = "x" * 7_000
 
     await loop.run(ctx)
 
@@ -952,7 +958,7 @@ async def test_max_steps_closes_every_step_without_final_compaction() -> None:
         ("step.started", 2),
         ("step.finished", 2),
     ]
-    assert compactor.calls == 1
+    assert compactor.calls == 2
     assert ctx.status == "failed"
     assert ctx.reason == "exceeded_max_steps"
     assert ctx.step == 2

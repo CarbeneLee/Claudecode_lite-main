@@ -6,9 +6,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from kama_claude.core.sandbox.executors import CommandExecutor
 from kama_claude.core.tools.base import BaseTool, ToolResult
+from kama_claude.core.tools.evidence import ToolEvidenceBudget, bound_tool_output
 from kama_claude.core.workspace.resolver import WorkspacePathResolver
 
-_MAX_OUTPUT_BYTES = 64 * 1024  # 64 KB
+_DURABLE_OUTPUT_BYTES = 1 * 1024 * 1024
+_MODEL_OUTPUT_CHARS = 8_000
 _DEFAULT_TIMEOUT = 60
 
 
@@ -24,7 +26,8 @@ class BashTool(BaseTool):
     description = (
         "Execute a shell command and return its output (stdout + stderr combined). "
         "Non-interactive only — commands requiring user input will hang and time out. "
-        "Prefer short, focused commands. Output is truncated at 64 KB."
+        "Prefer short, focused commands. Raw output is bounded and the model "
+        "receives a head/tail receipt."
     )
     input_schema: dict[str, object] = {
         "type": "object",
@@ -60,15 +63,50 @@ class BashTool(BaseTool):
                 error_type="timeout",
             )
 
-        output = result.output.decode("utf-8", errors="replace")
-        truncated = len(result.output) > _MAX_OUTPUT_BYTES
-        if truncated:
-            output = output[:_MAX_OUTPUT_BYTES] + "\n[truncated]"
+        receipt = bound_tool_output(
+            result.output,
+            budget=ToolEvidenceBudget(
+                producer_max_bytes=_DURABLE_OUTPUT_BYTES,
+                durable_max_bytes=_DURABLE_OUTPUT_BYTES,
+                model_max_chars=_MODEL_OUTPUT_CHARS,
+            ),
+            original_size=result.original_size,
+            raw_truncated=result.raw_truncated,
+        )
+        truncated = receipt.raw_truncated
+        display_truncated = truncated or receipt.model_truncated
+        output = receipt.to_model_text()
+        if display_truncated:
+            output += "\n[truncated]"
 
         if result.returncode != 0:
             return ToolResult(
                 content=f"[exit {result.returncode}]\n{output}",
                 is_error=True,
                 error_type="command_failed",
+                raw_truncated=truncated,
+                original_size=(
+                    result.original_size
+                    if result.original_size is not None
+                    else receipt.original_size
+                ),
+                captured_size=(
+                    result.captured_size
+                    if result.captured_size is not None
+                    else receipt.captured_size
+                ),
             )
-        return ToolResult(content=output or "[no output]")
+        return ToolResult(
+            content=output or "[no output]",
+            raw_truncated=truncated,
+            original_size=(
+                result.original_size
+                if result.original_size is not None
+                else receipt.original_size
+            ),
+            captured_size=(
+                result.captured_size
+                if result.captured_size is not None
+                else receipt.captured_size
+            ),
+        )

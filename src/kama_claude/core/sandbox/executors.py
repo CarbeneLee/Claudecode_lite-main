@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import signal
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +22,9 @@ class ExecResult:
     output: bytes  # stdout+stderr 合并后的原始输出
     returncode: int
     timed_out: bool
+    raw_truncated: bool = False
+    original_size: int | None = None
+    captured_size: int | None = None
 
 
 class CommandExecutor(ABC):
@@ -41,17 +46,79 @@ def build_executor(
 
 # 终止仍在运行的子进程并完成 reap；清理失败记日志但不覆盖调用方原始异常
 async def _kill_and_reap(proc: asyncio.subprocess.Process) -> None:
+    # 终止进程组后逐块 drain，避免 communicate() 再次无界缓存 stdout
     if proc.returncode is None:
         try:
-            proc.kill()
+            pid = getattr(proc, "pid", None)
+            if pid is None:
+                proc.kill()
+            else:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
         except ProcessLookupError:
             pass
+        except PermissionError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
         except (Exception, asyncio.CancelledError):
-            _LOGGER.exception("failed to terminate subprocess during cleanup")
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            except (Exception, asyncio.CancelledError):
+                _LOGGER.exception("failed to terminate subprocess during cleanup")
     try:
-        await proc.communicate()
+        await _drain_process_output(proc, max_bytes=_PRODUCER_OUTPUT_CAP)
+        wait = getattr(proc, "wait", None)
+        if callable(wait):
+            await wait()
     except (Exception, asyncio.CancelledError):
         _LOGGER.exception("failed to reap subprocess during cleanup")
+
+
+_PROCESS_CHUNK_BYTES = 64 * 1024
+_PRODUCER_OUTPUT_CAP = 1 * 1024 * 1024
+
+
+# 逐块读取进程输出并在 producer cap 超限时终止整个进程组
+async def _drain_process_output(
+    proc: asyncio.subprocess.Process,
+    *,
+    max_bytes: int,
+) -> tuple[bytes, int | None, bool]:
+    stdout = getattr(proc, "stdout", None)
+    if stdout is None:
+        communicate = getattr(proc, "communicate", None)
+        if not callable(communicate):
+            return b"", 0, False
+        output, _ = await communicate()
+        if not isinstance(output, bytes):
+            output = bytes(output or b"")
+        captured_bytes = output[:max_bytes]
+        truncated = len(output) > max_bytes
+        return captured_bytes, (None if truncated else len(output)), truncated
+    captured = bytearray()
+    original_size = 0
+    truncated = False
+    while True:
+        chunk = await stdout.read(_PROCESS_CHUNK_BYTES)
+        if not chunk:
+            break
+        original_size += len(chunk)
+        remaining = max(0, max_bytes - len(captured))
+        if remaining:
+            captured.extend(chunk[:remaining])
+        if len(captured) >= max_bytes and original_size > max_bytes and not truncated:
+            truncated = True
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+    return bytes(captured), (original_size if not truncated else None), truncated
 
 
 class HostExecutor(CommandExecutor):
@@ -62,9 +129,14 @@ class HostExecutor(CommandExecutor):
             cwd=str(cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
         )
         try:
-            stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            stdout_bytes, original_size, raw_truncated = await asyncio.wait_for(
+                _drain_process_output(proc, max_bytes=_PRODUCER_OUTPUT_CAP),
+                timeout=timeout,
+            )
+            await proc.wait()
         except TimeoutError:
             await _kill_and_reap(proc)
             return ExecResult(output=b"", returncode=-1, timed_out=True)
@@ -76,8 +148,11 @@ class HostExecutor(CommandExecutor):
             raise
         return ExecResult(
             output=stdout_bytes,
-            returncode=proc.returncode or 0,
+            returncode=proc.returncode if proc.returncode is not None else 0,
             timed_out=False,
+            raw_truncated=raw_truncated,
+            original_size=original_size,
+            captured_size=len(stdout_bytes),
         )
 
 

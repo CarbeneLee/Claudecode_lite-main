@@ -35,8 +35,11 @@ class McpClient:
         self._transport = ""
         self._lock = asyncio.Lock()
         self._stderr_task: asyncio.Task[None] | None = None
+        self._last_call_original_size = 0
+        self._last_call_captured_size = 0
+        self._last_call_truncated = False
 
-    _STREAM_LIMIT = 64 * 1024 * 1024  # 64 MB，防止大响应触发 LimitOverrunError
+    _STREAM_LIMIT = 1 * 1024 * 1024  # 1 MB absolute transport cap for remote tool payloads
 
     # 启动 stdio 子进程并完成 MCP initialize 握手
     async def connect_stdio(
@@ -97,11 +100,45 @@ class McpClient:
     # 调用 MCP server 工具，拼接 text 内容并按错误类型抛异常
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
         response = await self._call("tools/call", {"name": name, "arguments": arguments})
-        parts: list[str] = []
+        # The JSON line itself is bounded by _STREAM_LIMIT, but a valid MCP
+        # response may contain many text items.  Aggregate into a bounded byte
+        # buffer so remote tools cannot create an unbounded in-memory result.
+        captured = bytearray()
+        original_size = 0
+        text_index = 0
         for item in response.get("content", []):
-            if item.get("type") == "text":
-                parts.append(str(item["text"]))
-        return "\n".join(parts)
+            if not isinstance(item, dict) or item.get("type") != "text":
+                continue
+            raw = str(item.get("text", "")).encode("utf-8", errors="replace")
+            if text_index:
+                original_size += 1
+                remaining = max(0, self._STREAM_LIMIT - len(captured))
+                if remaining:
+                    captured.extend(b"\n"[:remaining])
+            text_index += 1
+            original_size += len(raw)
+            remaining = max(0, self._STREAM_LIMIT - len(captured))
+            if remaining:
+                captured.extend(raw[:remaining])
+        self._last_call_original_size = original_size
+        self._last_call_captured_size = len(captured)
+        self._last_call_truncated = original_size > len(captured)
+        return bytes(captured).decode("utf-8", errors="replace")
+
+    # 返回最近一次 MCP 调用是否超过 aggregate transport cap
+    @property
+    def last_call_truncated(self) -> bool:
+        return self._last_call_truncated
+
+    # 返回最近一次 MCP 调用的原始字节大小
+    @property
+    def last_call_original_size(self) -> int:
+        return self._last_call_original_size
+
+    # 返回最近一次 MCP 调用实际捕获的字节大小
+    @property
+    def last_call_captured_size(self) -> int:
+        return self._last_call_captured_size
 
     # 后台任务：持续读取 stderr 并记录日志，防止管道缓冲区满
     async def _drain_stderr(self) -> None:
